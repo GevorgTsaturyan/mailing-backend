@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Welcome Bonus</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f4f7; font-family:Arial, Helvetica, sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f7; padding:24px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden;">
+          <tr>
+            <td style="background-color:#1a1a2e; padding:20px 32px;">
+              <span style="color:#ffffff; font-size:22px; font-weight:bold; letter-spacing:1px;">Casino Rewards</span>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <p style="font-size:16px; color:#222222; margin:0 0 16px;">Hi {{firstName}},</p>
+              <p style="font-size:16px; color:#222222; margin:0 0 16px;">
+                Welcome aboard! As a thank-you for joining, we've added a welcome bonus to your account.
+              </p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f7; border-radius:6px; margin:24px 0;">
+                <tr>
+                  <td style="padding:20px; text-align:center;">
+                    <p style="margin:0 0 8px; font-size:14px; color:#555555;">Your Bonus Amount</p>
+                    <p style="margin:0 0 16px; font-size:28px; font-weight:bold; color:#1a1a2e;">${{bonusAmount}}</p>
+                    <p style="margin:0 0 4px; font-size:14px; color:#555555;">Promo Code</p>
+                    <p style="margin:0; font-size:20px; font-weight:bold; letter-spacing:2px; color:#e94560;">{{promoCode}}</p>
+                  </td>
+                </tr>
+              </table>
+              <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 auto 24px;">
+                <tr>
+                  <td style="background-color:#e94560; border-radius:6px;">
+                    <a href="https://example.com/claim?code={{promoCode}}" style="display:inline-block; padding:14px 32px; color:#ffffff; font-size:16px; font-weight:bold; text-decoration:none;">Claim Your Bonus</a>
+                  </td>
+                </tr>
+              </table>
+              <p style="font-size:13px; color:#888888; margin:0;">
+                If the button doesn't work, copy this code at checkout: {{promoCode}}
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 32px; border-top:1px solid #eeeeee;">
+              <p style="font-size:12px; color:#999999; margin:0 0 8px;">123 Example St, Example City, EX1 2AM</p>
+              <p style="font-size:12px; color:#999999; margin:0;">
+                <a href="{{unsubscribeLink}}" style="color:#999999; text-decoration:underline;">Unsubscribe</a>
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

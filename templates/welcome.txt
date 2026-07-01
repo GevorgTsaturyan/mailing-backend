@@ -1,0 +1,13 @@
+Hi {{firstName}},
+
+Welcome aboard! As a thank-you for joining, we've added a welcome bonus to your account.
+
+Your Bonus Amount: ${{bonusAmount}}
+Promo Code: {{promoCode}}
+
+Claim your bonus here: https://example.com/claim?code={{promoCode}}
+
+If you have any questions, just reply to this email.
+
+123 Example St, Example City, EX1 2AM
+Unsubscribe: {{unsubscribeLink}}
