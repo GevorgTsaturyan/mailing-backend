@@ -1,5 +1,5 @@
 import express from 'express';
-import { readJson, writeJson } from '../db.js';
+import db from '../db.js';
 import { sendCampaignEmail } from '../mailer.js';
 
 const router = express.Router();
@@ -11,12 +11,14 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'contactIds must be a non-empty array' });
   }
 
-  const contacts = await readJson('contacts.json');
-  const sendLog = await readJson('sendLog.json');
   const results = [];
+  const insertLog = db.prepare(`
+    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error)
+    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error)
+  `);
 
   for (const id of contactIds) {
-    const contact = contacts.find((c) => c.id === id);
+    const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
     if (!contact) {
       results.push({ id, status: 'failed', error: 'Contact not found' });
       continue;
@@ -40,23 +42,20 @@ router.post('/', async (req, res) => {
         variables: { firstName: contact.firstName, lastName: contact.lastName, ...variables },
       });
 
-      contact.status = 'sent';
-      contact.sentAt = logEntry.date;
+      db.prepare('UPDATE contacts SET status=?, sentAt=? WHERE id=?')
+        .run('sent', logEntry.date, id);
 
       logEntry.status = 'sent';
       logEntry.previewUrl = previewUrl;
       results.push({ id, status: 'sent', previewUrl });
     } catch (err) {
-      contact.status = 'failed';
+      db.prepare('UPDATE contacts SET status=? WHERE id=?').run('failed', id);
       logEntry.error = err.message;
       results.push({ id, status: 'failed', error: err.message });
     }
 
-    sendLog.push(logEntry);
+    insertLog.run(logEntry);
   }
-
-  await writeJson('contacts.json', contacts);
-  await writeJson('sendLog.json', sendLog);
 
   res.json({ results });
 });

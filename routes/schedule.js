@@ -1,26 +1,31 @@
 import express from 'express';
-import { readJson, writeJson } from '../db.js';
+import db from '../db.js';
 import { applyScheduleConfig } from '../scheduler.js';
 
 const router = express.Router();
 
-router.get('/', async (req, res) => {
-  const schedule = await readJson('schedule.json');
-  res.json(schedule);
+router.get('/', (req, res) => {
+  const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
+  res.json({ ...cfg, enabled: cfg.enabled === 1 });
 });
 
-router.post('/', async (req, res) => {
-  const { time, batchSize, enabled } = req.body;
+router.post('/', (req, res) => {
+  const { time, batchSize, enabled, template } = req.body;
 
-  const schedule = await readJson('schedule.json');
-  if (time !== undefined) schedule.time = time;
-  if (batchSize !== undefined) schedule.batchSize = batchSize;
-  if (enabled !== undefined) schedule.enabled = enabled;
+  const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
+  const updated = {
+    enabled:   enabled   !== undefined ? (enabled ? 1 : 0) : cfg.enabled,
+    time:      time      ?? cfg.time,
+    batchSize: batchSize ?? cfg.batchSize,
+    template:  template  ?? cfg.template,
+  };
 
-  await writeJson('schedule.json', schedule);
-  applyScheduleConfig(schedule);
+  db.prepare(
+    'UPDATE schedule_config SET enabled=?, time=?, batchSize=?, template=? WHERE id=1'
+  ).run(updated.enabled, updated.time, updated.batchSize, updated.template);
 
-  res.json(schedule);
+  applyScheduleConfig({ ...updated, enabled: updated.enabled === 1 });
+  res.json({ ...updated, enabled: updated.enabled === 1 });
 });
 
 export default router;

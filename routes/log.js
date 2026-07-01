@@ -1,11 +1,16 @@
 import express from 'express';
-import { readJson } from '../db.js';
+import db from '../db.js';
 
 const router = express.Router();
 
-router.get('/', async (req, res) => {
-  const sendLog = await readJson('sendLog.json');
-  res.json(sendLog);
+router.get('/', (req, res) => {
+  const log = db.prepare('SELECT * FROM send_log ORDER BY id DESC LIMIT 500').all();
+  res.json(log);
+});
+
+router.delete('/', (req, res) => {
+  db.prepare('DELETE FROM send_log').run();
+  res.json({ ok: true });
 });
 
 export default router;

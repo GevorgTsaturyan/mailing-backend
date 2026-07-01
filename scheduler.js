@@ -1,22 +1,26 @@
 import cron from 'node-cron';
-import { readJson, writeJson } from './db.js';
+import db from './db.js';
 import { sendCampaignEmail } from './mailer.js';
 
 let currentTask = null;
 
-function timeToCronExpression(time) {
+function timeToCron(time) {
   const [hour, minute] = time.split(':').map(Number);
   return `${minute} ${hour} * * *`;
 }
 
 async function runDailyBatch() {
-  const schedule = await readJson('schedule.json');
-  const contacts = await readJson('contacts.json');
-  const sendLog = await readJson('sendLog.json');
+  const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
+  const pending = db.prepare(
+    "SELECT * FROM contacts WHERE status = 'pending' ORDER BY id LIMIT ?"
+  ).all(cfg.batchSize);
 
-  const pending = contacts.filter((c) => c.status === 'pending').slice(0, schedule.batchSize);
+  console.log(`Scheduler: sending to ${pending.length} pending contact(s) with template "${cfg.template}"`);
 
-  console.log(`Scheduler: sending to ${pending.length} pending contact(s)`);
+  const insertLog = db.prepare(`
+    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error)
+    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error)
+  `);
 
   for (const contact of pending) {
     const logEntry = {
@@ -24,7 +28,7 @@ async function runDailyBatch() {
       contactId: contact.id,
       name: `${contact.firstName} ${contact.lastName}`,
       email: contact.email,
-      template: 'welcome',
+      template: cfg.template,
       status: 'failed',
       previewUrl: null,
       error: null,
@@ -33,42 +37,32 @@ async function runDailyBatch() {
     try {
       const { previewUrl } = await sendCampaignEmail({
         to: contact.email,
-        templateName: 'welcome',
+        templateName: cfg.template,
         variables: { firstName: contact.firstName, lastName: contact.lastName },
       });
 
-      contact.status = 'sent';
-      contact.sentAt = logEntry.date;
+      db.prepare('UPDATE contacts SET status=?, sentAt=? WHERE id=?')
+        .run('sent', logEntry.date, contact.id);
+
       logEntry.status = 'sent';
       logEntry.previewUrl = previewUrl;
     } catch (err) {
-      contact.status = 'failed';
+      db.prepare("UPDATE contacts SET status='failed' WHERE id=?").run(contact.id);
       logEntry.error = err.message;
     }
 
-    sendLog.push(logEntry);
+    insertLog.run(logEntry);
   }
-
-  await writeJson('contacts.json', contacts);
-  await writeJson('sendLog.json', sendLog);
-}
-
-function scheduleTask(schedule) {
-  if (currentTask) {
-    currentTask.stop();
-    currentTask = null;
-  }
-
-  if (!schedule.enabled) return;
-
-  currentTask = cron.schedule(timeToCronExpression(schedule.time), runDailyBatch);
 }
 
 export function applyScheduleConfig(schedule) {
-  scheduleTask(schedule);
+  if (currentTask) { currentTask.stop(); currentTask = null; }
+  if (!schedule.enabled) return;
+  currentTask = cron.schedule(timeToCron(schedule.time), runDailyBatch);
+  console.log(`Scheduler: enabled, runs daily at ${schedule.time}, batch=${schedule.batchSize}`);
 }
 
-export async function initScheduler() {
-  const schedule = await readJson('schedule.json');
-  scheduleTask(schedule);
+export function initScheduler() {
+  const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
+  applyScheduleConfig({ ...cfg, enabled: cfg.enabled === 1 });
 }
