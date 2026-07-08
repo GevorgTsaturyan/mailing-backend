@@ -3,13 +3,14 @@ import express from 'express';
 import cors from 'cors';
 import db from './db.js';
 
-import authRouter     from './routes/auth.js';
-import contactsRouter from './routes/contacts.js';
-import templatesRouter from './routes/templates.js';
-import sendRouter     from './routes/send.js';
-import scheduleRouter from './routes/schedule.js';
-import logRouter      from './routes/log.js';
-import smtpRouter     from './routes/smtp.js';
+import authRouter           from './routes/auth.js';
+import contactsRouter       from './routes/contacts.js';
+import templatesRouter      from './routes/templates.js';
+import sendRouter           from './routes/send.js';
+import scheduleRouter       from './routes/schedule.js';
+import scheduledSendsRouter from './routes/scheduled-sends.js';
+import logRouter            from './routes/log.js';
+import smtpRouter           from './routes/smtp.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
 
@@ -37,12 +38,13 @@ app.get('/unsubscribe', (req, res) => {
 
 // All API routes below require a valid JWT
 app.use('/api', requireAuth);
-app.use('/api/contacts',  contactsRouter);
-app.use('/api/templates', templatesRouter);
-app.use('/api/send',      sendRouter);
-app.use('/api/schedule',  scheduleRouter);
-app.use('/api/log',       logRouter);
-app.use('/api/smtp',      smtpRouter);
+app.use('/api/contacts',        contactsRouter);
+app.use('/api/templates',       templatesRouter);
+app.use('/api/send',            sendRouter);
+app.use('/api/schedule',        scheduleRouter);
+app.use('/api/scheduled-sends', scheduledSendsRouter);
+app.use('/api/log',             logRouter);
+app.use('/api/smtp',            smtpRouter);
 
 app.listen(PORT, () => {
   console.log(`Mail Campaign Manager backend on http://localhost:${PORT}`);

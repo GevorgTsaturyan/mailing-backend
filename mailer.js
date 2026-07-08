@@ -45,9 +45,14 @@ function renderTemplate(content, variables) {
   return content.replace(/\{\{(\w+)\}\}/g, (_, key) => variables[key] ?? '');
 }
 
-export async function sendCampaignEmail({ to, templateName = 'welcome', variables = {} }) {
-  const tmpl = db.prepare('SELECT * FROM templates WHERE name = ?').get(templateName);
-  if (!tmpl) throw new Error(`Template "${templateName}" not found`);
+export async function sendCampaignEmail({ to, templateName, templateContent, variables = {} }) {
+  let tmpl;
+  if (templateContent) {
+    tmpl = { subject: templateContent.subject || '', html: templateContent.html || '', txt: templateContent.txt || '' };
+  } else {
+    tmpl = db.prepare('SELECT * FROM templates WHERE name = ?').get(templateName || 'welcome');
+    if (!tmpl) throw new Error(`Template "${templateName}" not found`);
+  }
 
   const cfg = db.prepare('SELECT * FROM smtp_config WHERE id = 1').get();
 

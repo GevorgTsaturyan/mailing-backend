@@ -69,4 +69,24 @@ db.exec(`
     VALUES (1);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS scheduled_sends (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT,
+    contactIds   TEXT NOT NULL,
+    templateName TEXT,
+    subject      TEXT,
+    html         TEXT,
+    txt          TEXT,
+    scheduledAt  TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    createdAt    TEXT NOT NULL,
+    sentAt       TEXT
+  );
+`);
+
+// Add startTime / endTime columns if upgrading from older schema
+try { db.exec("ALTER TABLE schedule_config ADD COLUMN startTime TEXT NOT NULL DEFAULT '09:00'") } catch {}
+try { db.exec("ALTER TABLE schedule_config ADD COLUMN endTime   TEXT NOT NULL DEFAULT '17:00'") } catch {}
+
 export default db;

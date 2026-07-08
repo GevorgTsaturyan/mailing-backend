@@ -10,21 +10,22 @@ router.get('/', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { time, batchSize, enabled, template } = req.body;
+  const { startTime, endTime, batchSize, enabled, template } = req.body;
 
   const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
   const updated = {
     enabled:   enabled   !== undefined ? (enabled ? 1 : 0) : cfg.enabled,
-    time:      time      ?? cfg.time,
+    startTime: startTime ?? cfg.startTime,
+    endTime:   endTime   ?? cfg.endTime,
     batchSize: batchSize ?? cfg.batchSize,
     template:  template  ?? cfg.template,
   };
 
   db.prepare(
-    'UPDATE schedule_config SET enabled=?, time=?, batchSize=?, template=? WHERE id=1'
-  ).run(updated.enabled, updated.time, updated.batchSize, updated.template);
+    'UPDATE schedule_config SET enabled=?, startTime=?, endTime=?, batchSize=?, template=? WHERE id=1'
+  ).run(updated.enabled, updated.startTime, updated.endTime, updated.batchSize, updated.template);
 
-  applyScheduleConfig({ ...updated, enabled: updated.enabled === 1 });
+  applyScheduleConfig();
   res.json({ ...updated, enabled: updated.enabled === 1 });
 });
 

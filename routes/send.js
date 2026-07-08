@@ -5,11 +5,16 @@ import { sendCampaignEmail } from '../mailer.js';
 const router = express.Router();
 
 router.post('/', async (req, res) => {
-  const { contactIds, templateName = 'welcome', variables = {} } = req.body;
+  const { contactIds, templateName, subject, html, txt, variables = {} } = req.body;
 
   if (!Array.isArray(contactIds) || contactIds.length === 0) {
     return res.status(400).json({ error: 'contactIds must be a non-empty array' });
   }
+  if (!templateName && !subject) {
+    return res.status(400).json({ error: 'templateName or subject is required' });
+  }
+
+  const templateContent = subject ? { subject, html: html || '', txt: txt || '' } : null;
 
   const results = [];
   const insertLog = db.prepare(`
@@ -25,27 +30,28 @@ router.post('/', async (req, res) => {
     }
 
     const logEntry = {
-      date: new Date().toISOString(),
+      date:      new Date().toISOString(),
       contactId: contact.id,
-      name: `${contact.firstName} ${contact.lastName}`,
-      email: contact.email,
-      template: templateName,
-      status: 'failed',
+      name:      `${contact.firstName} ${contact.lastName}`,
+      email:     contact.email,
+      template:  templateName || '(custom)',
+      status:    'failed',
       previewUrl: null,
-      error: null,
+      error:     null,
     };
 
     try {
       const { previewUrl } = await sendCampaignEmail({
         to: contact.email,
         templateName,
+        templateContent,
         variables: { firstName: contact.firstName, lastName: contact.lastName, ...variables },
       });
 
       db.prepare('UPDATE contacts SET status=?, sentAt=? WHERE id=?')
         .run('sent', logEntry.date, id);
 
-      logEntry.status = 'sent';
+      logEntry.status    = 'sent';
       logEntry.previewUrl = previewUrl;
       results.push({ id, status: 'sent', previewUrl });
     } catch (err) {
