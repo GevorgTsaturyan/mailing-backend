@@ -70,6 +70,25 @@ db.exec(`
 `);
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS recurring_campaigns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    templateName    TEXT,
+    subject         TEXT,
+    html            TEXT,
+    txt             TEXT,
+    startTime       TEXT NOT NULL DEFAULT '09:00',
+    endTime         TEXT NOT NULL DEFAULT '17:00',
+    initialCount    INTEGER NOT NULL DEFAULT 10,
+    increasePercent REAL NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    currentDay      INTEGER NOT NULL DEFAULT 0,
+    lastRunDate     TEXT,
+    createdAt       TEXT NOT NULL
+  );
+`);
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS scheduled_sends (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     label        TEXT,
