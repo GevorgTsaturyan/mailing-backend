@@ -11,7 +11,29 @@ router.get('/', (req, res) => {
   const rows = db.prepare(
     'SELECT * FROM scheduled_sends ORDER BY scheduledAt ASC'
   ).all();
-  res.json(rows.map(parse));
+  res.json(rows.map(row => {
+    const parsed = parse(row);
+    const lastLog = db.prepare(
+      'SELECT MAX(id) as lastId FROM send_log WHERE scheduledSendId = ?'
+    ).get(row.id);
+    return { ...parsed, lastSendLogId: lastLog?.lastId || null };
+  }));
+});
+
+router.get('/:id', (req, res) => {
+  const id  = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM scheduled_sends WHERE id = ?').get(id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+
+  const parsed   = parse(row);
+  const logs     = db.prepare(
+    'SELECT * FROM send_log WHERE scheduledSendId = ? ORDER BY id ASC'
+  ).all(id);
+  const contacts = parsed.contactIds
+    .map(cid => db.prepare('SELECT * FROM contacts WHERE id = ?').get(cid))
+    .filter(Boolean);
+
+  res.json({ ...parsed, logs, contacts });
 });
 
 router.post('/', (req, res) => {

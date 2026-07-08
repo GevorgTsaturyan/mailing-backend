@@ -4,16 +4,17 @@ import { sendCampaignEmail } from './mailer.js';
 
 // ─── Shared send utility ────────────────────────────────────────────────────
 
-async function sendToContact(contact, templateName, templateContent) {
+async function sendToContact(contact, templateName, templateContent, scheduledSendId = null) {
   const logEntry = {
-    date:       new Date().toISOString(),
-    contactId:  contact.id,
-    name:       `${contact.firstName} ${contact.lastName}`,
-    email:      contact.email,
-    template:   templateName || '(custom)',
-    status:     'failed',
-    previewUrl: null,
-    error:      null,
+    date:            new Date().toISOString(),
+    contactId:       contact.id,
+    name:            `${contact.firstName} ${contact.lastName}`,
+    email:           contact.email,
+    template:        templateName || '(custom)',
+    status:          'failed',
+    previewUrl:      null,
+    error:           null,
+    scheduledSendId: scheduledSendId,
   };
 
   try {
@@ -37,8 +38,8 @@ async function sendToContact(contact, templateName, templateContent) {
   }
 
   db.prepare(`
-    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error)
-    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error)
+    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error, scheduledSendId)
+    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error, @scheduledSendId)
   `).run(logEntry);
 
   return logEntry.status;
@@ -194,7 +195,7 @@ async function checkScheduledSends() {
     for (const contactId of contactIds) {
       const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(contactId);
       if (!contact) continue;
-      if (await sendToContact(contact, task.templateName, templateContent) === 'failed')
+      if (await sendToContact(contact, task.templateName, templateContent, task.id) === 'failed')
         anyFailed = true;
     }
 

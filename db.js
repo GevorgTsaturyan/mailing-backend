@@ -108,4 +108,7 @@ db.exec(`
 try { db.exec("ALTER TABLE schedule_config ADD COLUMN startTime TEXT NOT NULL DEFAULT '09:00'") } catch {}
 try { db.exec("ALTER TABLE schedule_config ADD COLUMN endTime   TEXT NOT NULL DEFAULT '17:00'") } catch {}
 
+// Track which scheduled send produced each log entry
+try { db.exec("ALTER TABLE send_log ADD COLUMN scheduledSendId INTEGER") } catch {}
+
 export default db;
