@@ -14,11 +14,13 @@ async function sendToContact(contact, templateName, templateContent, scheduledSe
     status:          'failed',
     previewUrl:      null,
     error:           null,
+    subject:         null,
+    body:            null,
     scheduledSendId: scheduledSendId,
   };
 
   try {
-    const { previewUrl } = await sendCampaignEmail({
+    const { previewUrl, subject, html } = await sendCampaignEmail({
       to: contact.email,
       templateName,
       templateContent,
@@ -30,6 +32,8 @@ async function sendToContact(contact, templateName, templateContent, scheduledSe
 
     logEntry.status     = 'sent';
     logEntry.previewUrl = previewUrl;
+    logEntry.subject    = subject;
+    logEntry.body       = html;
     console.log(`Scheduler: sent to ${contact.email} at ${logEntry.date}`);
   } catch (err) {
     db.prepare("UPDATE contacts SET status='failed' WHERE id=?").run(contact.id);
@@ -38,8 +42,8 @@ async function sendToContact(contact, templateName, templateContent, scheduledSe
   }
 
   db.prepare(`
-    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error, scheduledSendId)
-    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error, @scheduledSendId)
+    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error, subject, body, scheduledSendId)
+    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error, @subject, @body, @scheduledSendId)
   `).run(logEntry);
 
   return logEntry.status;

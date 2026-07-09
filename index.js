@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import db from './db.js';
+import { seedDevData } from './seed.js';
 
 import authRouter           from './routes/auth.js';
 import contactsRouter       from './routes/contacts.js';
@@ -52,6 +53,8 @@ app.use('/api/scheduled-sends',    scheduledSendsRouter);
 app.use('/api/recurring-campaigns', recurringCampaignsRouter);
 app.use('/api/log',             logRouter);
 app.use('/api/smtp',            smtpRouter);
+
+seedDevData();
 
 app.listen(PORT, () => {
   console.log(`Mail Campaign Manager backend on http://localhost:${PORT}`);

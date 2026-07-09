@@ -67,14 +67,18 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
     ...variables,
   };
 
+  const renderedSubject = renderTemplate(tmpl.subject, mergedVars);
+  const renderedHtml    = renderTemplate(tmpl.html,    mergedVars);
+  const renderedTxt     = renderTemplate(tmpl.txt,     mergedVars);
+
   const transporter = await getTransporter();
   const info = await transporter.sendMail({
     from: `"${cfg.fromName}" <${cfg.fromAddr}>`,
     to,
     replyTo: cfg.fromAddr,
-    subject: renderTemplate(tmpl.subject, mergedVars),
-    text: renderTemplate(tmpl.txt, mergedVars),
-    html: renderTemplate(tmpl.html, mergedVars),
+    subject: renderedSubject,
+    text:    renderedTxt,
+    html:    renderedHtml,
     headers: {
       'List-Unsubscribe': `<mailto:unsubscribe@example.com>, <${baseUrl}/unsubscribe?email=${encodeURIComponent(to)}>`,
       'X-Mailer': 'MailCampaignManager/2.0',
@@ -83,7 +87,7 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
 
   const previewUrl = nodemailer.getTestMessageUrl(info) || null;
   if (previewUrl) console.log(`Preview for ${to}: ${previewUrl}`);
-  return { info, previewUrl };
+  return { info, previewUrl, subject: renderedSubject, html: renderedHtml };
 }
 
 export async function testSmtpConnection(cfg) {

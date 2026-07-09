@@ -18,8 +18,8 @@ router.post('/', async (req, res) => {
 
   const results = [];
   const insertLog = db.prepare(`
-    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error)
-    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error)
+    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error, subject, body)
+    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error, @subject, @body)
   `);
 
   for (const id of contactIds) {
@@ -38,10 +38,12 @@ router.post('/', async (req, res) => {
       status:    'failed',
       previewUrl: null,
       error:     null,
+      subject:   null,
+      body:      null,
     };
 
     try {
-      const { previewUrl } = await sendCampaignEmail({
+      const { previewUrl, subject, html } = await sendCampaignEmail({
         to: contact.email,
         templateName,
         templateContent,
@@ -51,8 +53,10 @@ router.post('/', async (req, res) => {
       db.prepare('UPDATE contacts SET status=?, sentAt=? WHERE id=?')
         .run('sent', logEntry.date, id);
 
-      logEntry.status    = 'sent';
+      logEntry.status     = 'sent';
       logEntry.previewUrl = previewUrl;
+      logEntry.subject    = subject;
+      logEntry.body       = html;
       results.push({ id, status: 'sent', previewUrl });
     } catch (err) {
       db.prepare('UPDATE contacts SET status=? WHERE id=?').run('failed', id);

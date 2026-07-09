@@ -111,4 +111,8 @@ try { db.exec("ALTER TABLE schedule_config ADD COLUMN endTime   TEXT NOT NULL DE
 // Track which scheduled send produced each log entry
 try { db.exec("ALTER TABLE send_log ADD COLUMN scheduledSendId INTEGER") } catch {}
 
+// Store the rendered email content for the View button in the log
+try { db.exec("ALTER TABLE send_log ADD COLUMN subject TEXT") } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN body    TEXT") } catch {}
+
 export default db;
