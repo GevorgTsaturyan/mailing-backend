@@ -19,13 +19,16 @@ async function getTransporter() {
 
   if (_transporter && _transporterConfig === hash) return _transporter;
 
-  if (cfg.host && cfg.user && cfg.pass) {
-    _transporter = nodemailer.createTransport({
+  if (cfg.host) {
+    const transportOpts = {
       host: cfg.host,
       port: cfg.port,
       secure: cfg.secure === 1,
-      auth: { user: cfg.user, pass: cfg.pass },
-    });
+    };
+    if (cfg.user && cfg.pass) {
+      transportOpts.auth = { user: cfg.user, pass: cfg.pass };
+    }
+    _transporter = nodemailer.createTransport(transportOpts);
   } else {
     const testAccount = await nodemailer.createTestAccount();
     console.log('Using Ethereal test account:', testAccount.user);
@@ -56,10 +59,11 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
 
   const cfg = db.prepare('SELECT * FROM smtp_config WHERE id = 1').get();
 
+  const baseUrl = process.env.APP_URL || 'http://localhost:3001';
   const mergedVars = {
     bonusAmount: '100',
     promoCode: 'WELCOME100',
-    unsubscribeLink: `http://localhost:3001/unsubscribe?email=${encodeURIComponent(to)}`,
+    unsubscribeLink: `${baseUrl}/unsubscribe?email=${encodeURIComponent(to)}`,
     ...variables,
   };
 
@@ -72,7 +76,7 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
     text: renderTemplate(tmpl.txt, mergedVars),
     html: renderTemplate(tmpl.html, mergedVars),
     headers: {
-      'List-Unsubscribe': `<mailto:unsubscribe@example.com>, <http://localhost:3001/unsubscribe?email=${encodeURIComponent(to)}>`,
+      'List-Unsubscribe': `<mailto:unsubscribe@example.com>, <${baseUrl}/unsubscribe?email=${encodeURIComponent(to)}>`,
       'X-Mailer': 'MailCampaignManager/2.0',
     },
   });
