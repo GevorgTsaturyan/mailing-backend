@@ -38,6 +38,7 @@ mail-campaign-manager/
     scheduler.js          # node-cron: daily batch sender, reads schedule_config from DB
     create-admin.js       # CLI script to create or reset admin user password
     migrate.js            # One-time migration from JSON files to SQLite (already done)
+    seed.js               # Dev-only seed data (skipped when NODE_ENV=production); seeds all tables if empty
     middleware/
       auth.js             # JWT requireAuth middleware — applied to all /api/* except /api/auth
     routes/
@@ -93,7 +94,7 @@ mail-campaign-manager/
                           # Scheduler, SMTP Settings, Logout button
         StatsCard.vue     # Single stat display (label + number + color)
         ContactTable.vue  # Table with checkboxes, status badges, Edit button
-        LogTable.vue      # Send log table (date, name, email, template, status, preview link)
+        LogTable.vue      # Send log table with View button per row; modal shows subject, HTML body (iframe), error
         TemplatePreview.vue # Renders email HTML in a sandboxed iframe with variable substitution
 ```
 
@@ -107,7 +108,7 @@ contacts (id, firstName, lastName, email UNIQUE, status, sentAt)
 
 templates (name PK, subject, html, txt)
 
-send_log (id, date, contactId, name, email, template, status, previewUrl, error)
+send_log (id, date, contactId, name, email, template, status, previewUrl, error, subject, body, scheduledSendId)
 
 schedule_config (id=1 only, enabled 0/1, time '09:00', batchSize, template)
 
@@ -280,11 +281,22 @@ node create-admin.js <username> <password>
 ```
 JWT_SECRET=<long random string — generate with: openssl rand -hex 64>
 APP_URL=https://serawin.net
+NODE_ENV=production        # required — prevents dev seed data from running on server
 ```
 
 ---
 
 ## Session log
+
+- **2026-07-09** (session 2): Send status fixes, View log button, seed data, CLAUDE.md to GitHub.
+  - Fixed `send.js` / `mailer.js` / `scheduler.js`: `sendCampaignEmail` now returns rendered `subject` + `html`; both are stored in `send_log` (`subject`, `body` columns added via ALTER TABLE in `db.js`)
+  - Fixed `Dashboard.vue` + `Contacts.vue`: moved `fetchContacts()` to `finally` block so contact status always refreshes after a send attempt, even on error
+  - `LogTable.vue`: added View button per row — opens modal with subject, HTML body preview (sandboxed iframe), status badge, and error message for failed sends
+  - `Dashboard.vue` send results: now shows contact email instead of raw ID, plus status badge and inline error
+  - Added `backend/seed.js`: dev-only seed data for all 6 tables (contacts, templates, send_log, schedule_config, recurring_campaigns, scheduled_sends); skips when `NODE_ENV=production`; seeds only if table is empty
+  - `backend/.env.example`: added `NODE_ENV=production`
+  - CLAUDE.md copied into both GitHub repos (`mailing-backend`, `mailing-front`) — now version-controlled
+  - Standing rule established: update CLAUDE.md + push to both repos after every feature session
 
 - **2026-07-09**: Production deployment + mail server setup session.
   - Fixed `mailer.js`: `unsubscribeLink` and `List-Unsubscribe` header now use `APP_URL` env var instead of hardcoded `localhost:3001`
