@@ -1,124 +1,104 @@
 import cron from 'node-cron';
 import db from './db.js';
-import { sendCampaignEmail } from './mailer.js';
 
-// ─── Shared send utility ────────────────────────────────────────────────────
+// ─── Queue utility ────────────────────────────────────────────────────────────
+// Instead of calling Nodemailer directly, we insert a send_job row.
+// A mail-node polls GET /api/nodes/jobs and handles actual delivery.
 
-async function sendToContact(contact, templateName, templateContent, scheduledSendId = null) {
-  const logEntry = {
-    date:            new Date().toISOString(),
-    contactId:       contact.id,
-    name:            `${contact.firstName} ${contact.lastName}`,
-    email:           contact.email,
-    template:        templateName || '(custom)',
-    status:          'failed',
-    previewUrl:      null,
-    error:           null,
-    subject:         null,
-    body:            null,
-    scheduledSendId: scheduledSendId,
-  };
-
-  try {
-    const { previewUrl, subject, html } = await sendCampaignEmail({
-      to: contact.email,
-      templateName,
-      templateContent,
-      variables: { firstName: contact.firstName, lastName: contact.lastName },
-    });
-
-    db.prepare('UPDATE contacts SET status=?, sentAt=? WHERE id=?')
-      .run('sent', logEntry.date, contact.id);
-
-    logEntry.status     = 'sent';
-    logEntry.previewUrl = previewUrl;
-    logEntry.subject    = subject;
-    logEntry.body       = html;
-    console.log(`Scheduler: sent to ${contact.email} at ${logEntry.date}`);
-  } catch (err) {
-    db.prepare("UPDATE contacts SET status='failed' WHERE id=?").run(contact.id);
-    logEntry.error = err.message;
-    console.error(`Scheduler: failed for ${contact.email}: ${err.message}`);
-  }
-
-  db.prepare(`
-    INSERT INTO send_log (date, contactId, name, email, template, status, previewUrl, error, subject, body, scheduledSendId)
-    VALUES (@date, @contactId, @name, @email, @template, @status, @previewUrl, @error, @subject, @body, @scheduledSendId)
-  `).run(logEntry);
-
-  return logEntry.status;
+function pickActiveIdentity() {
+  return db.prepare("SELECT id FROM sender_identities WHERE status='active' ORDER BY id LIMIT 1").get()?.id || null;
 }
 
-// ─── Random-window planner (shared by daily batch + recurring campaigns) ─────
+function resolveTemplate(templateName, templateContent) {
+  if (templateContent?.subject) return templateContent;
+  if (templateName) {
+    const t = db.prepare('SELECT subject, html, txt FROM templates WHERE name=?').get(templateName);
+    if (t) return t;
+  }
+  return { subject: null, html: null, txt: null };
+}
 
-function scheduleRandomWindow(startTime, endTime, count, onFire) {
-  const [startHour, startMin] = startTime.split(':').map(Number);
-  const [endHour,   endMin  ] = endTime.split(':').map(Number);
+function queueJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null) {
+  const identityId = senderIdentityId ?? pickActiveIdentity();
+  const tmpl = resolveTemplate(templateName, templateContent);
+  const now  = new Date().toISOString();
 
-  const startTotalMins = startHour * 60 + startMin;
-  const endTotalMins   = endHour   * 60 + endMin;
-  const rangeMinutes   = endTotalMins - startTotalMins;
-
-  if (rangeMinutes <= 0 || count <= 0) return [];
-
-  const numHours  = Math.ceil(rangeMinutes / 60);
-  const base      = Math.floor(count / numHours);
-  const remainder = count % numHours;
-
-  const now      = Date.now();
-  const todayUTC = Date.UTC(
-    new Date().getUTCFullYear(),
-    new Date().getUTCMonth(),
-    new Date().getUTCDate()
+  const logRow = db.prepare(`
+    INSERT INTO send_log (date, contactId, name, email, template, status, subject, body, scheduledSendId, senderIdentityId)
+    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+  `).run(
+    now, contact.id,
+    `${contact.firstName} ${contact.lastName}`,
+    contact.email,
+    templateName || '(custom)',
+    tmpl.subject, tmpl.html,
+    scheduledSendId, identityId
   );
 
-  const timers = [];
+  const jobRow = db.prepare(`
+    INSERT INTO send_jobs
+      (senderIdentityId, contactId, email, firstName, lastName,
+       templateName, subject, html, txt, status, scheduledFor, createdAt, sendLogId, scheduledSendId)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+  `).run(
+    identityId,
+    contact.id, contact.email, contact.firstName, contact.lastName,
+    templateName || null, tmpl.subject, tmpl.html, tmpl.txt,
+    scheduledFor, now, logRow.lastInsertRowid, scheduledSendId
+  );
 
-  for (let h = 0; h < numHours; h++) {
-    const hourStartMins  = startTotalMins + h * 60;
-    const hourEndMins    = Math.min(startTotalMins + (h + 1) * 60, endTotalMins);
-    const emailsThisHour = base + (h < remainder ? 1 : 0);
+  db.prepare('UPDATE send_log SET sendJobId=? WHERE id=?')
+    .run(jobRow.lastInsertRowid, logRow.lastInsertRowid);
 
-    for (let i = 0; i < emailsThisHour; i++) {
-      const randMin  = hourStartMins + Math.floor(Math.random() * (hourEndMins - hourStartMins));
-      const randSec  = Math.floor(Math.random() * 60);
-      const sendTime = todayUTC + randMin * 60_000 + randSec * 1_000;
-      const delay    = sendTime - now;
+  db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(contact.id);
+}
 
-      if (delay <= 0) continue;
-      timers.push(setTimeout(onFire, delay));
-    }
+// ─── Random timestamps in a UTC window (returns sorted ISO strings) ───────────
+
+function randomTimesInWindow(startTime, endTime, count) {
+  const [sh, sm] = startTime.split(':').map(Number);
+  const [eh, em] = endTime.split(':').map(Number);
+  const startMins = sh * 60 + sm;
+  const endMins   = eh * 60 + em;
+  const rangeMins = endMins - startMins;
+
+  if (rangeMins <= 0 || count <= 0) return [];
+
+  const now      = new Date();
+  const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const times    = [];
+
+  for (let i = 0; i < count; i++) {
+    const offset  = Math.floor(Math.random() * rangeMins);
+    const totalM  = startMins + offset;
+    const h       = Math.floor(totalM / 60);
+    const m       = totalM % 60;
+    const s       = Math.floor(Math.random() * 60);
+    times.push(new Date(todayUTC + (h * 3600 + m * 60 + s) * 1000).toISOString());
   }
 
-  return timers;
+  return times.sort();
 }
 
 // ─── Daily batch ─────────────────────────────────────────────────────────────
 
-let dayTimers = [];
-
 function planDaySends() {
-  dayTimers.forEach(t => clearTimeout(t));
-  dayTimers = [];
-
-  const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
+  const cfg = db.prepare('SELECT * FROM schedule_config WHERE id=1').get();
   if (!cfg.enabled || cfg.batchSize <= 0) return;
 
-  const sendFn = () => {
-    const contact = db.prepare(
-      "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT 1"
-    ).get();
-    if (!contact) { console.log('Daily batch: no pending contacts'); return; }
-    sendToContact(contact, cfg.template, null);
-  };
+  const times    = randomTimesInWindow(cfg.startTime, cfg.endTime, cfg.batchSize);
+  const contacts = db.prepare(
+    "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
+  ).all(times.length);
 
-  dayTimers = scheduleRandomWindow(cfg.startTime, cfg.endTime, cfg.batchSize, sendFn);
-  console.log(`Daily batch: planned ${dayTimers.length} sends (${cfg.startTime}–${cfg.endTime} UTC)`);
+  for (let i = 0; i < contacts.length; i++) {
+    queueJobForContact(contacts[i], cfg.template, null, times[i]);
+  }
+
+  console.log(`Daily batch: queued ${contacts.length} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
 }
 
 // ─── Recurring campaigns ──────────────────────────────────────────────────────
-
-const campaignTimers = {}; // id → [timer, ...]
 
 function nextCount(campaign) {
   return Math.max(1, Math.round(
@@ -127,48 +107,36 @@ function nextCount(campaign) {
 }
 
 function planRecurringCampaigns() {
-  const todayUTC = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-
-  // Clear timers for campaigns that are no longer active
-  const activeIds = new Set(
-    db.prepare("SELECT id FROM recurring_campaigns WHERE status='active'").all().map(r => r.id)
-  );
-  for (const [idStr, timers] of Object.entries(campaignTimers)) {
-    if (!activeIds.has(Number(idStr))) {
-      timers.forEach(t => clearTimeout(t));
-      delete campaignTimers[idStr];
-    }
-  }
+  const todayUTC = new Date().toISOString().split('T')[0];
 
   for (const campaign of db.prepare("SELECT * FROM recurring_campaigns WHERE status='active'").all()) {
-    // Already planned today
     if (campaign.lastRunDate === todayUTC) continue;
 
     const count = nextCount(campaign);
+    const times = randomTimesInWindow(campaign.startTime, campaign.endTime, count);
 
-    // Mark as planned for today before scheduling (so restart doesn't double-plan)
-    db.prepare(
-      'UPDATE recurring_campaigns SET lastRunDate=?, currentDay=? WHERE id=?'
-    ).run(todayUTC, campaign.currentDay + 1, campaign.id);
+    const contacts = db.prepare(
+      "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
+    ).all(times.length);
+
+    if (contacts.length === 0) {
+      console.log(`Recurring "${campaign.name}": no pending contacts — completed`);
+      db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
+      continue;
+    }
 
     const templateContent = campaign.subject
       ? { subject: campaign.subject, html: campaign.html || '', txt: campaign.txt || '' }
       : null;
 
-    const sendFn = () => {
-      const c = db.prepare("SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT 1").get();
-      if (!c) {
-        console.log(`Recurring "${campaign.name}": no more pending contacts — marking completed`);
-        db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
-        return;
-      }
-      sendToContact(c, campaign.templateName, templateContent);
-    };
+    for (let i = 0; i < contacts.length; i++) {
+      queueJobForContact(contacts[i], campaign.templateName, templateContent, times[i]);
+    }
 
-    const timers = scheduleRandomWindow(campaign.startTime, campaign.endTime, count, sendFn);
-    campaignTimers[campaign.id] = timers;
+    db.prepare('UPDATE recurring_campaigns SET lastRunDate=?, currentDay=? WHERE id=?')
+      .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
-    console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}): planned ${timers.length} sends (${campaign.startTime}–${campaign.endTime} UTC)`);
+    console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}): queued ${contacts.length} jobs`);
   }
 }
 
@@ -178,7 +146,7 @@ export function applyRecurringCampaigns() {
 
 // ─── One-off scheduled sends (per-minute check) ───────────────────────────────
 
-async function checkScheduledSends() {
+function checkScheduledSends() {
   const now = new Date().toISOString();
   const due = db.prepare(
     "SELECT * FROM scheduled_sends WHERE status='pending' AND scheduledAt <= ?"
@@ -188,27 +156,22 @@ async function checkScheduledSends() {
     db.prepare("UPDATE scheduled_sends SET status='sent', sentAt=? WHERE id=?")
       .run(new Date().toISOString(), task.id);
 
-    const contactIds    = JSON.parse(task.contactIds);
+    const contactIds = JSON.parse(task.contactIds);
     const templateContent = task.subject
       ? { subject: task.subject, html: task.html || '', txt: task.txt || '' }
       : null;
 
-    console.log(`Scheduled send #${task.id}: sending to ${contactIds.length} contact(s)`);
+    console.log(`Scheduled send #${task.id}: queuing ${contactIds.length} job(s)`);
 
-    let anyFailed = false;
     for (const contactId of contactIds) {
       const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(contactId);
       if (!contact) continue;
-      if (await sendToContact(contact, task.templateName, templateContent, task.id) === 'failed')
-        anyFailed = true;
+      queueJobForContact(contact, task.templateName, templateContent, null, task.id);
     }
-
-    if (anyFailed)
-      db.prepare("UPDATE scheduled_sends SET status='failed' WHERE id=?").run(task.id);
   }
 }
 
-// ─── Exports ─────────────────────────────────────────────────────────────────
+// ─── Exports ──────────────────────────────────────────────────────────────────
 
 export function applyScheduleConfig() {
   planDaySends();

@@ -115,4 +115,118 @@ try { db.exec("ALTER TABLE send_log ADD COLUMN scheduledSendId INTEGER") } catch
 try { db.exec("ALTER TABLE send_log ADD COLUMN subject TEXT") } catch {}
 try { db.exec("ALTER TABLE send_log ADD COLUMN body    TEXT") } catch {}
 
+// ─── Infrastructure: providers → servers → sender identities ─────────────────
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS providers (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    name      TEXT NOT NULL UNIQUE,
+    createdAt TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS servers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    providerId INTEGER,
+    label      TEXT NOT NULL,
+    mainIp     TEXT NOT NULL DEFAULT '',
+    apiKey     TEXT NOT NULL UNIQUE,
+    status     TEXT NOT NULL DEFAULT 'offline',
+    lastSeenAt TEXT,
+    createdAt  TEXT NOT NULL,
+    FOREIGN KEY (providerId) REFERENCES providers(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS sender_identities (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    serverId       INTEGER NOT NULL,
+    domain         TEXT NOT NULL,
+    ip             TEXT NOT NULL,
+    fromName       TEXT NOT NULL DEFAULT '',
+    fromAddr       TEXT NOT NULL DEFAULT '',
+    dkimSelector   TEXT NOT NULL DEFAULT 'mail',
+    dailyLimit     INTEGER NOT NULL DEFAULT 50,
+    warmupStage    INTEGER NOT NULL DEFAULT 1,
+    dailySentCount INTEGER NOT NULL DEFAULT 0,
+    lastResetDate  TEXT,
+    status         TEXT NOT NULL DEFAULT 'active',
+    createdAt      TEXT NOT NULL,
+    FOREIGN KEY (serverId) REFERENCES servers(id)
+  );
+`);
+
+// ─── Send jobs: the work queue nodes pull from ────────────────────────────────
+// Each send request from the controller becomes rows in this table.
+// Nodes poll GET /api/nodes/jobs, claim rows, send via their local Postfix,
+// then POST /api/nodes/results to report back.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS send_jobs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    senderIdentityId INTEGER,
+    contactId        INTEGER,
+    email            TEXT NOT NULL,
+    firstName        TEXT NOT NULL DEFAULT '',
+    lastName         TEXT NOT NULL DEFAULT '',
+    templateName     TEXT,
+    subject          TEXT,
+    html             TEXT,
+    txt              TEXT,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    scheduledFor     TEXT,
+    queueId          TEXT,
+    dsnCode          TEXT,
+    relay            TEXT,
+    remoteResponse   TEXT,
+    reasonCategory   TEXT,
+    reasonDetail     TEXT,
+    claimedAt        TEXT,
+    sentAt           TEXT,
+    deliveredAt      TEXT,
+    sendLogId        INTEGER,
+    scheduledSendId  INTEGER,
+    createdAt        TEXT NOT NULL,
+    FOREIGN KEY (senderIdentityId) REFERENCES sender_identities(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_send_jobs_status        ON send_jobs(status);
+  CREATE INDEX IF NOT EXISTS idx_send_jobs_identityId    ON send_jobs(senderIdentityId);
+  CREATE INDEX IF NOT EXISTS idx_send_jobs_scheduledFor  ON send_jobs(scheduledFor);
+  CREATE INDEX IF NOT EXISTS idx_send_jobs_queueId       ON send_jobs(queueId);
+`);
+
+// ─── Delivery events: full timeline per message ───────────────────────────────
+// Postfix can defer a message several times before final delivery or bounce.
+// Each event the node parses from mail.log gets stored here.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS delivery_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    sendJobId      INTEGER,
+    queueId        TEXT,
+    email          TEXT,
+    eventType      TEXT,
+    dsnCode        TEXT,
+    relay          TEXT,
+    response       TEXT,
+    reasonCategory TEXT,
+    reasonDetail   TEXT,
+    logTime        TEXT,
+    createdAt      TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_delivery_events_queueId   ON delivery_events(queueId);
+  CREATE INDEX IF NOT EXISTS idx_delivery_events_sendJobId ON delivery_events(sendJobId);
+`);
+
+// Link send_log rows to their job
+try { db.exec("ALTER TABLE send_log ADD COLUMN sendJobId        INTEGER") } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN senderIdentityId INTEGER") } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN queueId          TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN deliveryStatus   TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN dsnCode          TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN remoteMx         TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN remoteResponse   TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN reasonCategory   TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN reasonDetail     TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN deliveredAt      TEXT")    } catch {}
+try { db.exec("ALTER TABLE send_log ADD COLUMN lastEventAt      TEXT")    } catch {}
+
 export default db;
