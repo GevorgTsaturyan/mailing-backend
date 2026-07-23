@@ -19,6 +19,7 @@ import senderIdentitiesRouter   from './routes/sender-identities.js';
 import nodesRouter              from './routes/nodes.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
+import { startOfflineWatcher } from './services/HeartbeatService.js';
 
 const app = express();
 const PORT = 3001;
@@ -69,4 +70,5 @@ seedDevData();
 app.listen(PORT, () => {
   console.log(`Mail Campaign Manager backend on http://localhost:${PORT}`);
   initScheduler();
+  startOfflineWatcher();
 });

@@ -29,8 +29,8 @@ Express 5  +  SQLite (better-sqlite3, WAL mode)  +  node-cron
 
 ```
 backend/
-  index.js                  # Express entry point: registers all routes, starts scheduler
-  db.js                     # SQLite initialization: creates all 13 tables on startup, ALTER TABLE migrations
+  index.js                  # Express entry point: registers all routes, starts scheduler + offline watcher
+  db.js                     # SQLite initialization: creates all tables on startup, ALTER TABLE migrations
   mailer.js                 # Legacy: sendCampaignEmail (dead code), testSmtpConnection, resetTransporter
   scheduler.js              # Job queue planner: planDaySends, planRecurringCampaigns, checkScheduledSends
   seed.js                   # Dev-only seed data; skipped when NODE_ENV=production
@@ -52,7 +52,11 @@ backend/
     providers.js            # CRUD /api/providers
     servers.js              # CRUD /api/servers + POST /:id/regenerate-key
     sender-identities.js    # CRUD /api/sender-identities + pause/resume
-    nodes.js                # Node API: register, heartbeat, jobs, results, delivery-events
+    nodes.js                # Node API thin handlers: delegates register/heartbeat to services
+  services/
+    NodeRepository.js       # All DB queries for the servers table (node layer)
+    NodeRegistrationService.js  # register(): validates apiKey, writes system info, returns identities
+    HeartbeatService.js     # recordHeartbeat(): stores health JSON; startOfflineWatcher(): marks OFFLINE after 90 s
   data/
     mail.db                 # SQLite database — all live data lives here
     mail.db-shm             # WAL shared memory (auto-generated)
@@ -154,8 +158,8 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 ### Node API (apiKey authenticated, no JWT)
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/api/nodes/register` | Called by node on startup. Validates apiKey, returns identity list. |
-| POST | `/api/nodes/heartbeat` | `{apiKey}`. Updates server status=online, lastSeenAt. |
+| POST | `/api/nodes/register` | `{apiKey, node_id, hostname, version, ip, public_ip, os, uptime, capabilities[]}`. Stores full system info, sets status=online. Returns `{ok, serverId, identities[]}`. |
+| POST | `/api/nodes/heartbeat` | `{apiKey, uptime, cpu, ram, disk, queue_size, postfix_running, opendkim_running}`. Stores health JSON in `servers.health`, sets status=online. If no heartbeat for 90 s, offline watcher sets status=offline. |
 | GET | `/api/nodes/jobs` | `?apiKey=&limit=10`. Returns due queued jobs for this server's identities. Marks them claimed. Resets daily counts at day rollover. |
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
 | POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Reports Postfix log verdicts. Updates delivery_events, send_jobs, send_log. |
@@ -217,7 +221,15 @@ providers (id INTEGER PK, name TEXT UNIQUE, createdAt TEXT)
 servers (
   id INTEGER PK, providerId INTEGER FK→providers,
   label TEXT, mainIp TEXT, apiKey TEXT UNIQUE,
-  status TEXT DEFAULT 'offline', lastSeenAt TEXT, createdAt TEXT
+  status TEXT DEFAULT 'offline', lastSeenAt TEXT, createdAt TEXT,
+  -- Added Milestone 1: Node Registration & Communication
+  node_id TEXT,        -- stable hash derived from apiKey (16 hex chars)
+  hostname TEXT,       -- os.hostname() from the node
+  version TEXT,        -- package.json version from the node
+  public_ip TEXT,      -- node's public-facing IP
+  os_info TEXT,        -- platform + release string
+  capabilities TEXT,   -- JSON array, e.g. '["send_email","health","postfix"]'
+  health TEXT          -- JSON blob of last heartbeat metrics + recordedAt
 )
 
 sender_identities (
@@ -260,6 +272,20 @@ send_log (
 ---
 
 ## Services
+
+### NodeRepository.js — DB Layer for Nodes
+All SQLite queries for the `servers` table's node-communication fields. Four functions:
+- `findByApiKey(apiKey)` — authenticates a node request
+- `updateRegistration(serverId, fields)` — writes node_id, hostname, version, ip, public_ip, os_info, capabilities; sets status=online
+- `updateHeartbeat(serverId, health)` — stores health JSON, sets status=online, updates lastSeenAt
+- `markStaleOffline(thresholdMs)` — sets status=offline for any server whose lastSeenAt is older than thresholdMs
+
+### NodeRegistrationService.js — Registration Logic
+`register(body)` — validates apiKey, calls NodeRepository.updateRegistration, returns `{ok, serverId, identities}` or `{error, status}`.
+
+### HeartbeatService.js — Heartbeat + Offline Detection
+- `recordHeartbeat(apiKey, metrics)` — validates apiKey, builds health object, calls NodeRepository.updateHeartbeat
+- `startOfflineWatcher()` — called once on startup; sets a 30 s interval that calls `markStaleOffline(90_000)`. Any node silent for 90 s gets status=offline.
 
 ### scheduler.js — Job Planner
 Does NOT send email. Creates `send_jobs` rows for mail-nodes to pick up.
@@ -449,7 +475,13 @@ node index.js                             # or: pm2 start index.js --name backen
 
 ## Current Milestone
 
-Distributed send architecture is complete:
+**Milestone 1 complete: Node Registration & Communication**
+- Nodes register on startup with full system metadata (node_id, hostname, version, IP, OS, capabilities)
+- Heartbeat every 30 s with live health metrics (cpu, ram, disk, queue_size, postfix_running, opendkim_running)
+- Offline watcher marks nodes OFFLINE after 90 s of silence
+- Clean service layer: NodeRepository → NodeRegistrationService + HeartbeatService → thin route handlers
+
+**Send pipeline also complete:**
 - Controller queues jobs → mail-nodes poll and send via Postfix → delivery verdicts reported back
 - Daily batch, recurring campaigns, and scheduled one-off sends all route through job queue
 - Server/provider/identity management UI is live

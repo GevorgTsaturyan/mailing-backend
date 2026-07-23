@@ -1,7 +1,11 @@
 import express from 'express';
 import db from '../db.js';
+import { register } from '../services/NodeRegistrationService.js';
+import { recordHeartbeat } from '../services/HeartbeatService.js';
 
 const router = express.Router();
+
+// ─── Helpers used by jobs / results / delivery-events ─────────────────────────
 
 function getServer(apiKey) {
   return db.prepare('SELECT * FROM servers WHERE apiKey = ?').get(apiKey);
@@ -12,38 +16,24 @@ function touch(serverId) {
     .run(new Date().toISOString(), serverId);
 }
 
-// POST /api/nodes/register
-// Called by a node on startup. apiKey must already exist (created in controller UI).
+// ─── POST /api/nodes/register ─────────────────────────────────────────────────
+// Called by a node on startup. Stores full system info and returns active identities.
 router.post('/register', (req, res) => {
-  const { apiKey, mainIp, label } = req.body;
-  const server = getServer(apiKey);
-  if (!server) return res.status(401).json({ error: 'Invalid apiKey. Create the server in the controller UI first.' });
-
-  const updates = {};
-  if (mainIp) updates.mainIp = mainIp;
-  if (label)  updates.label  = label;
-
-  if (Object.keys(updates).length > 0) {
-    const sets = Object.keys(updates).map(k => `${k}=?`).join(', ');
-    db.prepare(`UPDATE servers SET ${sets} WHERE id=?`).run(...Object.values(updates), server.id);
-  }
-  touch(server.id);
-
-  const identities = db.prepare("SELECT * FROM sender_identities WHERE serverId=? AND status='active'").all(server.id);
-  res.json({ ok: true, serverId: server.id, identities });
+  const result = register(req.body);
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json(result);
 });
 
-// POST /api/nodes/heartbeat
+// ─── POST /api/nodes/heartbeat ────────────────────────────────────────────────
+// Called every 30 s. Stores health metrics; offline watcher marks OFFLINE after 90 s silence.
 router.post('/heartbeat', (req, res) => {
-  const { apiKey } = req.body;
-  const server = getServer(apiKey);
-  if (!server) return res.status(401).json({ error: 'Invalid apiKey' });
-  touch(server.id);
-  res.json({ ok: true });
+  const result = recordHeartbeat(req.body.apiKey, req.body);
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json(result);
 });
 
-// GET /api/nodes/jobs?apiKey=xxx&limit=10
-// Returns queued jobs assigned to this server's identities, respecting scheduledFor and daily limits.
+// ─── GET /api/nodes/jobs ──────────────────────────────────────────────────────
+// Returns queued jobs for this server's identities, respecting scheduledFor and daily limits.
 router.get('/jobs', (req, res) => {
   const { apiKey, limit = 10 } = req.query;
   const server = getServer(apiKey);
@@ -52,7 +42,6 @@ router.get('/jobs', (req, res) => {
 
   const today = new Date().toISOString().slice(0, 10);
 
-  // Reset daily counts for identities whose date rolled over
   db.prepare(`
     UPDATE sender_identities SET dailySentCount=0, lastResetDate=?
     WHERE serverId=? AND (lastResetDate IS NULL OR lastResetDate != ?)
@@ -61,7 +50,7 @@ router.get('/jobs', (req, res) => {
   const identities = db.prepare("SELECT * FROM sender_identities WHERE serverId=? AND status='active'").all(server.id);
   if (identities.length === 0) return res.json({ jobs: [] });
 
-  const now = new Date().toISOString();
+  const now  = new Date().toISOString();
   const jobs = [];
   const cap  = Math.min(Number(limit), 50);
 
@@ -92,7 +81,7 @@ router.get('/jobs', (req, res) => {
   res.json({ jobs });
 });
 
-// POST /api/nodes/results
+// ─── POST /api/nodes/results ──────────────────────────────────────────────────
 // Node reports send outcomes (success or failure from local Postfix submission).
 router.post('/results', (req, res) => {
   const { apiKey, results } = req.body;
@@ -145,9 +134,8 @@ router.post('/results', (req, res) => {
   res.json({ ok: true });
 });
 
-// POST /api/nodes/delivery-events
+// ─── POST /api/nodes/delivery-events ─────────────────────────────────────────
 // Node reports parsed Postfix mail.log events (delivered / deferred / bounced).
-// These are the final verdicts from Gmail/Outlook/etc.
 router.post('/delivery-events', (req, res) => {
   const { apiKey, events } = req.body;
   const server = getServer(apiKey);
@@ -181,8 +169,8 @@ router.post('/delivery-events', (req, res) => {
       e.logTime || now, now
     );
 
-    const finalStatus = e.eventType === 'sent' ? 'delivered' : e.eventType === 'bounced' ? 'bounced' : 'deferred';
-    const deliveredAt = e.eventType === 'sent' ? now : null;
+    const finalStatus  = e.eventType === 'sent' ? 'delivered' : e.eventType === 'bounced' ? 'bounced' : 'deferred';
+    const deliveredAt  = e.eventType === 'sent' ? now : null;
 
     updateJob.run(finalStatus, e.dsnCode || null, e.relay || null,
       (e.response || '').slice(0, 500), e.reasonCategory || null, e.reasonDetail || null,

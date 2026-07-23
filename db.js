@@ -229,4 +229,13 @@ try { db.exec("ALTER TABLE send_log ADD COLUMN reasonDetail     TEXT")    } catc
 try { db.exec("ALTER TABLE send_log ADD COLUMN deliveredAt      TEXT")    } catch {}
 try { db.exec("ALTER TABLE send_log ADD COLUMN lastEventAt      TEXT")    } catch {}
 
+// ─── Node registration metadata (Milestone 1) ─────────────────────────────────
+try { db.exec("ALTER TABLE servers ADD COLUMN node_id      TEXT") } catch {}
+try { db.exec("ALTER TABLE servers ADD COLUMN hostname     TEXT") } catch {}
+try { db.exec("ALTER TABLE servers ADD COLUMN version      TEXT") } catch {}
+try { db.exec("ALTER TABLE servers ADD COLUMN public_ip    TEXT") } catch {}
+try { db.exec("ALTER TABLE servers ADD COLUMN os_info      TEXT") } catch {}
+try { db.exec("ALTER TABLE servers ADD COLUMN capabilities TEXT") } catch {}
+try { db.exec("ALTER TABLE servers ADD COLUMN health       TEXT") } catch {}
+
 export default db;
