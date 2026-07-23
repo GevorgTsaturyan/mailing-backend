@@ -408,7 +408,7 @@ All SQLite queries for the `campaign_stats` table. Five functions:
 
 Each event is processed in its own `db.transaction()`. A bad event never blocks the rest of the batch.
 
-**Event fields**: `queueId`, `eventType` (`'sent'`|`'bounced'`|`'deferred'`), and optionally `dsnCode`, `relay`, `response`, `reasonCategory`, `reasonDetail`, `logTime`, `email`.
+**Event fields**: `queueId`, `eventType` (`'sent'`|`'bounced'`|`'deferred'`|`'complained'`), and optionally `dsnCode`, `relay`, `response`, `reasonCategory`, `reasonDetail`, `logTime`, `email`.
 
 **Processing order per event:**
 1. Map `eventType` → internal `delivery_status` via `EVENT_TO_STATUS`. Unknown types are skipped.
@@ -424,6 +424,8 @@ Each event is processed in its own `db.transaction()`. A bad event never blocks 
 SMTP_PENDING(0) < SMTP_ACCEPTED(1) < DEFERRED(2) < DELIVERED/BOUNCED/SEND_FAILED(3) < COMPLAINED(4)
 ```
 Late `DEFERRED` events arriving after `DELIVERED` are recorded in `delivery_events` but do not regress `jobs.delivery_status` or counters.
+
+After the transaction, if `didTransition` is true and the new status is terminal, `checkAndCompleteCampaign(campaignId)` is called. This runs outside the delivery-event transaction so the completion check doesn't extend the write lock.
 
 All prepared statements are module-level (compiled once, reused across all calls).
 
@@ -755,7 +757,7 @@ No application logic was changed. All existing queries and endpoints are unaffec
 **Modified route:**
 - `routes/nodes.js` — `POST /api/nodes/delivery-events` handler replaced: the previous 40-line inline loop is now a single `processEvents(events)` call; response now includes `{ok, processed, skipped}`
 
-**What is NOT yet wired (deferred to Phase 4+):**
+**What is NOT yet wired (deferred to Phase 5+):**
 - No campaign API endpoints (`GET /api/campaigns`, `GET /api/campaigns/:id`, etc.)
 - No frontend
 
@@ -795,6 +797,37 @@ delivery COMPLAINED  → campaign_stats.total_complained++    (DeliveryEventServ
 ```
 
 **Phase 3 verification:** 9 functional test scenarios all passed — campaign_id persisted to jobs, all counter transitions correct, exclusive-arc FKs correct (scheduled_send_id and recurring_campaign_id), orphan jobs (no campaign_id) are safely handled.
+
+### Phase 4 complete: Delivery Event Lifecycle + Campaign Completion
+
+**Modified files:**
+
+`services/CampaignRepository.js`:
+- `markCompleted` now uses `WHERE id=? AND status='running'` guard — idempotent, second call is a safe no-op
+- New `checkAndCompleteCampaign(campaignId)` (exported): checks campaign is `running`, then counts `total` vs `terminal_count` from actual `jobs` rows (not derived counters). If `total > 0 && total === terminal_count`, calls `markCompleted`. Terminal states: `DELIVERED`, `BOUNCED`, `SEND_FAILED`, `COMPLAINED`. Non-terminal: `SMTP_PENDING`, `SMTP_ACCEPTED`, `DEFERRED`.
+
+`services/DeliveryEventService.js`:
+- Added `complained → COMPLAINED` to `EVENT_TO_STATUS` (ISP feedback-loop complaints; FSM priority 4 — highest)
+- Added `COMPLAINED → 'complained'` to `STATUS_TO_LOG` (prevents NULL being written to `send_log.deliveryStatus`)
+- Added `TERMINAL_STATUSES` Set at module level
+- `processSingleEvent` restructured: closure variables `campaignId` and `didTransition` are set inside the `db.transaction()`; after the transaction commits, if `didTransition && campaignId && TERMINAL_STATUSES.has(newDeliveryStatus)`, calls `checkAndCompleteCampaign`. The completion check runs outside the delivery-event transaction so it doesn't hold the write lock.
+
+`services/CampaignResultService.js`:
+- `onJobCompleted`: all 5 writes (send_log, contact, dailySentCount, delivery_status, campaign_stats) are now in a **single** `db.transaction()` — previously delivery_status + stats were in a separate inner transaction
+- `onJobFailed`: same consolidation for all 4 writes; after the transaction commits, calls `checkAndCompleteCampaign(job.campaign_id)` — `SEND_FAILED` is terminal, so this is the trigger for campaigns that fail at SMTP submission without ever reaching Postfix delivery
+
+**Supported event types (full set):**
+| `eventType` | `delivery_status` | Priority | Terminal |
+|-------------|-------------------|----------|---------|
+| — (initial) | `SMTP_PENDING` | 0 | No |
+| job complete | `SMTP_ACCEPTED` | 1 | No |
+| `deferred` | `DEFERRED` | 2 | No |
+| `sent` | `DELIVERED` | 3 | Yes |
+| `bounced` | `BOUNCED` | 3 | Yes |
+| job fail | `SEND_FAILED` | 3 | Yes |
+| `complained` | `COMPLAINED` | 4 | Yes |
+
+**Phase 4 verification:** 36 functional test scenarios all passed — full FSM lifecycle, deferred→delivered counter correction, bounced contact marking, complained contact unsubscribing, SEND_FAILED campaign completion, partial-campaign premature-completion prevention, FSM regression blocking, markCompleted idempotency, dedup skipping.
 
 ---
 

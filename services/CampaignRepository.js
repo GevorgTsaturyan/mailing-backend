@@ -37,7 +37,31 @@ export function findById(id) {
   return db.prepare('SELECT * FROM campaigns WHERE id = ?').get(id) ?? null;
 }
 
+// WHERE status='running' guard makes this idempotent: a second call is a safe no-op.
 export function markCompleted(id) {
-  db.prepare("UPDATE campaigns SET status='completed', completed_at=? WHERE id=?")
+  db.prepare("UPDATE campaigns SET status='completed', completed_at=? WHERE id=? AND status='running'")
     .run(new Date().toISOString(), id);
+}
+
+// checkAndCompleteCampaign(campaignId)
+// Called after any terminal delivery_status is written to a job.
+// Reads the actual jobs table (not derived counters) to avoid completing prematurely.
+// Terminal states: DELIVERED, BOUNCED, SEND_FAILED, COMPLAINED.
+// Non-terminal: SMTP_PENDING, SMTP_ACCEPTED, DEFERRED.
+// No-op if the campaign is already completed or has no jobs.
+export function checkAndCompleteCampaign(campaignId) {
+  const campaign = db.prepare("SELECT status FROM campaigns WHERE id = ?").get(campaignId);
+  if (!campaign || campaign.status !== 'running') return;
+
+  const { total, terminal_count } = db.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN delivery_status IN ('DELIVERED','BOUNCED','SEND_FAILED','COMPLAINED')
+               THEN 1 ELSE 0 END) AS terminal_count
+    FROM jobs WHERE campaign_id = ?
+  `).get(campaignId);
+
+  if (total > 0 && total === terminal_count) {
+    markCompleted(campaignId);
+  }
 }

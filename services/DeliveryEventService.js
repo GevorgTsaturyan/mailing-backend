@@ -1,5 +1,6 @@
 import db from '../db.js';
 import { findOrCreate as findOrCreateStats, applyDeliveryEvent } from './CampaignStatsRepository.js';
+import { checkAndCompleteCampaign } from './CampaignRepository.js';
 
 // ─── DeliveryEventService ─────────────────────────────────────────────────────
 // Processes delivery events reported by mail-nodes from Postfix mail.log.
@@ -27,19 +28,25 @@ const FSM_PRIORITY = {
   COMPLAINED:    4,
 };
 
-// Postfix log status → internal delivery_status (uppercase)
+// Postfix log eventType → internal delivery_status (uppercase)
 const EVENT_TO_STATUS = {
-  sent:     'DELIVERED',
-  bounced:  'BOUNCED',
-  deferred: 'DEFERRED',
+  sent:      'DELIVERED',
+  bounced:   'BOUNCED',
+  deferred:  'DEFERRED',
+  complained: 'COMPLAINED',   // ISP feedback-loop complaint; highest FSM priority
 };
 
-// delivery_status → send_log.deliveryStatus (lowercase — backward-compatible)
+// delivery_status → send_log.deliveryStatus / send_jobs.status (lowercase — backward-compatible)
 const STATUS_TO_LOG = {
-  DELIVERED: 'delivered',
-  BOUNCED:   'bounced',
-  DEFERRED:  'deferred',
+  DELIVERED:  'delivered',
+  BOUNCED:    'bounced',
+  DEFERRED:   'deferred',
+  COMPLAINED: 'complained',
 };
+
+// Terminal delivery states: once reached, the job's delivery outcome is final.
+// DEFERRED, SMTP_PENDING, SMTP_ACCEPTED are non-terminal (delivery still in progress).
+const TERMINAL_STATUSES = new Set(['DELIVERED', 'BOUNCED', 'SEND_FAILED', 'COMPLAINED']);
 
 // ─── Prepared statements (module-level for reuse across calls) ────────────────
 
@@ -101,7 +108,12 @@ function processSingleEvent(event, now) {
   // dedup_key ties this specific log line to exactly one delivery_events row
   const dedupKey = `${event.queueId}_${event.eventType}_${event.logTime ?? now}`;
 
-  return db.transaction(() => {
+  // Closure variables set inside the transaction; read after it commits.
+  // Used to trigger campaign completion without holding a DB lock.
+  let campaignId    = null;
+  let didTransition = false;  // true when the FSM-gated update path ran
+
+  const result = db.transaction(() => {
     // Resolve job references for both pipelines
     const canonicalJob  = lookupCanonicalJob.get(event.queueId);
     const legacySendJob = lookupLegacySendJob.get(event.queueId);
@@ -179,6 +191,7 @@ function processSingleEvent(event, now) {
     if (canonicalJob?.campaign_id) {
       findOrCreateStats(canonicalJob.campaign_id);
       applyDeliveryEvent(canonicalJob.campaign_id, priorStatus, newDeliveryStatus);
+      campaignId = canonicalJob.campaign_id;  // captured for post-transaction check
     }
 
     // contact updates on hard outcomes
@@ -191,8 +204,19 @@ function processSingleEvent(event, now) {
       }
     }
 
+    didTransition = true;  // FSM-gated path ran; delivery_status committed
     return { skipped: false };
   })();
+
+  // ── 5. Campaign completion check (after transaction commits) ─────────────────
+  // Only when a terminal state was written and the job belongs to a campaign.
+  // Runs outside the event transaction so the completion UPDATE doesn't hold
+  // the delivery lock.
+  if (didTransition && campaignId && TERMINAL_STATUSES.has(newDeliveryStatus)) {
+    checkAndCompleteCampaign(campaignId);
+  }
+
+  return result;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -200,7 +224,7 @@ function processSingleEvent(event, now) {
 // processEvents(events[]) → { processed, skipped }
 //
 // events[] comes from POST /api/nodes/delivery-events.  Each event must have:
-//   queueId, eventType ('sent'|'bounced'|'deferred'),
+//   queueId, eventType ('sent'|'bounced'|'deferred'|'complained'),
 //   and optionally: dsnCode, relay, response, reasonCategory, reasonDetail,
 //   logTime, email.
 //
