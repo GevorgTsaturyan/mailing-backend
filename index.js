@@ -1,4 +1,10 @@
 import 'dotenv/config';
+
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set. Generate one with: openssl rand -hex 64');
+  process.exit(1);
+}
+
 import express from 'express';
 import cors from 'cors';
 import db from './db.js';
@@ -48,10 +54,11 @@ app.get('/unsubscribe', (req, res) => {
   const email = req.query.email;
   if (!email) return res.status(400).send('Missing email');
   db.prepare("UPDATE contacts SET status='unsubscribed' WHERE email=?").run(email.toLowerCase());
+  const safe = email.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
   res.send(`
     <html><body style="font-family:sans-serif;text-align:center;padding:60px">
       <h2>You have been unsubscribed</h2>
-      <p>The email address <strong>${email}</strong> will no longer receive campaigns.</p>
+      <p>The email address <strong>${safe}</strong> will no longer receive campaigns.</p>
     </body></html>
   `);
 });
@@ -73,7 +80,10 @@ app.use('/api/sender-identities',    senderIdentitiesRouter);
 seedDevData();
 
 app.listen(PORT, () => {
-  console.log(`Mail Campaign Manager backend on http://localhost:${PORT}`);
+  console.log(`[startup] Database initialized`);
+  console.log(`[startup] Queue mode: ${process.env.USE_CANONICAL_QUEUE === 'true' ? 'Canonical' : 'Legacy'}`);
+  console.log(`[startup] Backend listening on http://localhost:${PORT}`);
   initScheduler();
+  console.log('[startup] Scheduler initialized');
   startOfflineWatcher();
 });

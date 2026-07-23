@@ -19,7 +19,7 @@ Express 5  +  SQLite (better-sqlite3, WAL mode)  +  node-cron
 
 - **Single process**: one Node.js process, one SQLite file, no external services required
 - **Two auth planes**: JWT for human users, per-server `apiKey` for mail-node agents
-- **Job queue pattern**: the controller writes `send_jobs` rows; nodes poll and consume them
+- **Dual queue (Milestone 5 transition)**: `send_jobs` (legacy) and `jobs` (canonical) both active; a feature flag controls which one new campaigns write to. The legacy pipeline drains naturally.
 - **All times UTC**: scheduledFor, createdAt, sentAt, deliveredAt are all ISO 8601 UTC strings
 - **ESM modules** (`"type": "module"` in package.json)
 
@@ -33,6 +33,7 @@ backend/
   db.js                     # SQLite initialization: creates all tables on startup, ALTER TABLE migrations
   mailer.js                 # Legacy: sendCampaignEmail (dead code), testSmtpConnection, resetTransporter
   scheduler.js              # Job queue planner: planDaySends, planRecurringCampaigns, checkScheduledSends
+                            #   Milestone 5: USE_CANONICAL_QUEUE flag routes new sends to jobs vs send_jobs
   seed.js                   # Dev-only seed data; skipped when NODE_ENV=production
   migrate.js                # One-time migration from legacy JSON files → SQLite (already done, keep for reference)
   create-admin.js           # CLI: node create-admin.js <username> <password> (creates or resets admin)
@@ -57,6 +58,7 @@ backend/
     NodeRepository.js       # All DB queries for the servers table (node layer)
     NodeRegistrationService.js  # register(): validates apiKey, writes system info, returns identities
     HeartbeatService.js     # recordHeartbeat(): stores health JSON; startOfflineWatcher(): marks OFFLINE after 90 s
+    CampaignResultService.js    # Milestone 5: onJobCompleted / onJobFailed — updates send_log, contacts, dailySentCount
   data/
     mail.db                 # SQLite database — all live data lives here
     mail.db-shm             # WAL shared memory (auto-generated)
@@ -164,14 +166,14 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
 | POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Reports Postfix log verdicts. Updates delivery_events, send_jobs, send_log. |
 
-### Job Queue API (Milestone 4 — fully active)
+### Job Queue API (Milestone 4 — fully active; Milestone 5: side-effects added)
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | POST | `/api/jobs` | JWT | `{identity_id?, recipient, subject, body?, priority?}`. Creates a PENDING job. Returns the created job. `identity_id` must reference a `sender_identities` row with a populated `fromAddr` or the node will FAIL the job at send time. |
-| GET | `/api/jobs/poll` | apiKey | `?apiKey=`. Read-only peek at the next PENDING job (highest priority, oldest first). Response includes `fromAddr`, `fromName`, `domain` from `sender_identities` (LEFT JOIN on `identity_id`). Returns the job or **204 No Content** if queue is empty. Does NOT claim the job. |
+| GET | `/api/jobs/poll` | apiKey | `?apiKey=`. Read-only peek at the next PENDING job (highest priority, oldest first). Filters by `scheduled_for <= now` (withholds future-scheduled campaign jobs). Response includes `fromAddr`, `fromName`, `domain` from `sender_identities`. Returns the job or **204 No Content** if queue is empty. Does NOT claim the job. |
 | POST | `/api/jobs/:id/start` | apiKey | `{apiKey}`. Atomically claims the job: PENDING → PROCESSING. Returns 409 if another node already claimed it. |
-| POST | `/api/jobs/:id/complete` | apiKey | `{apiKey, queue_id?}`. Marks PROCESSING → SENT. `queue_id` is the Postfix queue ID (stored in `jobs.queue_id` for future delivery event correlation). Omitting `queue_id` is valid — backward-compatible. Only the owning node may call this. |
-| POST | `/api/jobs/:id/fail` | apiKey | `{apiKey, error_message?}`. Marks PROCESSING → FAILED. Only the owning node may call this. |
+| POST | `/api/jobs/:id/complete` | apiKey | `{apiKey, queue_id?}`. Marks PROCESSING → SENT. **Milestone 5**: also calls `CampaignResultService.onJobCompleted` — updates `send_log` status, marks contact `sent`, increments `dailySentCount`. Only the owning node may call this. |
+| POST | `/api/jobs/:id/fail` | apiKey | `{apiKey, error_message?}`. Marks PROCESSING → FAILED. **Milestone 5**: also calls `CampaignResultService.onJobFailed` — marks `send_log` failed, marks contact `failed`. Only the owning node may call this. |
 
 ### Public
 | Method | Path | Notes |
@@ -192,21 +194,27 @@ jobs (
   identity_id   INTEGER FK→sender_identities (nullable),
   recipient     TEXT NOT NULL,            -- destination email address
   subject       TEXT NOT NULL,
-  body          TEXT DEFAULT '',
+  body          TEXT DEFAULT '',          -- HTML email body; TXT falls back to body on the node
   priority      INTEGER DEFAULT 0,        -- higher = dispatched first
   attempts      INTEGER DEFAULT 0,        -- incremented each time a node claims the job
   created_at    TEXT NOT NULL,
   started_at    TEXT,                     -- set when first claimed
   finished_at   TEXT,                     -- set on SENT or FAILED
   error_message TEXT,                     -- set on FAILED
-  queue_id      TEXT                      -- Postfix queue ID reported by node on complete; links to mail.log
+  queue_id      TEXT,                     -- Postfix queue ID reported by node on complete; links to mail.log
+  -- Milestone 5: campaign fields (NULL for manually-created jobs via POST /api/jobs)
+  scheduled_for TEXT,                     -- dispatch withheld until this UTC timestamp; NULL = immediate
+  contact_id    INTEGER,                  -- FK→contacts; allows completion handler to update contact status
+  send_log_id   INTEGER                   -- FK→send_log; allows completion handler to update send_log status
 )
 -- Indexes: (status, priority DESC, created_at ASC) for O(1) poll; node_id for node queries
+-- Poll filter also applies scheduled_for: jobs with a future scheduled_for are withheld
 
 contacts (
   id INTEGER PK, firstName TEXT, lastName TEXT,
   email TEXT UNIQUE, status TEXT DEFAULT 'pending', sentAt TEXT
 )
+-- Index: status (for scheduler queries that filter by pending/queued)
 -- status: 'pending' | 'queued' | 'sent' | 'failed' | 'unsubscribed'
 
 templates (
@@ -233,6 +241,7 @@ scheduled_sends (
   templateName TEXT, subject TEXT, html TEXT, txt TEXT,
   scheduledAt TEXT, status TEXT DEFAULT 'pending', createdAt TEXT, sentAt TEXT
 )
+-- Index: (status, scheduledAt) for O(1) per-minute check in checkScheduledSends()
 
 recurring_campaigns (
   id INTEGER PK, name TEXT, templateName TEXT,
@@ -294,6 +303,7 @@ send_log (
   deliveryStatus TEXT, dsnCode TEXT, remoteMx TEXT, remoteResponse TEXT,
   reasonCategory TEXT, reasonDetail TEXT, deliveredAt TEXT, lastEventAt TEXT
 )
+-- Index: scheduledSendId (for log lookups by scheduled send)
 ```
 
 ---
@@ -304,11 +314,18 @@ send_log (
 All SQLite queries for the `jobs` table. Six functions:
 - `create(fields)` — inserts a PENDING job; returns the created row
 - `findById(id)` — returns a single job by primary key
-- `findNextPending()` — `SELECT j.*, si.fromAddr, si.fromName, si.domain FROM jobs j LEFT JOIN sender_identities si ON si.id = j.identity_id WHERE j.status='PENDING' ORDER BY priority DESC, created_at ASC LIMIT 1`; returns null if queue is empty. The JOIN means the node receives sender info without a separate round-trip.
+- `findNextPending()` — selects the highest-priority PENDING job whose `scheduled_for IS NULL OR scheduled_for <= now`; LEFT JOINs sender_identities for fromAddr/fromName/domain. Returns null if queue is empty.
 - `claimJob(id, nodeId)` — `UPDATE … WHERE id=? AND status='PENDING'`; returns `true` if `changes===1` (won the race), `false` otherwise
 - `markSent(id, nodeId, queueId)` — `UPDATE … WHERE id=? AND status='PROCESSING' AND node_id=?`; stores Postfix `queue_id`; returns `true` on success
 - `markFailed(id, nodeId, errorMessage)` — same guard as markSent; sets error_message
 - `markCancelled(id)` — cancels PENDING or PROCESSING jobs (internal utility, no API endpoint)
+
+### CampaignResultService.js — Completion Side-Effects for Campaign Jobs (Milestone 5)
+Called by `routes/jobs.js` after a canonical job transitions to SENT or FAILED. Mirrors the
+side-effects that `POST /api/nodes/results` produces for the legacy send_jobs pipeline.
+- `onJobCompleted(jobId, queueId)` — fetches the job; if `send_log_id` is set, marks send_log `sent` and stores queueId; if `contact_id` is set, marks contact `sent` + sets sentAt; if `identity_id` is set, increments `dailySentCount`
+- `onJobFailed(jobId, errorMessage)` — fetches the job; marks send_log `failed` + stores error; marks contact `failed`
+Both functions are no-ops when the job has no campaign fields (safe to call for any job).
 
 ### JobService.js — Job Lifecycle Logic
 Validates inputs and orchestrates state transitions via JobRepository:
@@ -336,27 +353,28 @@ All SQLite queries for the `servers` table's node-communication fields. Four fun
 - `recordHeartbeat(apiKey, metrics)` — validates apiKey, builds health object, calls NodeRepository.updateHeartbeat
 - `startOfflineWatcher()` — called once on startup; sets a 30 s interval that calls `markStaleOffline(90_000)`. Any node silent for 90 s gets status=offline.
 
-### scheduler.js — Job Planner
-Does NOT send email. Creates `send_jobs` rows for mail-nodes to pick up.
+### scheduler.js — Job Planner (Milestone 5: dual-queue)
+Does NOT send email. Creates job queue rows for mail-nodes to pick up.
+
+**Feature flag**: reads `USE_CANONICAL_QUEUE` from env at call time. When `true`, all three planner functions write to the `jobs` table (canonical pipeline). When `false` or unset, they write to `send_jobs` (legacy pipeline). The legacy pipeline drains existing rows normally regardless of the flag.
+
+**Daily limit enforcement (canonical path only)**: `getIdentityRemainingCapacity(identityId)` resets `dailySentCount` if the calendar day changed, then returns `max(0, dailyLimit - dailySentCount)`. Planners cap their batch at this capacity before fetching contacts — the queue only holds dispatchable jobs.
 
 **`planDaySends()`** — called on startup + every midnight UTC:
-1. Reads `schedule_config` (must be enabled, batchSize > 0)
-2. Generates `batchSize` random ISO timestamps within the `startTime`–`endTime` UTC window for today
-3. Inserts one `send_jobs` row per contact (status=queued, scheduledFor=random time)
-4. Sets contact status to `queued`
+- **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window, creates `jobs` rows with `scheduled_for` set
+- **Legacy**: unchanged — generates random timestamps, creates `send_jobs` rows
 
 **`planRecurringCampaigns()`** — called on startup + every midnight UTC:
-1. For each `active` recurring campaign where `lastRunDate != today`:
-2. Computes today's count: `round(initialCount × (1 + increasePercent/100)^currentDay)`
-3. Generates that many random times in the campaign's window
-4. Creates `send_jobs` rows for the next N pending contacts
-5. Updates `lastRunDate` and increments `currentDay`
-6. Marks campaign `completed` when no pending contacts remain
+- For each `active` recurring campaign where `lastRunDate != today`:
+- Computes today's count: `round(initialCount × (1 + increasePercent/100)^currentDay)`
+- **Canonical**: caps count by remaining capacity, creates `jobs` rows
+- **Legacy**: unchanged — creates `send_jobs` rows
+- Updates `lastRunDate` and increments `currentDay`; marks `completed` when no pending contacts remain
 
 **`checkScheduledSends()`** — called every minute by cron:
-1. Finds `scheduled_sends` where `status='pending' AND scheduledAt <= now`
-2. Marks them `sent`
-3. Creates `send_jobs` rows for their contactIds (these have no `scheduledFor`, so nodes can pick them up immediately)
+1. Finds `scheduled_sends` where `status='pending' AND scheduledAt <= now`; marks them `sent`
+2. **Canonical**: creates `jobs` rows for up to `remainingCapacity` contacts (stops if daily limit hit)
+3. **Legacy**: unchanged — creates `send_jobs` rows for all contacts
 
 ### mailer.js — Legacy SMTP Client
 `sendCampaignEmail()` is **dead code** — not called anywhere in the current codebase. The architecture moved to mail-nodes. Only two functions are still active:
@@ -377,28 +395,45 @@ Both are also called once on startup (`initScheduler()`).
 
 ## Mail Flow
 
+### Legacy pipeline (send_jobs — USE_CANONICAL_QUEUE=false or unset)
 ```
-1. User action (UI send, scheduled send due, daily batch, recurring campaign)
+1. User action (UI send, scheduler: daily batch / recurring / scheduled send)
         ↓
 2. Backend creates send_jobs rows (status=queued, scheduledFor=ISO timestamp or null)
         ↓
 3. Mail-node polls GET /api/nodes/jobs?apiKey=…&limit=10
    → Controller filters: status=queued, scheduledFor <= now, within dailyLimit
-   → Controller marks jobs claimed
+   → Controller marks jobs claimed, resets dailySentCount at day rollover
         ↓
 4. Mail-node sends each job via Nodemailer → localhost:25 (Postfix)
-   → Postfix routes to correct source IP per sender domain
-   → OpenDKIM milter signs the message
-   → Postfix returns "250 Ok: queued as <QUEUEID>"
         ↓
-5. Mail-node POSTs /api/nodes/results with {jobId, status, queueId, ...}
-   → Controller updates send_jobs, send_log, contacts
+5. Mail-node POSTs /api/nodes/results → Controller updates send_jobs, send_log, contacts, dailySentCount
         ↓
-6. Postfix delivers to remote MX; logs verdict to /var/log/mail.log
+6. Postfix delivers; mail-node scans mail.log → POSTs /api/nodes/delivery-events
+   → Controller updates delivery_events, send_jobs (delivered/bounced/deferred), send_log
+```
+
+### Canonical pipeline (jobs — USE_CANONICAL_QUEUE=true, Milestone 5)
+```
+1. Scheduler (daily batch / recurring / scheduled send)
+   → checks identity daily capacity (resets dailySentCount if new day)
+   → caps batch at remaining capacity
         ↓
-7. Mail-node scans mail.log incrementally, parses delivery lines
-   → Mail-node POSTs /api/nodes/delivery-events with {queueId, eventType, dsnCode, ...}
-   → Controller updates delivery_events, send_jobs (status=delivered/bounced/deferred), send_log
+2. Backend creates jobs rows (status=PENDING, scheduled_for=ISO timestamp or null,
+   contact_id=…, send_log_id=…)
+        ↓
+3. Mail-node polls GET /api/jobs/poll?apiKey=…
+   → Controller filters: status=PENDING, scheduled_for <= now (or null)
+   → Returns job with fromAddr/fromName/domain (no state change)
+        ↓
+4. Mail-node POSTs /api/jobs/:id/start → status=PROCESSING (atomic)
+        ↓
+5. Mail-node sends via Nodemailer → Postfix → returns queueId
+        ↓
+6. Mail-node POSTs /api/jobs/:id/complete {queue_id}
+   → jobs.status = SENT
+   → CampaignResultService: send_log→sent, contact→sent, dailySentCount++
+   (or /fail → jobs.status=FAILED, send_log→failed, contact→failed)
 ```
 
 ---
@@ -446,6 +481,7 @@ Passwords are hashed with bcrypt (rounds=12). `create-admin.js` is the only way 
 | `JWT_SECRET` | Yes | Long random string for signing JWT tokens. Generate: `openssl rand -hex 64` |
 | `APP_URL` | Yes | Full public URL of the backend, e.g. `https://serawin.net`. Used in unsubscribe links. |
 | `NODE_ENV` | Yes | Set to `production` to skip seed data. Any other value enables seeding. |
+| `USE_CANONICAL_QUEUE` | No | `true` to route new campaign sends to the `jobs` table (canonical pipeline). Omit or set `false` to use the legacy `send_jobs` pipeline. Flip to `true` only after validating the canonical pipeline in production. |
 
 File: `backend/.env` (gitignored). Copy from `.env.example`.
 
@@ -487,6 +523,7 @@ node index.js                             # or: pm2 start index.js --name backen
 ## Security Notes
 
 - JWT secret must be a long random string (`JWT_SECRET`). Rotation invalidates all existing sessions.
+- **Fail-fast on missing JWT_SECRET**: the backend calls `process.exit(1)` at startup if `JWT_SECRET` is not set, preventing the server from running unsigned. Generate with: `openssl rand -hex 64`.
 - SMTP password is never returned in API responses (masked as ••••••••).
 - Unsubscribe endpoint is public and does not require auth by design (linked from emails).
 - Node apiKeys are 64-char hex strings. Regenerate via `POST /api/servers/:id/regenerate-key` if compromised.
@@ -580,6 +617,67 @@ SQLite serialises concurrent writes, so only one node's UPDATE will observe `cha
 - The two-step design (poll → start) means a node crash between the two calls leaves the job PENDING, not stuck in a transitional state.
 
 ## Current Milestone
+
+**Production Hardening complete (pre-M6)**
+
+Five production-hardening changes applied to the existing codebase. No new features, no schema rebuilding required.
+
+**1. SQLite transactions for all multi-write operations**
+All functions that write to more than one table are now wrapped in `db.transaction(() => { ... })()`:
+- `queueJobForContact()` — wraps INSERT send_log + INSERT send_jobs + UPDATE send_log + UPDATE contacts
+- `queueCanonicalJobForContact()` — wraps INSERT send_log + INSERT jobs + UPDATE contacts
+- `checkScheduledSends()` — each due task wraps UPDATE scheduled_sends + all contact job inserts atomically
+- `POST /api/send` — the entire contact loop is a single transaction; partial writes no longer possible
+Nested calls (e.g. `queueJobForContact` called inside `checkScheduledSends`'s transaction) use SQLite SAVEPOINTs automatically via better-sqlite3.
+
+**2. Missing database indexes added (idempotent)**
+Three `CREATE INDEX IF NOT EXISTS` statements added at the end of `db.js`:
+- `idx_contacts_status` on `contacts(status)` — used by all scheduler queries that filter pending contacts
+- `idx_scheduled_sends_status_sched` on `scheduled_sends(status, scheduledAt)` — covers the per-minute `checkScheduledSends` query
+- `idx_send_log_scheduledSendId` on `send_log(scheduledSendId)` — covers log lookups by scheduled send
+
+**3. Sender identity delete guard covers canonical queue**
+`DELETE /api/sender-identities/:id` previously only checked `send_jobs` for pending legacy jobs.
+Now also checks `jobs` for `PENDING` or `PROCESSING` rows (`identity_id` FK). Both checks must pass before deletion proceeds.
+
+**4. JWT_SECRET fail-fast**
+`index.js` checks `process.env.JWT_SECRET` immediately after `dotenv/config` is loaded. If missing, logs `FATAL: JWT_SECRET is not set` and calls `process.exit(1)`. The server never starts without a signing secret.
+
+**5. Startup logs**
+`app.listen` callback now emits three structured startup lines before and after init:
+```
+[startup] Database initialized
+[startup] Queue mode: Legacy | Canonical
+[startup] Backend listening on http://localhost:3001
+[startup] Scheduler initialized
+```
+
+**Rollback:** all changes are backward-compatible. Removing the transaction wrappers reverts to the previous behaviour. Indexes can be dropped with `DROP INDEX`. The fail-fast check can be removed. No schema changes were made to any table.
+
+---
+
+**Milestone 5 complete: Canonical Queue Migration**
+
+The scheduler now routes new campaign sends to the `jobs` table when `USE_CANONICAL_QUEUE=true`. The legacy `send_jobs` pipeline remains fully operational and continues draining any existing rows. No endpoints were removed or renamed; no database rebuilding is required.
+
+**Schema additions (idempotent ALTER TABLE on `jobs`):**
+- `scheduled_for TEXT` — withholds dispatch until this UTC timestamp; NULL = immediately dispatchable. Enforced in `JobRepository.findNextPending()`.
+- `contact_id INTEGER` — links to the contact whose status must be updated on completion/failure.
+- `send_log_id INTEGER` — links to the send_log row whose status must be updated on completion/failure.
+
+**New service: `CampaignResultService.js`** — side-effects for canonical job completion:
+- `onJobCompleted`: marks `send_log` sent + stores queueId; marks contact sent; increments `dailySentCount`
+- `onJobFailed`: marks `send_log` failed; marks contact failed
+
+**Scheduler dual-queue support** (`scheduler.js`):
+- `useCanonicalQueue()` reads `USE_CANONICAL_QUEUE` env var
+- `getIdentityRemainingCapacity(identityId)` resets daily count if day rolled over, returns remaining capacity
+- All three planners (`planDaySends`, `planRecurringCampaigns`, `checkScheduledSends`) branch on the flag; the legacy path is byte-for-byte identical to Milestone 4
+- Daily limit enforcement moved to creation-time for the canonical path: planners cap batch size by remaining identity capacity before inserting jobs
+
+**Migration state:** `USE_CANONICAL_QUEUE=false` (default) — legacy pipeline active. Set to `true` when ready to validate canonical pipeline in production. Legacy send_jobs rows are drained by the existing `GET /api/nodes/jobs` poller on mail-nodes.
+
+**Rollback:** set `USE_CANONICAL_QUEUE=false`. Legacy pipeline resumes immediately. Any PENDING canonical jobs already in the `jobs` table will still be claimed and sent by `JobPollingService`; their completion will update contacts and send_log via `CampaignResultService`. No data loss either way.
 
 **Milestone 4 complete: Real SMTP Sending via Job Queue**
 - `GET /api/jobs/poll` now LEFT JOINs `sender_identities` — response includes `fromAddr`, `fromName`, `domain`

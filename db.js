@@ -267,4 +267,17 @@ db.exec(`
 // ─── Milestone 4: queue_id added to jobs (idempotent upgrade for existing DBs) ─
 try { db.exec("ALTER TABLE jobs ADD COLUMN queue_id TEXT") } catch {}
 
+// ─── Milestone 5: campaign fields on jobs (canonical queue migration) ─────────
+// scheduled_for — withholds dispatch until this UTC timestamp (mirrors send_jobs.scheduledFor)
+// contact_id    — links to contacts row so completion handler can update status
+// send_log_id   — links to send_log row so completion handler can update delivery status
+try { db.exec("ALTER TABLE jobs ADD COLUMN scheduled_for TEXT")    } catch {}
+try { db.exec("ALTER TABLE jobs ADD COLUMN contact_id    INTEGER") } catch {}
+try { db.exec("ALTER TABLE jobs ADD COLUMN send_log_id   INTEGER") } catch {}
+
+// ─── Production hardening: missing indexes (idempotent) ───────────────────────
+db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_status              ON contacts(status)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_sends_status_sched ON scheduled_sends(status, scheduledAt)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_send_log_scheduledSendId     ON send_log(scheduledSendId)`);
+
 export default db;

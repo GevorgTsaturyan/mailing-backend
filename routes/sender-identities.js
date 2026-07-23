@@ -68,8 +68,15 @@ router.put('/:id', (req, res) => {
 });
 
 router.delete('/:id', (req, res) => {
-  const queued = db.prepare("SELECT id FROM send_jobs WHERE senderIdentityId=? AND status IN ('queued','claimed') LIMIT 1").get(req.params.id);
-  if (queued) return res.status(409).json({ error: 'There are pending jobs for this identity. Wait for them to complete first.' });
+  const legacyPending = db.prepare(
+    "SELECT id FROM send_jobs WHERE senderIdentityId=? AND status IN ('queued','claimed') LIMIT 1"
+  ).get(req.params.id);
+  const canonicalPending = db.prepare(
+    "SELECT id FROM jobs WHERE identity_id=? AND status IN ('PENDING','PROCESSING') LIMIT 1"
+  ).get(req.params.id);
+  if (legacyPending || canonicalPending) {
+    return res.status(409).json({ error: 'There are pending jobs for this identity. Wait for them to complete first.' });
+  }
   db.prepare('DELETE FROM sender_identities WHERE id = ?').run(req.params.id);
   res.json({ ok: true });
 });
