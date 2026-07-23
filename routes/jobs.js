@@ -3,6 +3,7 @@ import { requireAuth }  from '../middleware/auth.js';
 import { findByApiKey } from '../services/NodeRepository.js';
 import { poll }         from '../services/PollingService.js';
 import * as JobService  from '../services/JobService.js';
+import * as CampaignResultService from '../services/CampaignResultService.js';
 
 const router = express.Router();
 
@@ -71,32 +72,44 @@ router.post('/:id/start', (req, res) => {
 // ── POST /api/jobs/:id/complete ───────────────────────────────────────────────
 // Marks a PROCESSING job as SENT.  Only the node that claimed it may complete it.
 // Body: { apiKey, queue_id? }  — queue_id is the Postfix queue ID; omitting it is valid.
+// Side-effect: updates send_log, contact status, and dailySentCount for campaign jobs.
 router.post('/:id/complete', (req, res) => {
   const server = resolveNode(req.body.apiKey, res);
   if (!server) return;
 
-  const result = JobService.completeJob(
-    Number(req.params.id),
-    nodeIdOf(server),
-    req.body.queue_id ?? null,
-  );
+  const id      = Number(req.params.id);
+  const queueId = req.body.queue_id ?? null;
+
+  const result = JobService.completeJob(id, nodeIdOf(server), queueId);
   if (result.error) return res.status(result.status).json({ error: result.error });
+
+  try {
+    CampaignResultService.onJobCompleted(id, queueId);
+  } catch (err) {
+    console.error(`[jobs/complete] side-effects failed for job #${id}:`, err.message);
+  }
   res.json(result);
 });
 
 // ── POST /api/jobs/:id/fail ───────────────────────────────────────────────────
 // Marks a PROCESSING job as FAILED.  Only the node that claimed it may fail it.
 // Body: { apiKey, error_message? }
+// Side-effect: updates send_log and contact status for campaign jobs.
 router.post('/:id/fail', (req, res) => {
   const server = resolveNode(req.body.apiKey, res);
   if (!server) return;
 
-  const result = JobService.failJob(
-    Number(req.params.id),
-    nodeIdOf(server),
-    req.body.error_message ?? null,
-  );
+  const id           = Number(req.params.id);
+  const errorMessage = req.body.error_message ?? null;
+
+  const result = JobService.failJob(id, nodeIdOf(server), errorMessage);
   if (result.error) return res.status(result.status).json({ error: result.error });
+
+  try {
+    CampaignResultService.onJobFailed(id, errorMessage);
+  } catch (err) {
+    console.error(`[jobs/fail] side-effects failed for job #${id}:`, err.message);
+  }
   res.json(result);
 });
 
