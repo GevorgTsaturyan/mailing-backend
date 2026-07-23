@@ -2,6 +2,7 @@ import express from 'express';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import db from '../db.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -30,8 +31,7 @@ router.post('/login', async (req, res) => {
   res.json({ token, username: user.username });
 });
 
-router.get('/me', (req, res) => {
-  // req.user is set by auth middleware
+router.get('/me', requireAuth, (req, res) => {
   res.json({ username: req.user.username });
 });
 

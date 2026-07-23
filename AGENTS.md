@@ -164,7 +164,10 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
 | POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Reports Postfix log verdicts. Updates delivery_events, send_jobs, send_log. |
 
-### Job Queue API (Milestone 3)
+### Job Queue API (Milestone 3 — infrastructure live, node-side pending Milestone 4)
+Routes are registered and functional. The mail-node does not actively poll these endpoints yet
+(`startJobPoller` is disabled in `poller.js` until Milestone 4 wires actual Postfix sending).
+
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
 | POST | `/api/jobs` | JWT | `{identity_id?, recipient, subject, body?, priority?}`. Creates a PENDING job. Returns the created job. |
@@ -318,6 +321,8 @@ Validates inputs and orchestrates state transitions via JobRepository:
 
 ### PollingService.js — Poll Abstraction
 Single exported function `poll()` — wraps `findNextPending()` for use by the route handler. Keeps the controller thin and makes the polling strategy swappable without touching the route.
+
+Note: `JobRepository.markCancelled(id)` is implemented but has no API endpoint. It is an internal utility reserved for future admin tooling or job cleanup scripts.
 
 ### NodeRepository.js — DB Layer for Nodes
 All SQLite queries for the `servers` table's node-communication fields. Four functions:
@@ -578,14 +583,15 @@ SQLite serialises concurrent writes, so only one node's UPDATE will observe `cha
 
 ## Current Milestone
 
-**Milestone 3 complete: Job Queue & Polling**
+**Milestone 3 complete: Job Queue & Polling (infrastructure only)**
 - New `jobs` table with full lifecycle schema (PENDING → PROCESSING → SENT/FAILED/CANCELLED)
 - `JobRepository` — atomic `claimJob()` with `WHERE status='PENDING'` guard
 - `JobService` — validates inputs, enforces ownership on complete/fail, surfaces meaningful error codes
 - `PollingService` — read-only poll abstraction; 204 when queue is empty
 - `routes/jobs.js` — `POST /api/jobs` (JWT), `GET /api/jobs/poll`, `POST /api/jobs/:id/start|complete|fail` (apiKey)
 - Registered before `requireAuth` so node endpoints bypass JWT; only job creation requires a JWT
-- Mail-node: `services/JobPollingService.js` — full poll→claim→stub→complete cycle at `JOB_POLL_INTERVAL` (default 10 s)
+- Mail-node: `services/JobPollingService.js` exists but `startJobPoller()` is intentionally NOT called
+  from `startPoller()` — the process step is a stub (no Postfix). Will be activated in Milestone 4.
 
 **Milestone 1 complete: Node Registration & Communication**
 - Nodes register on startup with full system metadata (node_id, hostname, version, IP, OS, capabilities)
@@ -614,7 +620,7 @@ SQLite serialises concurrent writes, so only one node's UPDATE will observe `cha
 ## Known Limitations
 
 - `mailer.js::sendCampaignEmail` is dead code (architecture moved to mail-nodes). It remains in the file for potential dev/test fallback but is never called.
-- `GET /api/auth/me` bypasses `requireAuth` middleware (mounted before it). The handler references `req.user.username` which is undefined without prior auth middleware. The frontend always sends a JWT header, so in practice this crashes silently or returns 500 without a JWT.
+- `GET /api/auth/me` now applies `requireAuth` directly on the route handler (`router.get('/me', requireAuth, ...)`). This was fixed because the route is registered under `/api/auth` which is mounted before the global `app.use('/api', requireAuth)`, meaning the middleware was never reached for auth routes.
 - Legacy JSON files in `data/` (`contacts.json`, `schedule.json`, `sendLog.json`) are unused. Safe to delete.
 - The root-level `README.md` in `mail-campaign-manager/` is outdated (references JSON-based architecture). Ignore it.
 - `setup-mail-server.sh` in the backend folder was for configuring Postfix on the controller itself. This pattern was replaced by the mail-node architecture. The file is kept for reference.
