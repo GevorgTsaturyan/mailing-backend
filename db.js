@@ -280,4 +280,75 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_status              ON contacts
 db.exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_sends_status_sched ON scheduled_sends(status, scheduledAt)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_send_log_scheduledSendId     ON send_log(scheduledSendId)`);
 
+// ─── Milestone 6: Delivery Tracking ──────────────────────────────────────────
+//
+// campaigns — one row per campaign dispatch (batch send run).
+//   type = 'manual' | 'scheduled_send' | 'recurring' | 'daily_batch'
+//   scheduled_send_id / recurring_campaign_id are typed FKs (exclusive arcs):
+//     at most one is non-NULL, identifying the source of this dispatch.
+//   Manual and daily_batch campaigns have both FKs NULL.
+//   date is the YYYY-MM-DD UTC calendar day the send was dispatched.
+//   Manual sends on the same calendar day share one campaigns row (grouped by day).
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS campaigns (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    type                  TEXT    NOT NULL,
+    scheduled_send_id     INTEGER REFERENCES scheduled_sends(id),
+    recurring_campaign_id INTEGER REFERENCES recurring_campaigns(id),
+    identity_id           INTEGER REFERENCES sender_identities(id),
+    label                 TEXT,
+    status                TEXT    NOT NULL DEFAULT 'running',
+    date                  TEXT    NOT NULL,
+    created_at            TEXT    NOT NULL,
+    completed_at          TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_campaigns_type_date            ON campaigns(type, date);
+  CREATE INDEX IF NOT EXISTS idx_campaigns_scheduled_send_id    ON campaigns(scheduled_send_id);
+  CREATE INDEX IF NOT EXISTS idx_campaigns_recurring_id         ON campaigns(recurring_campaign_id);
+`);
+
+// campaign_stats — one row per campaigns row, updated transactionally on each
+//   delivery event.  Counters are the permanent historical record: they survive
+//   the 90-day delivery_events retention window.
+//   total_currently_deferred tracks the count of jobs still awaiting retry
+//   (decremented when a deferred job is eventually delivered or bounced).
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS campaign_stats (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id              INTEGER NOT NULL UNIQUE REFERENCES campaigns(id),
+    total_jobs               INTEGER NOT NULL DEFAULT 0,
+    total_sent               INTEGER NOT NULL DEFAULT 0,
+    total_send_failed        INTEGER NOT NULL DEFAULT 0,
+    total_delivered          INTEGER NOT NULL DEFAULT 0,
+    total_bounced            INTEGER NOT NULL DEFAULT 0,
+    total_currently_deferred INTEGER NOT NULL DEFAULT 0,
+    total_complained         INTEGER NOT NULL DEFAULT 0,
+    last_updated             TEXT,
+    created_at               TEXT    NOT NULL
+  );
+`);
+
+// jobs: campaign_id links a job to its dispatch campaign.
+//   delivery_status tracks the Postfix/MX delivery outcome independently from
+//   the SMTP submission status (jobs.status).  Values:
+//   SMTP_PENDING | SMTP_ACCEPTED | DEFERRED | DELIVERED | BOUNCED | SEND_FAILED | COMPLAINED
+try { db.exec("ALTER TABLE jobs ADD COLUMN campaign_id     INTEGER REFERENCES campaigns(id)") } catch {}
+try { db.exec("ALTER TABLE jobs ADD COLUMN delivery_status TEXT DEFAULT 'SMTP_PENDING'")      } catch {}
+
+// delivery_events: job_id links canonical pipeline events to their jobs row.
+//   NULL for legacy send_jobs events (sendJobId covers those).
+//   dedup_key enforces idempotency: duplicate log lines from a restarted parser
+//   are silently ignored via INSERT OR IGNORE.
+try { db.exec("ALTER TABLE delivery_events ADD COLUMN job_id    INTEGER") } catch {}
+try { db.exec("ALTER TABLE delivery_events ADD COLUMN dedup_key TEXT")    } catch {}
+
+// Indexes for Milestone 6 hot paths (all idempotent)
+db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_queue_id          ON jobs(queue_id)`);
+db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_campaign_id       ON jobs(campaign_id)`);
+db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_delivery_status   ON jobs(delivery_status)`);
+db.exec(`CREATE INDEX        IF NOT EXISTS idx_delivery_events_job_id ON delivery_events(job_id)`);
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_events_dedup  ON delivery_events(dedup_key)`);
+
 export default db;

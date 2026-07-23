@@ -188,26 +188,30 @@ All tables are created in `db.js` on startup via `CREATE TABLE IF NOT EXISTS`. S
 
 ```sql
 jobs (
-  id            INTEGER PK,
-  status        TEXT DEFAULT 'PENDING',   -- PENDING | PROCESSING | SENT | FAILED | CANCELLED
-  node_id       TEXT,                     -- String(server.id) of the claiming node; NULL until claimed
-  identity_id   INTEGER FK→sender_identities (nullable),
-  recipient     TEXT NOT NULL,            -- destination email address
-  subject       TEXT NOT NULL,
-  body          TEXT DEFAULT '',          -- HTML email body; TXT falls back to body on the node
-  priority      INTEGER DEFAULT 0,        -- higher = dispatched first
-  attempts      INTEGER DEFAULT 0,        -- incremented each time a node claims the job
-  created_at    TEXT NOT NULL,
-  started_at    TEXT,                     -- set when first claimed
-  finished_at   TEXT,                     -- set on SENT or FAILED
-  error_message TEXT,                     -- set on FAILED
-  queue_id      TEXT,                     -- Postfix queue ID reported by node on complete; links to mail.log
+  id              INTEGER PK,
+  status          TEXT DEFAULT 'PENDING',        -- PENDING | PROCESSING | SENT | FAILED | CANCELLED
+  node_id         TEXT,                          -- String(server.id) of the claiming node; NULL until claimed
+  identity_id     INTEGER FK→sender_identities (nullable),
+  recipient       TEXT NOT NULL,                 -- destination email address
+  subject         TEXT NOT NULL,
+  body            TEXT DEFAULT '',               -- HTML email body; TXT falls back to body on the node
+  priority        INTEGER DEFAULT 0,             -- higher = dispatched first
+  attempts        INTEGER DEFAULT 0,             -- incremented each time a node claims the job
+  created_at      TEXT NOT NULL,
+  started_at      TEXT,                          -- set when first claimed
+  finished_at     TEXT,                          -- set on SENT or FAILED
+  error_message   TEXT,                          -- set on FAILED
+  queue_id        TEXT,                          -- Postfix queue ID reported by node on complete; links to mail.log
   -- Milestone 5: campaign fields (NULL for manually-created jobs via POST /api/jobs)
-  scheduled_for TEXT,                     -- dispatch withheld until this UTC timestamp; NULL = immediate
-  contact_id    INTEGER,                  -- FK→contacts; allows completion handler to update contact status
-  send_log_id   INTEGER                   -- FK→send_log; allows completion handler to update send_log status
+  scheduled_for   TEXT,                          -- dispatch withheld until this UTC timestamp; NULL = immediate
+  contact_id      INTEGER,                       -- FK→contacts; allows completion handler to update contact status
+  send_log_id     INTEGER,                       -- FK→send_log; allows completion handler to update send_log status
+  -- Milestone 6: delivery tracking
+  campaign_id     INTEGER FK→campaigns,          -- links job to its dispatch campaign; NULL for pre-M6 jobs
+  delivery_status TEXT DEFAULT 'SMTP_PENDING'    -- Postfix delivery FSM; see DeliveryEventService
+                                                 -- SMTP_PENDING|SMTP_ACCEPTED|DEFERRED|DELIVERED|BOUNCED|SEND_FAILED|COMPLAINED
 )
--- Indexes: (status, priority DESC, created_at ASC) for O(1) poll; node_id for node queries
+-- Indexes: (status, priority DESC, created_at ASC) for O(1) poll; node_id, queue_id, campaign_id, delivery_status
 -- Poll filter also applies scheduled_for: jobs with a future scheduled_for are withheld
 
 contacts (
@@ -289,11 +293,23 @@ send_jobs (
 -- Indexes: status, senderIdentityId, scheduledFor, queueId
 
 delivery_events (
-  id INTEGER PK, sendJobId INTEGER, queueId TEXT, email TEXT,
-  eventType TEXT, dsnCode TEXT, relay TEXT, response TEXT,
-  reasonCategory TEXT, reasonDetail TEXT, logTime TEXT, createdAt TEXT
+  id             INTEGER PK,
+  sendJobId      INTEGER,    -- FK→send_jobs (legacy pipeline); NULL for canonical pipeline events
+  queueId        TEXT,       -- Postfix queue ID (correlation key)
+  email          TEXT,
+  eventType      TEXT,       -- 'sent' | 'bounced' | 'deferred'
+  dsnCode        TEXT,       -- e.g. '2.0.0', '5.1.1', '4.2.2'
+  relay          TEXT,       -- remote MX host
+  response       TEXT,       -- full SMTP response (truncated to 500 chars)
+  reasonCategory TEXT,       -- from classify.js
+  reasonDetail   TEXT,
+  logTime        TEXT,       -- timestamp from mail.log line
+  createdAt      TEXT NOT NULL,
+  -- Milestone 6: delivery tracking
+  job_id         INTEGER,    -- FK→jobs (canonical pipeline); NULL for legacy send_jobs events
+  dedup_key      TEXT UNIQUE -- queue_id + '_' + event_type + '_' + log_time; INSERT OR IGNORE prevents duplicates
 )
--- Indexes: queueId, sendJobId
+-- Indexes: queueId, sendJobId, job_id; UNIQUE on dedup_key
 
 send_log (
   id INTEGER PK, date TEXT, contactId INTEGER, name TEXT, email TEXT,
@@ -304,6 +320,42 @@ send_log (
   reasonCategory TEXT, reasonDetail TEXT, deliveredAt TEXT, lastEventAt TEXT
 )
 -- Index: scheduledSendId (for log lookups by scheduled send)
+
+-- Milestone 6: campaign and stats tables
+
+campaigns (
+  id                    INTEGER PK,
+  type                  TEXT NOT NULL,     -- 'manual' | 'scheduled_send' | 'recurring' | 'daily_batch'
+  scheduled_send_id     INTEGER FK→scheduled_sends (nullable),   -- set when type='scheduled_send'
+  recurring_campaign_id INTEGER FK→recurring_campaigns (nullable), -- set when type='recurring'
+  identity_id           INTEGER FK→sender_identities (nullable),
+  label                 TEXT,             -- human-readable dispatch label
+  status                TEXT DEFAULT 'running',  -- 'running' | 'completed' | 'cancelled'
+  date                  TEXT NOT NULL,    -- YYYY-MM-DD UTC dispatch date
+  created_at            TEXT NOT NULL,
+  completed_at          TEXT
+)
+-- Exclusive arcs: at most one of scheduled_send_id / recurring_campaign_id is non-NULL.
+-- Manual and daily_batch campaigns have both NULL.
+-- Manual sends on the same calendar day share one campaigns row (grouped by day + identity).
+-- Indexes: (type, date), scheduled_send_id, recurring_campaign_id
+
+campaign_stats (
+  id                       INTEGER PK,
+  campaign_id              INTEGER NOT NULL UNIQUE FK→campaigns,
+  total_jobs               INTEGER DEFAULT 0,   -- jobs created for this campaign
+  total_sent               INTEGER DEFAULT 0,   -- SMTP_ACCEPTED (Postfix took the message)
+  total_send_failed        INTEGER DEFAULT 0,   -- SEND_FAILED (Postfix rejected submission)
+  total_delivered          INTEGER DEFAULT 0,   -- DELIVERED (2.x.x DSN from remote MX)
+  total_bounced            INTEGER DEFAULT 0,   -- BOUNCED (5.x.x DSN, hard bounce)
+  total_currently_deferred INTEGER DEFAULT 0,   -- currently awaiting retry; decremented on delivery
+  total_complained         INTEGER DEFAULT 0,   -- COMPLAINED (ISP spam report)
+  last_updated             TEXT,
+  created_at               TEXT NOT NULL
+)
+-- Permanent record: survives the 90-day delivery_events retention window.
+-- Updated transactionally on every delivery event (same db.transaction as delivery_events INSERT).
+-- Nightly reconciliation compares counters to delivery_events for recently-active campaigns.
 ```
 
 ---
@@ -617,6 +669,33 @@ SQLite serialises concurrent writes, so only one node's UPDATE will observe `cha
 - The two-step design (poll → start) means a node crash between the two calls leaves the job PENDING, not stuck in a transitional state.
 
 ## Current Milestone
+
+**Milestone 6 in progress: Delivery Tracking**
+
+### Phase 1 complete: Database Schema Foundation
+
+All schema additions are idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE` wrapped in try/catch).
+
+**New tables:**
+- `campaigns` — one row per campaign dispatch; typed nullable FKs (`scheduled_send_id → scheduled_sends`, `recurring_campaign_id → recurring_campaigns`) replace the earlier polymorphic ref_id design
+- `campaign_stats` — one row per campaign; denormalized counters updated transactionally on each delivery event; permanent record surviving the 90-day event retention window
+
+**New columns on `jobs`:**
+- `campaign_id INTEGER` — FK→campaigns; links each job to its dispatch campaign
+- `delivery_status TEXT DEFAULT 'SMTP_PENDING'` — Postfix/MX delivery FSM, independent of the SMTP submission `status` field
+
+**New columns on `delivery_events`:**
+- `job_id INTEGER` — FK→jobs (canonical pipeline); NULL for legacy send_jobs events
+- `dedup_key TEXT UNIQUE` — `queue_id + '_' + event_type + '_' + log_time`; INSERT OR IGNORE prevents duplicate events from a restarted parser
+
+**New indexes:**
+- `idx_jobs_queue_id`, `idx_jobs_campaign_id`, `idx_jobs_delivery_status`
+- `idx_delivery_events_job_id`, `idx_delivery_events_dedup` (UNIQUE)
+- `idx_campaigns_type_date`, `idx_campaigns_scheduled_send_id`, `idx_campaigns_recurring_id`
+
+No application logic was changed. All existing queries and endpoints are unaffected.
+
+---
 
 **Production Hardening complete (pre-M6)**
 
