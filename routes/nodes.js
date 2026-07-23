@@ -2,6 +2,7 @@ import express from 'express';
 import db from '../db.js';
 import { register } from '../services/NodeRegistrationService.js';
 import { recordHeartbeat } from '../services/HeartbeatService.js';
+import { processEvents } from '../services/DeliveryEventService.js';
 
 const router = express.Router();
 
@@ -136,6 +137,8 @@ router.post('/results', (req, res) => {
 
 // ─── POST /api/nodes/delivery-events ─────────────────────────────────────────
 // Node reports parsed Postfix mail.log events (delivered / deferred / bounced).
+// Delegated to DeliveryEventService which handles deduplication, FSM transitions,
+// campaign_stats updates, and backward-compatible send_jobs / send_log writes.
 router.post('/delivery-events', (req, res) => {
   const { apiKey, events } = req.body;
   const server = getServer(apiKey);
@@ -143,47 +146,8 @@ router.post('/delivery-events', (req, res) => {
   if (!Array.isArray(events)) return res.status(400).json({ error: 'events array required' });
   touch(server.id);
 
-  const now = new Date().toISOString();
-  const insertEvent = db.prepare(`
-    INSERT INTO delivery_events (sendJobId, queueId, email, eventType, dsnCode, relay, response, reasonCategory, reasonDetail, logTime, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const updateJob = db.prepare(`
-    UPDATE send_jobs SET status=?, dsnCode=?, relay=?, remoteResponse=?, reasonCategory=?, reasonDetail=?, deliveredAt=?
-    WHERE queueId=? AND status NOT IN ('delivered','bounced')
-  `);
-  const updateLog = db.prepare(`
-    UPDATE send_log SET deliveryStatus=?, dsnCode=?, remoteMx=?, remoteResponse=?,
-      reasonCategory=?, reasonDetail=?, deliveredAt=?, lastEventAt=?
-    WHERE queueId=?
-  `);
-
-  for (const e of events) {
-    const job = db.prepare('SELECT id, email FROM send_jobs WHERE queueId=?').get(e.queueId);
-
-    insertEvent.run(
-      job?.id || null, e.queueId, job?.email || e.email || null,
-      e.eventType, e.dsnCode || null, e.relay || null,
-      (e.response || '').slice(0, 500),
-      e.reasonCategory || null, e.reasonDetail || null,
-      e.logTime || now, now
-    );
-
-    const finalStatus  = e.eventType === 'sent' ? 'delivered' : e.eventType === 'bounced' ? 'bounced' : 'deferred';
-    const deliveredAt  = e.eventType === 'sent' ? now : null;
-
-    updateJob.run(finalStatus, e.dsnCode || null, e.relay || null,
-      (e.response || '').slice(0, 500), e.reasonCategory || null, e.reasonDetail || null,
-      deliveredAt, e.queueId);
-
-    updateLog.run(
-      finalStatus, e.dsnCode || null, e.relay || null,
-      (e.response || '').slice(0, 500), e.reasonCategory || null, e.reasonDetail || null,
-      deliveredAt, now, e.queueId
-    );
-  }
-
-  res.json({ ok: true });
+  const { processed, skipped } = processEvents(events);
+  res.json({ ok: true, processed, skipped });
 });
 
 export default router;

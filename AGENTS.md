@@ -59,6 +59,9 @@ backend/
     NodeRegistrationService.js  # register(): validates apiKey, writes system info, returns identities
     HeartbeatService.js     # recordHeartbeat(): stores health JSON; startOfflineWatcher(): marks OFFLINE after 90 s
     CampaignResultService.js    # Milestone 5: onJobCompleted / onJobFailed — updates send_log, contacts, dailySentCount
+    CampaignRepository.js       # Milestone 6: DB layer for campaigns table (create, findOrCreateManual, findById, markCompleted)
+    CampaignStatsRepository.js  # Milestone 6: DB layer for campaign_stats (findOrCreate, incrementJobs/Sent/SendFailed, applyDeliveryEvent)
+    DeliveryEventService.js     # Milestone 6: processes Postfix delivery events — dedup, FSM, campaign_stats, both pipelines
   data/
     mail.db                 # SQLite database — all live data lives here
     mail.db-shm             # WAL shared memory (auto-generated)
@@ -164,7 +167,7 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 | POST | `/api/nodes/heartbeat` | `{apiKey, uptime, cpu, ram, disk, queue_size, postfix_running, opendkim_running}`. Stores health JSON in `servers.health`, sets status=online. If no heartbeat for 90 s, offline watcher sets status=offline. |
 | GET | `/api/nodes/jobs` | `?apiKey=&limit=10`. Returns due queued jobs for this server's identities. Marks them claimed. Resets daily counts at day rollover. |
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
-| POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Reports Postfix log verdicts. Updates delivery_events, send_jobs, send_log. |
+| POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Delegates to `DeliveryEventService.processEvents`. Updates `delivery_events` (INSERT OR IGNORE), applies FSM transitions on `jobs.delivery_status`, updates `send_jobs`+`send_log` (both pipelines), updates `campaign_stats` counters, and marks contacts failed/unsubscribed. Returns `{ok, processed, skipped}`. |
 
 ### Job Queue API (Milestone 4 — fully active; Milestone 5: side-effects added)
 | Method | Path | Auth | Notes |
@@ -378,6 +381,51 @@ side-effects that `POST /api/nodes/results` produces for the legacy send_jobs pi
 - `onJobCompleted(jobId, queueId)` — fetches the job; if `send_log_id` is set, marks send_log `sent` and stores queueId; if `contact_id` is set, marks contact `sent` + sets sentAt; if `identity_id` is set, increments `dailySentCount`
 - `onJobFailed(jobId, errorMessage)` — fetches the job; marks send_log `failed` + stores error; marks contact `failed`
 Both functions are no-ops when the job has no campaign fields (safe to call for any job).
+
+### CampaignRepository.js — DB Layer for Campaigns (Milestone 6)
+All SQLite queries for the `campaigns` table. Four functions:
+- `create({ type, date, identity_id?, label?, scheduled_send_id?, recurring_campaign_id? })` — inserts a `running` campaign row; returns the inserted row
+- `findOrCreateManual(date, identityId?)` — idempotent: returns the existing `type='manual'` campaign for that day+identity pair, or creates one. All manual sends within a calendar day share one campaigns row. Uses `identity_id IS ?` for NULL-safe SQLite comparison.
+- `findById(id)` — returns a single campaign by PK or `null`
+- `markCompleted(id)` — sets `status='completed'` and `completed_at=now`
+
+**Exclusive-arcs invariant**: at most one of `scheduled_send_id` / `recurring_campaign_id` is non-NULL per row. `manual` and `daily_batch` campaigns have both NULL.
+
+### CampaignStatsRepository.js — DB Layer for Campaign Stats (Milestone 6)
+All SQLite queries for the `campaign_stats` table. Five functions:
+- `findOrCreate(campaignId)` — returns existing stats row or inserts a zeroed row. **Must be called inside the caller's `db.transaction()`** — it does not wrap itself.
+- `incrementJobs(campaignId, count?)` — called after creating jobs for a campaign (from scheduler, Phase 3+)
+- `incrementSent(campaignId)` — called from `CampaignResultService.onJobCompleted` (Phase 3+)
+- `incrementSendFailed(campaignId)` — called from `CampaignResultService.onJobFailed` (Phase 3+)
+- `applyDeliveryEvent(campaignId, priorStatus, newStatus)` — updates counters based on the FSM transition. **Must be called inside the caller's `db.transaction()`**. Key counter rules:
+  - `DEFERRED`: increments `total_currently_deferred` only when `priorStatus !== 'DEFERRED'` (first entry only)
+  - `DELIVERED` from `DEFERRED`: decrements `total_currently_deferred` AND increments `total_delivered`
+  - `BOUNCED` from `DEFERRED`: decrements `total_currently_deferred` AND increments `total_bounced`
+  - `COMPLAINED`: increments `total_complained` (always)
+
+### DeliveryEventService.js — Delivery Event Processor (Milestone 6)
+`processEvents(events[])` — processes a batch of Postfix mail.log delivery events. Returns `{processed, skipped}`.
+
+Each event is processed in its own `db.transaction()`. A bad event never blocks the rest of the batch.
+
+**Event fields**: `queueId`, `eventType` (`'sent'`|`'bounced'`|`'deferred'`), and optionally `dsnCode`, `relay`, `response`, `reasonCategory`, `reasonDetail`, `logTime`, `email`.
+
+**Processing order per event:**
+1. Map `eventType` → internal `delivery_status` via `EVENT_TO_STATUS`. Unknown types are skipped.
+2. Compute `dedup_key = queueId + '_' + eventType + '_' + (logTime ?? now)`
+3. Look up both pipelines: `lookupCanonicalJob` (by `jobs.queue_id`) and `lookupLegacySendJob` (by `send_jobs.queueId`)
+4. `INSERT OR IGNORE INTO delivery_events` — if `changes === 0`, the event is a duplicate; return `{skipped: true}`
+5. Compute `priorStatus = canonicalJob?.delivery_status ?? 'SMTP_PENDING'` and FSM priority check
+6. Always update `send_jobs` (legacy pipeline guard: `WHERE status NOT IN ('delivered','bounced')`)
+7. If FSM allows: update `send_log` (both pipelines via `queueId`), update `jobs.delivery_status`, update `campaign_stats` (canonical jobs with `campaign_id` only), mark contact `failed` (BOUNCED) or `unsubscribed` (COMPLAINED)
+
+**FSM priority map** (higher wins; equal is allowed):
+```
+SMTP_PENDING(0) < SMTP_ACCEPTED(1) < DEFERRED(2) < DELIVERED/BOUNCED/SEND_FAILED(3) < COMPLAINED(4)
+```
+Late `DEFERRED` events arriving after `DELIVERED` are recorded in `delivery_events` but do not regress `jobs.delivery_status` or counters.
+
+All prepared statements are module-level (compiled once, reused across all calls).
 
 ### JobService.js — Job Lifecycle Logic
 Validates inputs and orchestrates state transitions via JobRepository:
@@ -694,6 +742,32 @@ All schema additions are idempotent (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`
 - `idx_campaigns_type_date`, `idx_campaigns_scheduled_send_id`, `idx_campaigns_recurring_id`
 
 No application logic was changed. All existing queries and endpoints are unaffected.
+
+### Phase 2 complete: Event Processing Services
+
+**New services:**
+- `services/CampaignRepository.js` — DB layer for the `campaigns` table; `findOrCreateManual` groups manual sends by calendar-day + identity
+- `services/CampaignStatsRepository.js` — DB layer for the `campaign_stats` table; `applyDeliveryEvent` handles all FSM counter corrections, including the `DEFERRED → DELIVERED` decrement
+- `services/DeliveryEventService.js` — processes Postfix delivery event batches; supports both canonical (`jobs`) and legacy (`send_jobs`) pipelines; fully idempotent via `dedup_key`; each event runs in its own `db.transaction()`
+
+**Modified route:**
+- `routes/nodes.js` — `POST /api/nodes/delivery-events` handler replaced: the previous 40-line inline loop is now a single `processEvents(events)` call; response now includes `{ok, processed, skipped}`
+
+**What is NOT yet wired (Phase 3):**
+- `POST /api/send` still writes to `send_jobs` (legacy) and does not create a `campaigns` row
+- `scheduler.js` planners do not yet set `campaign_id` on new `jobs` rows
+- `CampaignResultService.onJobCompleted/onJobFailed` do not yet call `CampaignStatsRepository.incrementSent/incrementSendFailed`
+- No campaign API endpoints (`GET /api/campaigns`, `GET /api/campaigns/:id`, etc.)
+- No frontend
+
+**Phase 2 verification:** 7 functional test scenarios all passed:
+1. DELIVERED event → correct FSM transition, send_log, campaign_stats
+2. Duplicate event (same dedup_key) → silently skipped, no counter double-count
+3. Late DEFERRED after DELIVERED → recorded in delivery_events, state unchanged (FSM blocked)
+4. DEFERRED → DEFERRED → DELIVERED → `total_currently_deferred` decrement correct
+5. BOUNCED → `total_bounced` incremented, contact marked failed
+6. Legacy send_jobs event (no canonical job) → `delivery_events.job_id=NULL`, `sendJobId` set correctly
+7. `findOrCreateManual` → same day returns same row; different day returns different row
 
 ---
 
