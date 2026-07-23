@@ -257,10 +257,14 @@ db.exec(`
     created_at    TEXT    NOT NULL,
     started_at    TEXT,
     finished_at   TEXT,
-    error_message TEXT
+    error_message TEXT,
+    queue_id      TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_jobs_poll    ON jobs(status, priority DESC, created_at ASC);
   CREATE INDEX IF NOT EXISTS idx_jobs_node_id ON jobs(node_id);
 `);
+
+// ─── Milestone 4: queue_id added to jobs (idempotent upgrade for existing DBs) ─
+try { db.exec("ALTER TABLE jobs ADD COLUMN queue_id TEXT") } catch {}
 
 export default db;

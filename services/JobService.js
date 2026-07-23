@@ -50,7 +50,8 @@ export function startJob(id, nodeId) {
 }
 
 // Marks a PROCESSING job as SENT.  Only the owning node may complete its own job.
-export function completeJob(id, nodeId) {
+// queueId is the Postfix queue ID — stored for future delivery event correlation.
+export function completeJob(id, nodeId, queueId = null) {
   const job = JobRepository.findById(id);
   if (!job) return { error: 'Job not found', status: 404 };
 
@@ -61,7 +62,7 @@ export function completeJob(id, nodeId) {
     return { error: `Cannot complete job with status ${job.status}`, status: 409 };
   }
 
-  const updated = JobRepository.markSent(id, nodeId);
+  const updated = JobRepository.markSent(id, nodeId, queueId);
   return updated ? { ok: true } : { error: 'Concurrent state change — please retry', status: 409 };
 }
 

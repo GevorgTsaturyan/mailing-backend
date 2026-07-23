@@ -21,12 +21,15 @@ export function findById(id) {
 }
 
 // Returns the single highest-priority PENDING job (for poll endpoint).
-// Ordered by priority DESC then created_at ASC so oldest high-priority jobs go first.
+// LEFT JOINs sender_identities so the node receives fromAddr/fromName without
+// a separate round-trip — mirrors the pattern used by GET /api/nodes/jobs.
 export function findNextPending() {
   return db.prepare(`
-    SELECT * FROM jobs
-    WHERE  status = 'PENDING'
-    ORDER  BY priority DESC, created_at ASC
+    SELECT j.*, si.fromAddr, si.fromName, si.domain
+    FROM   jobs j
+    LEFT   JOIN sender_identities si ON si.id = j.identity_id
+    WHERE  j.status = 'PENDING'
+    ORDER  BY j.priority DESC, j.created_at ASC
     LIMIT  1
   `).get() ?? null;
 }
@@ -44,13 +47,14 @@ export function claimJob(id, nodeId) {
 }
 
 // Transitions PROCESSING → SENT. Enforces node ownership.
-export function markSent(id, nodeId) {
+// queueId is the Postfix queue ID returned by Nodemailer; stored for future delivery tracking.
+export function markSent(id, nodeId, queueId = null) {
   const now = new Date().toISOString();
   const { changes } = db.prepare(`
     UPDATE jobs
-    SET    status = 'SENT', finished_at = ?
+    SET    status = 'SENT', finished_at = ?, queue_id = ?
     WHERE  id = ? AND status = 'PROCESSING' AND node_id = ?
-  `).run(now, id, nodeId);
+  `).run(now, queueId, id, nodeId);
   return changes === 1;
 }
 

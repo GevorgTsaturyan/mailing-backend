@@ -70,12 +70,16 @@ router.post('/:id/start', (req, res) => {
 
 // ── POST /api/jobs/:id/complete ───────────────────────────────────────────────
 // Marks a PROCESSING job as SENT.  Only the node that claimed it may complete it.
-// Body: { apiKey }
+// Body: { apiKey, queue_id? }  — queue_id is the Postfix queue ID; omitting it is valid.
 router.post('/:id/complete', (req, res) => {
   const server = resolveNode(req.body.apiKey, res);
   if (!server) return;
 
-  const result = JobService.completeJob(Number(req.params.id), nodeIdOf(server));
+  const result = JobService.completeJob(
+    Number(req.params.id),
+    nodeIdOf(server),
+    req.body.queue_id ?? null,
+  );
   if (result.error) return res.status(result.status).json({ error: result.error });
   res.json(result);
 });
