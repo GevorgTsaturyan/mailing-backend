@@ -1,5 +1,7 @@
 import cron from 'node-cron';
 import db from './db.js';
+import * as CampaignRepo from './services/CampaignRepository.js';
+import { findOrCreate as findOrCreateStats, incrementJobs } from './services/CampaignStatsRepository.js';
 
 // ─── Feature flag ─────────────────────────────────────────────────────────────
 // When USE_CANONICAL_QUEUE=true, the scheduler creates `jobs` rows instead of
@@ -70,7 +72,7 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
 // planner level (see getIdentityRemainingCapacity), so this function trusts that
 // the caller has already validated capacity.
 
-function queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null) {
+export function queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null, campaignId = null) {
   const identityId = senderIdentityId ?? pickActiveIdentity();
   if (!identityId) return;
 
@@ -93,8 +95,8 @@ function queueCanonicalJobForContact(contact, templateName, templateContent, sch
     db.prepare(`
       INSERT INTO jobs
         (status, identity_id, recipient, subject, body,
-         scheduled_for, contact_id, send_log_id, created_at)
-      VALUES ('PENDING', ?, ?, ?, ?, ?, ?, ?, ?)
+         scheduled_for, contact_id, send_log_id, campaign_id, created_at)
+      VALUES ('PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       identityId,
       contact.email,
@@ -103,6 +105,7 @@ function queueCanonicalJobForContact(contact, templateName, templateContent, sch
       scheduledFor,
       contact.id,
       logRow.lastInsertRowid,
+      campaignId,
       now
     );
 
@@ -176,9 +179,22 @@ function planDaySends() {
       "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
     ).all(times.length);
 
-    for (let i = 0; i < contacts.length; i++) {
-      queueCanonicalJobForContact(contacts[i], cfg.template, null, times[i], null, identityId);
+    if (contacts.length === 0) {
+      console.log('Daily batch (canonical): no pending contacts');
+      return;
     }
+
+    const todayUTC = new Date().toISOString().slice(0, 10);
+    const dispatch = CampaignRepo.create({
+      type: 'daily_batch', date: todayUTC, identity_id: identityId,
+      label: `Daily batch – ${todayUTC}`,
+    });
+    findOrCreateStats(dispatch.id);
+
+    for (let i = 0; i < contacts.length; i++) {
+      queueCanonicalJobForContact(contacts[i], cfg.template, null, times[i], null, identityId, dispatch.id);
+    }
+    incrementJobs(dispatch.id, contacts.length);
 
     console.log(`Daily batch (canonical): queued ${contacts.length} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
   } else {
@@ -237,9 +253,17 @@ function planRecurringCampaigns() {
         continue;
       }
 
+      const dispatch = CampaignRepo.create({
+        type: 'recurring', date: todayUTC,
+        recurring_campaign_id: campaign.id,
+        label: campaign.name,
+      });
+      findOrCreateStats(dispatch.id);
+
       for (let i = 0; i < contacts.length; i++) {
-        queueCanonicalJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId);
+        queueCanonicalJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId, dispatch.id);
       }
+      incrementJobs(dispatch.id, contacts.length);
 
       db.prepare('UPDATE recurring_campaigns SET lastRunDate=?, currentDay=? WHERE id=?')
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
@@ -297,13 +321,24 @@ function checkScheduledSends() {
         const identityId = pickActiveIdentity();
         let capacity = identityId ? getIdentityRemainingCapacity(identityId) : 0;
 
+        const todayUTC = new Date().toISOString().slice(0, 10);
+        const dispatch = CampaignRepo.create({
+          type: 'scheduled_send', date: todayUTC,
+          scheduled_send_id: task.id,
+          label: task.label ?? null,
+        });
+        findOrCreateStats(dispatch.id);
+        let jobsQueued = 0;
+
         for (const contactId of contactIds) {
           if (capacity <= 0) break;
           const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(contactId);
           if (!contact) continue;
-          queueCanonicalJobForContact(contact, task.templateName, templateContent, null, task.id, identityId);
+          queueCanonicalJobForContact(contact, task.templateName, templateContent, null, task.id, identityId, dispatch.id);
           capacity--;
+          jobsQueued++;
         }
+        if (jobsQueued > 0) incrementJobs(dispatch.id, jobsQueued);
       } else {
         for (const contactId of contactIds) {
           const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(contactId);

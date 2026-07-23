@@ -1,5 +1,8 @@
 import express from 'express';
 import db from '../db.js';
+import { findOrCreateManual } from '../services/CampaignRepository.js';
+import { findOrCreate as findOrCreateStats, incrementJobs } from '../services/CampaignStatsRepository.js';
+import { queueCanonicalJobForContact } from '../scheduler.js';
 
 const router = express.Router();
 
@@ -36,23 +39,18 @@ router.post('/', (req, res) => {
     identityId = first?.id || null;
   }
 
-  const now = new Date().toISOString();
+  const now     = new Date().toISOString();
   const results = [];
 
-  const insertLog = db.prepare(`
-    INSERT INTO send_log (date, contactId, name, email, template, status, subject, body, senderIdentityId)
-    VALUES (@date, @contactId, @name, @email, @template, @status, @subject, @body, @senderIdentityId)
-  `);
-  const insertJob = db.prepare(`
-    INSERT INTO send_jobs
-      (senderIdentityId, contactId, email, firstName, lastName,
-       templateName, subject, html, txt, status, createdAt, sendLogId)
-    VALUES
-      (@senderIdentityId, @contactId, @email, @firstName, @lastName,
-       @templateName, @subject, @html, @txt, 'queued', @createdAt, @sendLogId)
-  `);
+  if (process.env.USE_CANONICAL_QUEUE === 'true' && identityId) {
+    // ── Canonical path: jobs table + delivery tracking ──────────────────────────
+    const today    = now.slice(0, 10);
+    const dispatch = findOrCreateManual(today, identityId);
+    findOrCreateStats(dispatch.id);
 
-  db.transaction(() => {
+    const templateContent = { subject: resolvedSubject, html: resolvedHtml, txt: resolvedTxt };
+    let jobsCreated = 0;
+
     for (const id of contactIds) {
       const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(id);
       if (!contact) {
@@ -60,49 +58,87 @@ router.post('/', (req, res) => {
         continue;
       }
 
-      // Skip if already queued or in-flight
       const existing = db.prepare(
-        "SELECT id FROM send_jobs WHERE contactId=? AND status IN ('queued','claimed') LIMIT 1"
+        "SELECT id FROM jobs WHERE contact_id=? AND status IN ('PENDING','PROCESSING') LIMIT 1"
       ).get(id);
       if (existing) {
         results.push({ id, email: contact.email, status: 'skipped', note: 'Already queued' });
         continue;
       }
 
-      const logRow = insertLog.run({
-        date: now, contactId: contact.id,
-        name: `${contact.firstName} ${contact.lastName}`,
-        email: contact.email,
-        template: templateName || '(custom)',
-        status: 'queued',
-        subject: resolvedSubject,
-        body: resolvedHtml,
-        senderIdentityId: identityId,
-      });
-
-      const jobRow = insertJob.run({
-        senderIdentityId: identityId,
-        contactId: contact.id,
-        email: contact.email,
-        firstName: contact.firstName,
-        lastName: contact.lastName,
-        templateName: templateName || null,
-        subject: resolvedSubject,
-        html: resolvedHtml,
-        txt: resolvedTxt,
-        createdAt: now,
-        sendLogId: logRow.lastInsertRowid,
-      });
-
-      db.prepare('UPDATE send_log SET sendJobId=? WHERE id=?')
-        .run(jobRow.lastInsertRowid, logRow.lastInsertRowid);
-
-      // Mark contact so the scheduler doesn't re-pick it for other campaigns
-      db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(id);
-
-      results.push({ id, email: contact.email, status: 'queued', jobId: jobRow.lastInsertRowid });
+      queueCanonicalJobForContact(contact, templateName || null, templateContent, null, null, identityId, dispatch.id);
+      jobsCreated++;
+      results.push({ id, email: contact.email, status: 'queued' });
     }
-  })();
+
+    if (jobsCreated > 0) incrementJobs(dispatch.id, jobsCreated);
+  } else {
+    // ── Legacy path: send_jobs table (unchanged) ────────────────────────────────
+    const insertLog = db.prepare(`
+      INSERT INTO send_log (date, contactId, name, email, template, status, subject, body, senderIdentityId)
+      VALUES (@date, @contactId, @name, @email, @template, @status, @subject, @body, @senderIdentityId)
+    `);
+    const insertJob = db.prepare(`
+      INSERT INTO send_jobs
+        (senderIdentityId, contactId, email, firstName, lastName,
+         templateName, subject, html, txt, status, createdAt, sendLogId)
+      VALUES
+        (@senderIdentityId, @contactId, @email, @firstName, @lastName,
+         @templateName, @subject, @html, @txt, 'queued', @createdAt, @sendLogId)
+    `);
+
+    db.transaction(() => {
+      for (const id of contactIds) {
+        const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(id);
+        if (!contact) {
+          results.push({ id, status: 'error', error: 'Contact not found' });
+          continue;
+        }
+
+        // Skip if already queued or in-flight
+        const existing = db.prepare(
+          "SELECT id FROM send_jobs WHERE contactId=? AND status IN ('queued','claimed') LIMIT 1"
+        ).get(id);
+        if (existing) {
+          results.push({ id, email: contact.email, status: 'skipped', note: 'Already queued' });
+          continue;
+        }
+
+        const logRow = insertLog.run({
+          date: now, contactId: contact.id,
+          name: `${contact.firstName} ${contact.lastName}`,
+          email: contact.email,
+          template: templateName || '(custom)',
+          status: 'queued',
+          subject: resolvedSubject,
+          body: resolvedHtml,
+          senderIdentityId: identityId,
+        });
+
+        const jobRow = insertJob.run({
+          senderIdentityId: identityId,
+          contactId: contact.id,
+          email: contact.email,
+          firstName: contact.firstName,
+          lastName: contact.lastName,
+          templateName: templateName || null,
+          subject: resolvedSubject,
+          html: resolvedHtml,
+          txt: resolvedTxt,
+          createdAt: now,
+          sendLogId: logRow.lastInsertRowid,
+        });
+
+        db.prepare('UPDATE send_log SET sendJobId=? WHERE id=?')
+          .run(jobRow.lastInsertRowid, logRow.lastInsertRowid);
+
+        // Mark contact so the scheduler doesn't re-pick it for other campaigns
+        db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(id);
+
+        results.push({ id, email: contact.email, status: 'queued', jobId: jobRow.lastInsertRowid });
+      }
+    })();
+  }
 
   const noIdentity = !identityId;
   res.json({ results, noIdentity });

@@ -1,5 +1,6 @@
 import db from '../db.js';
 import * as JobRepository from './JobRepository.js';
+import { incrementSent, incrementSendFailed } from './CampaignStatsRepository.js';
 
 // ─── Campaign completion handlers for the canonical jobs queue ────────────────
 //
@@ -31,6 +32,12 @@ export function onJobCompleted(jobId, queueId) {
     db.prepare('UPDATE sender_identities SET dailySentCount = dailySentCount + 1 WHERE id=?')
       .run(job.identity_id);
   }
+
+  // Delivery tracking: mark Postfix accepted the message and update campaign stats
+  db.transaction(() => {
+    db.prepare("UPDATE jobs SET delivery_status = 'SMTP_ACCEPTED' WHERE id=?").run(jobId);
+    if (job.campaign_id) incrementSent(job.campaign_id);
+  })();
 }
 
 export function onJobFailed(jobId, errorMessage) {
@@ -46,4 +53,10 @@ export function onJobFailed(jobId, errorMessage) {
     db.prepare("UPDATE contacts SET status='failed' WHERE id=?")
       .run(job.contact_id);
   }
+
+  // Delivery tracking: mark Postfix rejected the submission and update campaign stats
+  db.transaction(() => {
+    db.prepare("UPDATE jobs SET delivery_status = 'SEND_FAILED' WHERE id=?").run(jobId);
+    if (job.campaign_id) incrementSendFailed(job.campaign_id);
+  })();
 }

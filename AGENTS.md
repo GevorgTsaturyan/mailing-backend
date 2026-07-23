@@ -375,12 +375,12 @@ All SQLite queries for the `jobs` table. Six functions:
 - `markFailed(id, nodeId, errorMessage)` — same guard as markSent; sets error_message
 - `markCancelled(id)` — cancels PENDING or PROCESSING jobs (internal utility, no API endpoint)
 
-### CampaignResultService.js — Completion Side-Effects for Campaign Jobs (Milestone 5)
+### CampaignResultService.js — Completion Side-Effects for Campaign Jobs (Milestone 5+6)
 Called by `routes/jobs.js` after a canonical job transitions to SENT or FAILED. Mirrors the
 side-effects that `POST /api/nodes/results` produces for the legacy send_jobs pipeline.
-- `onJobCompleted(jobId, queueId)` — fetches the job; if `send_log_id` is set, marks send_log `sent` and stores queueId; if `contact_id` is set, marks contact `sent` + sets sentAt; if `identity_id` is set, increments `dailySentCount`
-- `onJobFailed(jobId, errorMessage)` — fetches the job; marks send_log `failed` + stores error; marks contact `failed`
-Both functions are no-ops when the job has no campaign fields (safe to call for any job).
+- `onJobCompleted(jobId, queueId)` — fetches the job; marks send_log `sent` + stores queueId; marks contact `sent`; increments `dailySentCount`; **M6**: atomically sets `jobs.delivery_status = 'SMTP_ACCEPTED'` and calls `incrementSent(campaign_id)` if the job has a campaign
+- `onJobFailed(jobId, errorMessage)` — fetches the job; marks send_log `failed`; marks contact `failed`; **M6**: atomically sets `jobs.delivery_status = 'SEND_FAILED'` and calls `incrementSendFailed(campaign_id)` if the job has a campaign
+Both functions are no-ops for jobs with no campaign_id (safe to call for any jobs-table row).
 
 ### CampaignRepository.js — DB Layer for Campaigns (Milestone 6)
 All SQLite queries for the `campaigns` table. Four functions:
@@ -453,27 +453,29 @@ All SQLite queries for the `servers` table's node-communication fields. Four fun
 - `recordHeartbeat(apiKey, metrics)` — validates apiKey, builds health object, calls NodeRepository.updateHeartbeat
 - `startOfflineWatcher()` — called once on startup; sets a 30 s interval that calls `markStaleOffline(90_000)`. Any node silent for 90 s gets status=offline.
 
-### scheduler.js — Job Planner (Milestone 5: dual-queue)
+### scheduler.js — Job Planner (Milestone 5: dual-queue; Milestone 6: campaign integration)
 Does NOT send email. Creates job queue rows for mail-nodes to pick up.
 
 **Feature flag**: reads `USE_CANONICAL_QUEUE` from env at call time. When `true`, all three planner functions write to the `jobs` table (canonical pipeline). When `false` or unset, they write to `send_jobs` (legacy pipeline). The legacy pipeline drains existing rows normally regardless of the flag.
 
 **Daily limit enforcement (canonical path only)**: `getIdentityRemainingCapacity(identityId)` resets `dailySentCount` if the calendar day changed, then returns `max(0, dailyLimit - dailySentCount)`. Planners cap their batch at this capacity before fetching contacts — the queue only holds dispatchable jobs.
 
+**`queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor?, scheduledSendId?, senderIdentityId?, campaignId?)`** — **exported**. Creates a `send_log` row + `jobs` row atomically (own `db.transaction()`). Sets `campaign_id` on the job. Callers pass `campaignId` from the campaign row created before the loop.
+
 **`planDaySends()`** — called on startup + every midnight UTC:
-- **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window, creates `jobs` rows with `scheduled_for` set
+- **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window; creates a `type='daily_batch'` campaign row, then calls `queueCanonicalJobForContact` for each contact with `campaign_id` set; calls `incrementJobs` after the loop
 - **Legacy**: unchanged — generates random timestamps, creates `send_jobs` rows
 
 **`planRecurringCampaigns()`** — called on startup + every midnight UTC:
 - For each `active` recurring campaign where `lastRunDate != today`:
 - Computes today's count: `round(initialCount × (1 + increasePercent/100)^currentDay)`
-- **Canonical**: caps count by remaining capacity, creates `jobs` rows
+- **Canonical**: caps count by remaining capacity; creates a `type='recurring'` campaign row with `recurring_campaign_id` FK set; calls `queueCanonicalJobForContact` for each contact; calls `incrementJobs`
 - **Legacy**: unchanged — creates `send_jobs` rows
 - Updates `lastRunDate` and increments `currentDay`; marks `completed` when no pending contacts remain
 
 **`checkScheduledSends()`** — called every minute by cron:
 1. Finds `scheduled_sends` where `status='pending' AND scheduledAt <= now`; marks them `sent`
-2. **Canonical**: creates `jobs` rows for up to `remainingCapacity` contacts (stops if daily limit hit)
+2. **Canonical**: creates a `type='scheduled_send'` campaign row with `scheduled_send_id` FK set (inside the outer `db.transaction()`); calls `queueCanonicalJobForContact` for each contact up to `remainingCapacity`; calls `incrementJobs`
 3. **Legacy**: unchanged — creates `send_jobs` rows for all contacts
 
 ### mailer.js — Legacy SMTP Client
@@ -753,10 +755,7 @@ No application logic was changed. All existing queries and endpoints are unaffec
 **Modified route:**
 - `routes/nodes.js` — `POST /api/nodes/delivery-events` handler replaced: the previous 40-line inline loop is now a single `processEvents(events)` call; response now includes `{ok, processed, skipped}`
 
-**What is NOT yet wired (Phase 3):**
-- `POST /api/send` still writes to `send_jobs` (legacy) and does not create a `campaigns` row
-- `scheduler.js` planners do not yet set `campaign_id` on new `jobs` rows
-- `CampaignResultService.onJobCompleted/onJobFailed` do not yet call `CampaignStatsRepository.incrementSent/incrementSendFailed`
+**What is NOT yet wired (deferred to Phase 4+):**
 - No campaign API endpoints (`GET /api/campaigns`, `GET /api/campaigns/:id`, etc.)
 - No frontend
 
@@ -768,6 +767,34 @@ No application logic was changed. All existing queries and endpoints are unaffec
 5. BOUNCED → `total_bounced` incremented, contact marked failed
 6. Legacy send_jobs event (no canonical job) → `delivery_events.job_id=NULL`, `sendJobId` set correctly
 7. `findOrCreateManual` → same day returns same row; different day returns different row
+
+### Phase 3 complete: Pipeline Integration
+
+**Modified files:**
+- `scheduler.js` — `queueCanonicalJobForContact` now accepts `campaignId` (last param, default `null`) and persists it to `jobs.campaign_id`; now exported. All three canonical planners create a `campaigns` row and call `findOrCreateStats` before queueing jobs, then call `incrementJobs` with the actual queued count:
+  - `planDaySends` (canonical): creates `type='daily_batch'` campaign before the loop
+  - `planRecurringCampaigns` (canonical): creates `type='recurring'` campaign with `recurring_campaign_id` FK
+  - `checkScheduledSends` (canonical): creates `type='scheduled_send'` campaign with `scheduled_send_id` FK — inside the outer `db.transaction()` so campaign + jobs creation is atomic
+- `services/CampaignResultService.js` — both handlers now update `delivery_status` and campaign_stats atomically:
+  - `onJobCompleted`: sets `jobs.delivery_status = 'SMTP_ACCEPTED'`; if `campaign_id` present, calls `incrementSent`
+  - `onJobFailed`: sets `jobs.delivery_status = 'SEND_FAILED'`; if `campaign_id` present, calls `incrementSendFailed`
+  - Both wrapped in `db.transaction()` so `delivery_status` and counter update are atomic
+- `routes/send.js` — `POST /api/send` branches on `USE_CANONICAL_QUEUE`:
+  - **Canonical path** (new): calls `findOrCreateManual(today, identityId)` to get/create the daily campaign, then `queueCanonicalJobForContact` for each contact with `campaign_id` set; calls `incrementJobs` after the loop. Duplicate guard checks `jobs WHERE contact_id=? AND status IN ('PENDING','PROCESSING')`.
+  - **Legacy path** (unchanged): existing `send_jobs` code, byte-for-byte identical
+
+**Counter flow (full lifecycle):**
+```
+job created          → campaign_stats.total_jobs++          (incrementJobs, in planner/send route)
+job SMTP_ACCEPTED    → campaign_stats.total_sent++          (onJobCompleted)
+job SEND_FAILED      → campaign_stats.total_send_failed++   (onJobFailed)
+delivery DELIVERED   → campaign_stats.total_delivered++     (DeliveryEventService — Phase 2)
+delivery BOUNCED     → campaign_stats.total_bounced++       (DeliveryEventService — Phase 2)
+delivery DEFERRED    → campaign_stats.total_currently_deferred++ (first entry only — Phase 2)
+delivery COMPLAINED  → campaign_stats.total_complained++    (DeliveryEventService — Phase 2)
+```
+
+**Phase 3 verification:** 9 functional test scenarios all passed — campaign_id persisted to jobs, all counter transitions correct, exclusive-arc FKs correct (scheduled_send_id and recurring_campaign_id), orphan jobs (no campaign_id) are safely handled.
 
 ---
 
