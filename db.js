@@ -238,4 +238,29 @@ try { db.exec("ALTER TABLE servers ADD COLUMN os_info      TEXT") } catch {}
 try { db.exec("ALTER TABLE servers ADD COLUMN capabilities TEXT") } catch {}
 try { db.exec("ALTER TABLE servers ADD COLUMN health       TEXT") } catch {}
 
+// ─── Job queue (Milestone 3) ─────────────────────────────────────────────────
+// Clean job entity with explicit lifecycle statuses.
+// Nodes poll GET /api/jobs/poll, claim via POST /api/jobs/:id/start (atomic),
+// then report via /complete or /fail.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS jobs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    status        TEXT    NOT NULL DEFAULT 'PENDING',
+    node_id       TEXT,
+    identity_id   INTEGER REFERENCES sender_identities(id),
+    recipient     TEXT    NOT NULL,
+    subject       TEXT    NOT NULL,
+    body          TEXT    NOT NULL DEFAULT '',
+    priority      INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT    NOT NULL,
+    started_at    TEXT,
+    finished_at   TEXT,
+    error_message TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_jobs_poll    ON jobs(status, priority DESC, created_at ASC);
+  CREATE INDEX IF NOT EXISTS idx_jobs_node_id ON jobs(node_id);
+`);
+
 export default db;

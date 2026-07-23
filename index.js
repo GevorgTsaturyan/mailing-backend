@@ -17,6 +17,7 @@ import providersRouter          from './routes/providers.js';
 import serversRouter            from './routes/servers.js';
 import senderIdentitiesRouter   from './routes/sender-identities.js';
 import nodesRouter              from './routes/nodes.js';
+import jobsRouter               from './routes/jobs.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
 import { startOfflineWatcher } from './services/HeartbeatService.js';
@@ -37,6 +38,10 @@ app.use('/api/auth', authRouter);
 
 // Node agent routes — no JWT, authenticated by per-server apiKey
 app.use('/api/nodes', nodesRouter);
+
+// Job queue API — registered before requireAuth so node endpoints use apiKey auth.
+// POST /api/jobs (create) applies requireAuth internally via the router.
+app.use('/api/jobs', jobsRouter);
 
 // Unsubscribe link — public, no auth needed
 app.get('/unsubscribe', (req, res) => {

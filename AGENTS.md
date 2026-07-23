@@ -164,6 +164,15 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
 | POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Reports Postfix log verdicts. Updates delivery_events, send_jobs, send_log. |
 
+### Job Queue API (Milestone 3)
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| POST | `/api/jobs` | JWT | `{identity_id?, recipient, subject, body?, priority?}`. Creates a PENDING job. Returns the created job. |
+| GET | `/api/jobs/poll` | apiKey | `?apiKey=`. Read-only peek at the next PENDING job (highest priority, oldest first). Returns the job or **204 No Content** if queue is empty. Does NOT claim the job. |
+| POST | `/api/jobs/:id/start` | apiKey | `{apiKey}`. Atomically claims the job: PENDING → PROCESSING. Returns 409 if another node already claimed it. |
+| POST | `/api/jobs/:id/complete` | apiKey | `{apiKey}`. Marks PROCESSING → SENT. Only the owning node may call this. |
+| POST | `/api/jobs/:id/fail` | apiKey | `{apiKey, error_message?}`. Marks PROCESSING → FAILED. Only the owning node may call this. |
+
 ### Public
 | Method | Path | Notes |
 |--------|------|-------|
@@ -176,6 +185,23 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 All tables are created in `db.js` on startup via `CREATE TABLE IF NOT EXISTS`. Schema upgrades use `ALTER TABLE ... ADD COLUMN` wrapped in try/catch (idempotent).
 
 ```sql
+jobs (
+  id            INTEGER PK,
+  status        TEXT DEFAULT 'PENDING',   -- PENDING | PROCESSING | SENT | FAILED | CANCELLED
+  node_id       TEXT,                     -- String(server.id) of the claiming node; NULL until claimed
+  identity_id   INTEGER FK→sender_identities (nullable),
+  recipient     TEXT NOT NULL,            -- destination email address
+  subject       TEXT NOT NULL,
+  body          TEXT DEFAULT '',
+  priority      INTEGER DEFAULT 0,        -- higher = dispatched first
+  attempts      INTEGER DEFAULT 0,        -- incremented each time a node claims the job
+  created_at    TEXT NOT NULL,
+  started_at    TEXT,                     -- set when first claimed
+  finished_at   TEXT,                     -- set on SENT or FAILED
+  error_message TEXT                      -- set on FAILED
+)
+-- Indexes: (status, priority DESC, created_at ASC) for O(1) poll; node_id for node queries
+
 contacts (
   id INTEGER PK, firstName TEXT, lastName TEXT,
   email TEXT UNIQUE, status TEXT DEFAULT 'pending', sentAt TEXT
@@ -272,6 +298,26 @@ send_log (
 ---
 
 ## Services
+
+### JobRepository.js — DB Layer for Jobs
+All SQLite queries for the `jobs` table. Six functions:
+- `create(fields)` — inserts a PENDING job; returns the created row
+- `findById(id)` — returns a single job by primary key
+- `findNextPending()` — `SELECT … WHERE status='PENDING' ORDER BY priority DESC, created_at ASC LIMIT 1`; returns null if queue is empty
+- `claimJob(id, nodeId)` — `UPDATE … WHERE id=? AND status='PENDING'`; returns `true` if `changes===1` (won the race), `false` otherwise
+- `markSent(id, nodeId)` — `UPDATE … WHERE id=? AND status='PROCESSING' AND node_id=?`; returns `true` on success
+- `markFailed(id, nodeId, errorMessage)` — same guard as markSent; sets error_message
+- `markCancelled(id)` — cancels PENDING or PROCESSING jobs
+
+### JobService.js — Job Lifecycle Logic
+Validates inputs and orchestrates state transitions via JobRepository:
+- `createJob(fields)` — validates recipient/subject, delegates to create
+- `startJob(id, nodeId)` — checks job exists and is PENDING, then calls claimJob; returns `{ok, job}` or `{error, status}`
+- `completeJob(id, nodeId)` — checks ownership and PROCESSING status, calls markSent
+- `failJob(id, nodeId, errorMessage)` — checks ownership and PROCESSING status, calls markFailed
+
+### PollingService.js — Poll Abstraction
+Single exported function `poll()` — wraps `findNextPending()` for use by the route handler. Keeps the controller thin and makes the polling strategy swappable without touching the route.
 
 ### NodeRepository.js — DB Layer for Nodes
 All SQLite queries for the `servers` table's node-communication fields. Four functions:
@@ -473,7 +519,73 @@ node index.js                             # or: pm2 start index.js --name backen
 
 ---
 
+## Job Lifecycle (Milestone 3)
+
+```
+POST /api/jobs  ──────────────────────────────────────┐
+(JWT, admin)                                          │
+                                                      ↓
+                                               status = PENDING
+                                               node_id = NULL
+
+GET /api/jobs/poll?apiKey=…  ─────────────────────────┐
+(read-only SELECT — no state change)                  │
+                                                      ↓
+                                         returns the job OR 204 No Content
+
+POST /api/jobs/:id/start  {apiKey}  ──────────────────┐
+(atomic UPDATE WHERE status='PENDING')                │
+                                                      ↓
+              changes=1 ──────→  status = PROCESSING  │  node_id = String(server.id)
+              changes=0 ──────→  409 Conflict         │  started_at = now
+                                 (re-poll next tick)  │  attempts   += 1
+
+                                               [node does work — Postfix in M4]
+
+POST /api/jobs/:id/complete  {apiKey}  ───────────────┐
+                                                      ↓
+                                               status = SENT
+                                               finished_at = now
+
+POST /api/jobs/:id/fail  {apiKey, error_message}  ────┐
+                                                      ↓
+                                               status = FAILED
+                                               finished_at = now
+                                               error_message = …
+```
+
+### Locking
+
+Locking is implemented with **optimistic concurrency via a conditional UPDATE**:
+
+```sql
+UPDATE jobs
+SET    status='PROCESSING', node_id=:nodeId, started_at=:now, attempts=attempts+1
+WHERE  id=:id AND status='PENDING'
+```
+
+- `changes === 1` → this node won; proceed
+- `changes === 0` → another node claimed the job first; return 409 to the caller so it re-polls
+
+SQLite serialises concurrent writes, so only one node's UPDATE will observe `changes=1` even if multiple nodes call `/start` simultaneously.  No application-level mutexes or external queue systems are needed.
+
+### Polling behaviour
+
+- `GET /api/jobs/poll` is **read-only** — it never changes job state.  
+- The next PENDING job is selected by `priority DESC, created_at ASC` so higher-priority jobs and older same-priority jobs are dispatched first.  
+- Returns **204 No Content** (empty body) when the queue is empty — mail-nodes check for the absence of an `id` field and skip to the next tick.  
+- The two-step design (poll → start) means a node crash between the two calls leaves the job PENDING, not stuck in a transitional state.
+
 ## Current Milestone
+
+**Milestone 3 complete: Job Queue & Polling**
+- New `jobs` table with full lifecycle schema (PENDING → PROCESSING → SENT/FAILED/CANCELLED)
+- `JobRepository` — atomic `claimJob()` with `WHERE status='PENDING'` guard
+- `JobService` — validates inputs, enforces ownership on complete/fail, surfaces meaningful error codes
+- `PollingService` — read-only poll abstraction; 204 when queue is empty
+- `routes/jobs.js` — `POST /api/jobs` (JWT), `GET /api/jobs/poll`, `POST /api/jobs/:id/start|complete|fail` (apiKey)
+- Registered before `requireAuth` so node endpoints bypass JWT; only job creation requires a JWT
+- Mail-node: `services/JobPollingService.js` — full poll→claim→stub→complete cycle at `JOB_POLL_INTERVAL` (default 10 s)
 
 **Milestone 1 complete: Node Registration & Communication**
 - Nodes register on startup with full system metadata (node_id, hostname, version, IP, OS, capabilities)
