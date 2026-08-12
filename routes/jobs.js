@@ -32,11 +32,12 @@ function nodeIdOf(server) {
 
 // ── POST /api/jobs ────────────────────────────────────────────────────────────
 // Create a new job.  JWT-authenticated (called by the controller UI or admin scripts).
-// Body: { identity_id?, recipient, subject, body?, priority? }
+// Body: { identity_id?, recipient, subject, body?, priority?, content_type? }
+// content_type: 'html' (default) | 'text'
 router.post('/', requireAuth, (req, res) => {
-  const { identity_id, recipient, subject, body, priority } = req.body;
+  const { identity_id, recipient, subject, body, priority, content_type } = req.body;
   try {
-    const job = JobService.createJob({ identity_id, recipient, subject, body, priority });
+    const job = JobService.createJob({ identity_id, recipient, subject, body, priority, content_type });
     res.status(201).json(job);
   } catch (err) {
     res.status(400).json({ error: err.message });

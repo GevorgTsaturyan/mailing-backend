@@ -9,8 +9,9 @@ const router = express.Router();
 // POST /api/send
 // Creates send_jobs (queued) for the given contacts instead of sending directly.
 // A mail-node will poll, claim, and execute them via its local Postfix.
+// contentType: 'html' (default) | 'text' — controls which MIME part the node sends.
 router.post('/', (req, res) => {
-  const { contactIds, templateName, subject, html, txt, senderIdentityId } = req.body;
+  const { contactIds, templateName, subject, html, txt, senderIdentityId, contentType } = req.body;
 
   if (!Array.isArray(contactIds) || contactIds.length === 0) {
     return res.status(400).json({ error: 'contactIds must be a non-empty array' });
@@ -18,18 +19,23 @@ router.post('/', (req, res) => {
   if (!templateName && !subject) {
     return res.status(400).json({ error: 'templateName or subject is required' });
   }
+  if (contentType != null && contentType !== 'html' && contentType !== 'text') {
+    return res.status(400).json({ error: "contentType must be 'html' or 'text'" });
+  }
 
   // Pre-fetch template content so the job row has everything the node needs
-  let resolvedSubject = subject || null;
-  let resolvedHtml    = html    || null;
-  let resolvedTxt     = txt     || null;
+  let resolvedSubject     = subject     || null;
+  let resolvedHtml        = html        || null;
+  let resolvedTxt         = txt         || null;
+  let resolvedContentType = contentType || 'html';
 
   if (templateName && !subject) {
     const tmpl = db.prepare('SELECT * FROM templates WHERE name=?').get(templateName);
     if (!tmpl) return res.status(404).json({ error: `Template "${templateName}" not found` });
-    resolvedSubject = tmpl.subject;
-    resolvedHtml    = tmpl.html;
-    resolvedTxt     = tmpl.txt;
+    resolvedSubject     = tmpl.subject;
+    resolvedHtml        = tmpl.html;
+    resolvedTxt         = tmpl.txt;
+    resolvedContentType = contentType || tmpl.content_type || 'html';
   }
 
   // Pick identity: use provided, or fall back to first active
@@ -48,7 +54,7 @@ router.post('/', (req, res) => {
     const dispatch = findOrCreateManual(today, identityId);
     findOrCreateStats(dispatch.id);
 
-    const templateContent = { subject: resolvedSubject, html: resolvedHtml, txt: resolvedTxt };
+    const templateContent = { subject: resolvedSubject, html: resolvedHtml, txt: resolvedTxt, content_type: resolvedContentType };
     let jobsCreated = 0;
 
     for (const id of contactIds) {
@@ -81,10 +87,10 @@ router.post('/', (req, res) => {
     const insertJob = db.prepare(`
       INSERT INTO send_jobs
         (senderIdentityId, contactId, email, firstName, lastName,
-         templateName, subject, html, txt, status, createdAt, sendLogId)
+         templateName, subject, html, txt, content_type, status, createdAt, sendLogId)
       VALUES
         (@senderIdentityId, @contactId, @email, @firstName, @lastName,
-         @templateName, @subject, @html, @txt, 'queued', @createdAt, @sendLogId)
+         @templateName, @subject, @html, @txt, @content_type, 'queued', @createdAt, @sendLogId)
     `);
 
     db.transaction(() => {
@@ -125,6 +131,7 @@ router.post('/', (req, res) => {
           subject: resolvedSubject,
           html: resolvedHtml,
           txt: resolvedTxt,
+          content_type: resolvedContentType,
           createdAt: now,
           sendLogId: logRow.lastInsertRowid,
         });

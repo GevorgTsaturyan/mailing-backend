@@ -9,17 +9,20 @@ router.get('/', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent } = req.body;
+  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!templateName && !subject) return res.status(400).json({ error: 'templateName or subject required' });
+  if (content_type != null && content_type !== 'html' && content_type !== 'text')
+    return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
   const result = db.prepare(`
     INSERT INTO recurring_campaigns
-      (name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, status, currentDay, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?)
+      (name, templateName, subject, html, txt, content_type, startTime, endTime, initialCount, increasePercent, status, currentDay, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?)
   `).run(
     name,
     templateName || null, subject || null, html || null, txt || null,
+    content_type || 'html',
     startTime || '09:00', endTime || '17:00',
     initialCount || 10, increasePercent || 0,
     new Date().toISOString()
@@ -34,11 +37,14 @@ router.put('/:id', (req, res) => {
   const row = db.prepare('SELECT * FROM recurring_campaigns WHERE id=?').get(id);
   if (!row) return res.status(404).json({ error: 'Not found' });
 
-  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent } = req.body;
+  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type } = req.body;
+
+  if (content_type != null && content_type !== 'html' && content_type !== 'text')
+    return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
   db.prepare(`
     UPDATE recurring_campaigns
-    SET name=?, templateName=?, subject=?, html=?, txt=?,
+    SET name=?, templateName=?, subject=?, html=?, txt=?, content_type=?,
         startTime=?, endTime=?, initialCount=?, increasePercent=?
     WHERE id=?
   `).run(
@@ -47,6 +53,7 @@ router.put('/:id', (req, res) => {
     subject       !== undefined ? subject       : row.subject,
     html          !== undefined ? html          : row.html,
     txt           !== undefined ? txt           : row.txt,
+    content_type  !== undefined ? content_type  : row.content_type,
     startTime     ?? row.startTime,
     endTime       ?? row.endTime,
     initialCount  ?? row.initialCount,

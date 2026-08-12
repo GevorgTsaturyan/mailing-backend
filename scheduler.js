@@ -21,19 +21,20 @@ function pickActiveIdentity() {
 function resolveTemplate(templateName, templateContent) {
   if (templateContent?.subject) return templateContent;
   if (templateName) {
-    const t = db.prepare('SELECT subject, html, txt FROM templates WHERE name=?').get(templateName);
+    const t = db.prepare('SELECT subject, html, txt, content_type FROM templates WHERE name=?').get(templateName);
     if (t) return t;
   }
-  return { subject: null, html: null, txt: null };
+  return { subject: null, html: null, txt: null, content_type: 'html' };
 }
 
 // ─── Legacy queue path ────────────────────────────────────────────────────────
 // Creates a send_jobs row + send_log row. Unchanged from Milestone 4.
 
 function queueJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null) {
-  const identityId = senderIdentityId ?? pickActiveIdentity();
-  const tmpl = resolveTemplate(templateName, templateContent);
-  const now  = new Date().toISOString();
+  const identityId  = senderIdentityId ?? pickActiveIdentity();
+  const tmpl        = resolveTemplate(templateName, templateContent);
+  const contentType = tmpl.content_type || 'html';
+  const now         = new Date().toISOString();
 
   db.transaction(() => {
     const logRow = db.prepare(`
@@ -51,12 +52,12 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
     const jobRow = db.prepare(`
       INSERT INTO send_jobs
         (senderIdentityId, contactId, email, firstName, lastName,
-         templateName, subject, html, txt, status, scheduledFor, createdAt, sendLogId, scheduledSendId)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+         templateName, subject, html, txt, content_type, status, scheduledFor, createdAt, sendLogId, scheduledSendId)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
     `).run(
       identityId,
       contact.id, contact.email, contact.firstName, contact.lastName,
-      templateName || null, tmpl.subject, tmpl.html, tmpl.txt,
+      templateName || null, tmpl.subject, tmpl.html, tmpl.txt, contentType,
       scheduledFor, now, logRow.lastInsertRowid, scheduledSendId
     );
 
@@ -73,11 +74,14 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
 // the caller has already validated capacity.
 
 export function queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null, campaignId = null) {
-  const identityId = senderIdentityId ?? pickActiveIdentity();
+  const identityId  = senderIdentityId ?? pickActiveIdentity();
   if (!identityId) return;
 
-  const tmpl = resolveTemplate(templateName, templateContent);
-  const now  = new Date().toISOString();
+  const tmpl        = resolveTemplate(templateName, templateContent);
+  const contentType = tmpl.content_type || 'html';
+  // Store the relevant content body based on mode: text jobs use txt, html jobs use html.
+  const body        = contentType === 'text' ? (tmpl.txt || '') : (tmpl.html || '');
+  const now         = new Date().toISOString();
 
   db.transaction(() => {
     const logRow = db.prepare(`
@@ -94,14 +98,15 @@ export function queueCanonicalJobForContact(contact, templateName, templateConte
 
     db.prepare(`
       INSERT INTO jobs
-        (status, identity_id, recipient, subject, body,
+        (status, identity_id, recipient, subject, body, content_type,
          scheduled_for, contact_id, send_log_id, campaign_id, created_at)
-      VALUES ('PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES ('PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       identityId,
       contact.email,
       tmpl.subject || '',
-      tmpl.html    || '',
+      body,
+      contentType,
       scheduledFor,
       contact.id,
       logRow.lastInsertRowid,
@@ -227,7 +232,7 @@ function planRecurringCampaigns() {
 
     const requestedCount = nextCount(campaign);
     const templateContent = campaign.subject
-      ? { subject: campaign.subject, html: campaign.html || '', txt: campaign.txt || '' }
+      ? { subject: campaign.subject, html: campaign.html || '', txt: campaign.txt || '', content_type: campaign.content_type || 'html' }
       : null;
 
     if (useCanonicalQueue()) {
@@ -308,7 +313,7 @@ function checkScheduledSends() {
   for (const task of due) {
     const contactIds = JSON.parse(task.contactIds);
     const templateContent = task.subject
-      ? { subject: task.subject, html: task.html || '', txt: task.txt || '' }
+      ? { subject: task.subject, html: task.html || '', txt: task.txt || '', content_type: task.content_type || 'html' }
       : null;
 
     console.log(`Scheduled send #${task.id}: queuing ${contactIds.length} job(s)`);

@@ -2,21 +2,26 @@ import * as JobRepository from './JobRepository.js';
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-function validate({ recipient, subject }) {
-  if (!recipient?.trim()) throw new Error('recipient is required');
-  if (!subject?.trim())   throw new Error('subject is required');
+const VALID_CONTENT_TYPES = new Set(['html', 'text']);
+
+function validate({ recipient, subject, content_type }) {
+  if (!recipient?.trim())    throw new Error('recipient is required');
+  if (!subject?.trim())      throw new Error('subject is required');
+  if (content_type != null && !VALID_CONTENT_TYPES.has(content_type))
+    throw new Error(`content_type must be 'html' or 'text'`);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export function createJob({ identity_id, recipient, subject, body, priority }) {
-  validate({ recipient, subject });
+export function createJob({ identity_id, recipient, subject, body, priority, content_type }) {
+  validate({ recipient, subject, content_type });
   return JobRepository.create({
-    identity_id: identity_id ?? null,
-    recipient:   recipient.trim(),
-    subject:     subject.trim(),
-    body:        body ?? '',
-    priority:    Number(priority ?? 0),
+    identity_id:  identity_id ?? null,
+    recipient:    recipient.trim(),
+    subject:      subject.trim(),
+    body:         body ?? '',
+    priority:     Number(priority ?? 0),
+    content_type: content_type ?? 'html',
   });
 }
 

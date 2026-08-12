@@ -280,6 +280,16 @@ db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_status              ON contacts
 db.exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_sends_status_sched ON scheduled_sends(status, scheduledAt)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_send_log_scheduledSendId     ON send_log(scheduledSendId)`);
 
+// ─── Plain-text email support (content_type field) ───────────────────────────
+// content_type = 'html' (default) | 'text'
+// For text mode: the mail-node sends text/plain only, no HTML MIME part.
+// Existing rows without the column get DEFAULT 'html', preserving behaviour.
+try { db.exec("ALTER TABLE jobs              ADD COLUMN content_type TEXT NOT NULL DEFAULT 'html'") } catch {}
+try { db.exec("ALTER TABLE send_jobs         ADD COLUMN content_type TEXT NOT NULL DEFAULT 'html'") } catch {}
+try { db.exec("ALTER TABLE templates         ADD COLUMN content_type TEXT NOT NULL DEFAULT 'html'") } catch {}
+try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN content_type TEXT NOT NULL DEFAULT 'html'") } catch {}
+try { db.exec("ALTER TABLE scheduled_sends   ADD COLUMN content_type TEXT NOT NULL DEFAULT 'html'") } catch {}
+
 // ─── Milestone 6: Delivery Tracking ──────────────────────────────────────────
 //
 // campaigns — one row per campaign dispatch (batch send run).

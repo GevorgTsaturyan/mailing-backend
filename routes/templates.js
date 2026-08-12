@@ -15,12 +15,14 @@ router.get('/:name', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { name, subject, html, txt } = req.body;
+  const { name, subject, html, txt, content_type } = req.body;
   if (!name || !subject) return res.status(400).json({ error: 'name and subject required' });
+  if (content_type != null && content_type !== 'html' && content_type !== 'text')
+    return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
   try {
     db.prepare(
-      'INSERT INTO templates (name, subject, html, txt) VALUES (?, ?, ?, ?)'
-    ).run(name.trim(), subject.trim(), html || '', txt || '');
+      'INSERT INTO templates (name, subject, html, txt, content_type) VALUES (?, ?, ?, ?, ?)'
+    ).run(name.trim(), subject.trim(), html || '', txt || '', content_type || 'html');
     res.status(201).json({ name: name.trim() });
   } catch (err) {
     if (err.message.includes('UNIQUE')) return res.status(409).json({ error: 'Template name already exists' });
@@ -29,13 +31,15 @@ router.post('/', (req, res) => {
 });
 
 router.put('/:name', (req, res) => {
-  const { subject, html, txt } = req.body;
+  const { subject, html, txt, content_type } = req.body;
   const existing = db.prepare('SELECT name FROM templates WHERE name = ?').get(req.params.name);
   if (!existing) return res.status(404).json({ error: 'Template not found' });
+  if (content_type != null && content_type !== 'html' && content_type !== 'text')
+    return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
   db.prepare(
-    'UPDATE templates SET subject=COALESCE(?, subject), html=COALESCE(?, html), txt=COALESCE(?, txt) WHERE name=?'
-  ).run(subject ?? null, html ?? null, txt ?? null, req.params.name);
+    'UPDATE templates SET subject=COALESCE(?, subject), html=COALESCE(?, html), txt=COALESCE(?, txt), content_type=COALESCE(?, content_type) WHERE name=?'
+  ).run(subject ?? null, html ?? null, txt ?? null, content_type ?? null, req.params.name);
 
   res.json(db.prepare('SELECT * FROM templates WHERE name = ?').get(req.params.name));
 });

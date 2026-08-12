@@ -1,15 +1,16 @@
 import db from '../db.js';
 
-export function create({ identity_id, recipient, subject, body, priority }) {
+export function create({ identity_id, recipient, subject, body, priority, content_type }) {
   const now = new Date().toISOString();
   const { lastInsertRowid } = db.prepare(`
-    INSERT INTO jobs (status, node_id, identity_id, recipient, subject, body, priority, attempts, created_at)
-    VALUES ('PENDING', NULL, ?, ?, ?, ?, ?, 0, ?)
+    INSERT INTO jobs (status, node_id, identity_id, recipient, subject, body, content_type, priority, attempts, created_at)
+    VALUES ('PENDING', NULL, ?, ?, ?, ?, ?, ?, 0, ?)
   `).run(
     identity_id ?? null,
     recipient,
     subject,
     body ?? '',
+    content_type ?? 'html',
     priority ?? 0,
     now,
   );

@@ -37,7 +37,7 @@ router.get('/:id', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { label, contactIds, templateName, subject, html, txt, scheduledAt } = req.body;
+  const { label, contactIds, templateName, subject, html, txt, scheduledAt, content_type } = req.body;
 
   if (!Array.isArray(contactIds) || contactIds.length === 0)
     return res.status(400).json({ error: 'contactIds required' });
@@ -45,11 +45,13 @@ router.post('/', (req, res) => {
     return res.status(400).json({ error: 'scheduledAt required' });
   if (!templateName && !subject)
     return res.status(400).json({ error: 'templateName or subject required' });
+  if (content_type != null && content_type !== 'html' && content_type !== 'text')
+    return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
   const result = db.prepare(`
     INSERT INTO scheduled_sends
-      (label, contactIds, templateName, subject, html, txt, scheduledAt, status, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      (label, contactIds, templateName, subject, html, txt, content_type, scheduledAt, status, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
   `).run(
     label || null,
     JSON.stringify(contactIds),
@@ -57,6 +59,7 @@ router.post('/', (req, res) => {
     subject || null,
     html || null,
     txt || null,
+    content_type || 'html',
     scheduledAt,
     new Date().toISOString()
   );
@@ -72,11 +75,14 @@ router.put('/:id', (req, res) => {
   if (row.status !== 'pending')
     return res.status(400).json({ error: 'Only pending scheduled sends can be edited' });
 
-  const { label, scheduledAt, templateName, subject, html, txt } = req.body;
+  const { label, scheduledAt, templateName, subject, html, txt, content_type } = req.body;
+
+  if (content_type != null && content_type !== 'html' && content_type !== 'text')
+    return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
   db.prepare(`
     UPDATE scheduled_sends
-    SET label=?, scheduledAt=?, templateName=?, subject=?, html=?, txt=?
+    SET label=?, scheduledAt=?, templateName=?, subject=?, html=?, txt=?, content_type=?
     WHERE id=?
   `).run(
     label         !== undefined ? label         : row.label,
@@ -85,6 +91,7 @@ router.put('/:id', (req, res) => {
     subject       !== undefined ? subject       : row.subject,
     html          !== undefined ? html          : row.html,
     txt           !== undefined ? txt           : row.txt,
+    content_type  !== undefined ? content_type  : row.content_type,
     id
   );
 

@@ -101,15 +101,15 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | `/api/templates` | Returns array of name strings only |
-| GET | `/api/templates/:name` | Full template object `{name, subject, html, txt}` |
-| POST | `/api/templates` | `{name, subject, html?, txt?}` |
-| PUT | `/api/templates/:name` | `{subject?, html?, txt?}` (partial) |
+| GET | `/api/templates/:name` | Full template object `{name, subject, html, txt, content_type}` |
+| POST | `/api/templates` | `{name, subject, html?, txt?, content_type?}`. `content_type`: `'html'` (default) or `'text'` |
+| PUT | `/api/templates/:name` | `{subject?, html?, txt?, content_type?}` (partial) |
 | DELETE | `/api/templates/:name` | — |
 
 ### Send
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/api/send` | `{contactIds[], templateName?, subject?, html?, txt?, senderIdentityId?}`. Creates `send_jobs` rows (status=queued). Returns `{results[], noIdentity}` |
+| POST | `/api/send` | `{contactIds[], templateName?, subject?, html?, txt?, senderIdentityId?, contentType?}`. `contentType`: `'html'` (default) or `'text'`. Creates job queue rows. Returns `{results[], noIdentity}` |
 | GET | `/api/send/jobs` | Queue overview with `?status=&limit=` filters. Joins identities, servers, providers. |
 
 ### Schedule (daily batch)
@@ -123,16 +123,16 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 |--------|------|-------|
 | GET | `/api/scheduled-sends` | All, ordered by scheduledAt ASC. Includes `lastSendLogId` |
 | GET | `/api/scheduled-sends/:id` | Single with `logs[]` and `contacts[]` |
-| POST | `/api/scheduled-sends` | `{contactIds[], scheduledAt, templateName? or subject+html+txt, label?}` |
-| PUT | `/api/scheduled-sends/:id` | Only pending rows. `{label?, scheduledAt?, templateName?, subject?, html?, txt?}` |
+| POST | `/api/scheduled-sends` | `{contactIds[], scheduledAt, templateName? or subject+html+txt, label?, content_type?}`. `content_type`: `'html'` (default) or `'text'` |
+| PUT | `/api/scheduled-sends/:id` | Only pending rows. `{label?, scheduledAt?, templateName?, subject?, html?, txt?, content_type?}` |
 | DELETE | `/api/scheduled-sends/:id` | — |
 
 ### Recurring Campaigns (day-over-day warmup sends)
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | `/api/recurring-campaigns` | All, ordered by createdAt DESC |
-| POST | `/api/recurring-campaigns` | `{name, templateName? or subject+html+txt, startTime, endTime, initialCount, increasePercent}` |
-| PUT | `/api/recurring-campaigns/:id` | Update config fields |
+| POST | `/api/recurring-campaigns` | `{name, templateName? or subject+html+txt, startTime, endTime, initialCount, increasePercent, content_type?}`. `content_type`: `'html'` (default) or `'text'` |
+| PUT | `/api/recurring-campaigns/:id` | Update config fields including `content_type?` |
 | POST | `/api/recurring-campaigns/:id/pause` | Sets status=paused |
 | POST | `/api/recurring-campaigns/:id/resume` | Sets status=active |
 | DELETE | `/api/recurring-campaigns/:id` | — |
@@ -172,7 +172,7 @@ All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a va
 ### Job Queue API (Milestone 4 — fully active; Milestone 5: side-effects added)
 | Method | Path | Auth | Notes |
 |--------|------|------|-------|
-| POST | `/api/jobs` | JWT | `{identity_id?, recipient, subject, body?, priority?}`. Creates a PENDING job. Returns the created job. `identity_id` must reference a `sender_identities` row with a populated `fromAddr` or the node will FAIL the job at send time. |
+| POST | `/api/jobs` | JWT | `{identity_id?, recipient, subject, body?, priority?, content_type?}`. `content_type`: `'html'` (default) or `'text'` — controls MIME structure the node uses when sending. Creates a PENDING job. Returns the created job. `identity_id` must reference a `sender_identities` row with a populated `fromAddr` or the node will FAIL the job at send time. |
 | GET | `/api/jobs/poll` | apiKey | `?apiKey=`. Read-only peek at the next PENDING job (highest priority, oldest first). Filters by `scheduled_for <= now` (withholds future-scheduled campaign jobs). Response includes `fromAddr`, `fromName`, `domain` from `sender_identities`. Returns the job or **204 No Content** if queue is empty. Does NOT claim the job. |
 | POST | `/api/jobs/:id/start` | apiKey | `{apiKey}`. Atomically claims the job: PENDING → PROCESSING. Returns 409 if another node already claimed it. |
 | POST | `/api/jobs/:id/complete` | apiKey | `{apiKey, queue_id?}`. Marks PROCESSING → SENT. **Milestone 5**: also calls `CampaignResultService.onJobCompleted` — updates `send_log` status, marks contact `sent`, increments `dailySentCount`. Only the owning node may call this. |
@@ -197,7 +197,8 @@ jobs (
   identity_id     INTEGER FK→sender_identities (nullable),
   recipient       TEXT NOT NULL,                 -- destination email address
   subject         TEXT NOT NULL,
-  body            TEXT DEFAULT '',               -- HTML email body; TXT falls back to body on the node
+  body            TEXT DEFAULT '',               -- email body: HTML when content_type='html', plain text when content_type='text'
+  content_type    TEXT DEFAULT 'html',           -- 'html' | 'text'; controls MIME structure on the node
   priority        INTEGER DEFAULT 0,             -- higher = dispatched first
   attempts        INTEGER DEFAULT 0,             -- incremented each time a node claims the job
   created_at      TEXT NOT NULL,
@@ -225,7 +226,8 @@ contacts (
 -- status: 'pending' | 'queued' | 'sent' | 'failed' | 'unsubscribed'
 
 templates (
-  name TEXT PK, subject TEXT, html TEXT, txt TEXT
+  name TEXT PK, subject TEXT, html TEXT, txt TEXT,
+  content_type TEXT DEFAULT 'html'   -- 'html' | 'text'; propagated to jobs at dispatch time
 )
 
 users (
@@ -246,6 +248,7 @@ schedule_config (
 scheduled_sends (
   id INTEGER PK, label TEXT, contactIds TEXT (JSON array),
   templateName TEXT, subject TEXT, html TEXT, txt TEXT,
+  content_type TEXT DEFAULT 'html',   -- 'html' | 'text'
   scheduledAt TEXT, status TEXT DEFAULT 'pending', createdAt TEXT, sentAt TEXT
 )
 -- Index: (status, scheduledAt) for O(1) per-minute check in checkScheduledSends()
@@ -253,6 +256,7 @@ scheduled_sends (
 recurring_campaigns (
   id INTEGER PK, name TEXT, templateName TEXT,
   subject TEXT, html TEXT, txt TEXT,
+  content_type TEXT DEFAULT 'html',   -- 'html' | 'text'
   startTime TEXT DEFAULT '09:00', endTime TEXT DEFAULT '17:00',
   initialCount INTEGER DEFAULT 10, increasePercent REAL DEFAULT 0,
   status TEXT DEFAULT 'active', currentDay INTEGER DEFAULT 0,
@@ -287,6 +291,7 @@ send_jobs (
   id INTEGER PK, senderIdentityId INTEGER FK→sender_identities,
   contactId INTEGER, email TEXT, firstName TEXT, lastName TEXT,
   templateName TEXT, subject TEXT, html TEXT, txt TEXT,
+  content_type TEXT DEFAULT 'html',   -- 'html' | 'text'
   status TEXT DEFAULT 'queued',   -- queued|claimed|sent|failed|delivered|bounced|deferred
   scheduledFor TEXT, queueId TEXT, dsnCode TEXT, relay TEXT,
   remoteResponse TEXT, reasonCategory TEXT, reasonDetail TEXT,
