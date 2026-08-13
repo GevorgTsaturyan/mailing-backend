@@ -24,14 +24,19 @@ export function findById(id) {
 // Returns the single highest-priority PENDING job (for poll endpoint).
 // LEFT JOINs sender_identities so the node receives fromAddr/fromName without
 // a separate round-trip — mirrors the pattern used by GET /api/nodes/jobs.
+// LEFT JOINs contacts so the node receives firstName/lastName for template
+// variable substitution.  The jobs table stores only contact_id (FK); without
+// this join, job.firstName is undefined and {{firstName}} renders as empty.
 // Respects scheduled_for: jobs with a future scheduled_for are withheld until
 // their time comes (NULL scheduled_for = immediately dispatchable).
 export function findNextPending() {
   const now = new Date().toISOString();
   return db.prepare(`
-    SELECT j.*, si.fromAddr, si.fromName, si.domain
+    SELECT j.*, si.fromAddr, si.fromName, si.domain,
+           c.firstName, c.lastName
     FROM   jobs j
     LEFT   JOIN sender_identities si ON si.id = j.identity_id
+    LEFT   JOIN contacts          c  ON c.id  = j.contact_id
     WHERE  j.status = 'PENDING'
       AND  (j.scheduled_for IS NULL OR j.scheduled_for <= ?)
     ORDER  BY j.priority DESC, j.created_at ASC
