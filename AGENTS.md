@@ -54,7 +54,12 @@ backend/
     servers.js              # CRUD /api/servers + POST /:id/regenerate-key
     sender-identities.js    # CRUD /api/sender-identities + pause/resume
     nodes.js                # Node API thin handlers: delegates register/heartbeat to services
+    jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
+    unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   services/
+    unsubscribeToken.js     # HMAC-signed unsubscribe tokens (no PII): signToken/verifyToken/buildUnsubscribeUrl — sole token authority
+    SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact
+    ProvisioningService.js  # Applies node provisioning reports to sender_identities.verificationStatus (ownership-checked, safe metadata only)
     NodeRepository.js       # All DB queries for the servers table (node layer)
     NodeRegistrationService.js  # register(): validates apiKey, writes system info, returns identities
     HeartbeatService.js     # recordHeartbeat(): stores health JSON; startOfflineWatcher(): marks OFFLINE after 90 s
@@ -74,13 +79,102 @@ backend/
     welcome.txt             # Default plain-text version
   .env                      # Secrets — gitignored, create manually on each server
   .env.example              # Template for .env
+  UNSUBSCRIBE.md            # Unsubscribe architecture + required DNS/Nginx for unsubscribe.serawin.net
+  unsubscribe.test.js       # Tests for the token-based unsubscribe endpoints (node --test)
+  suppression.test.js       # Defense-in-depth suppression enforcement tests (node --test)
+  ownership.test.js         # Multi-node identity/job ownership isolation tests (node --test)
 ```
+
+## Node / identity / job ownership (multi-node boundary)
+
+Ownership chain: a mail node authenticates with its secret `apiKey` → `servers.id`;
+`sender_identities.serverId` binds each identity to one node; `jobs.identity_id` binds each
+job to one identity. **A node may only poll/claim jobs whose identity it owns (and that
+identity is active).** Enforced in the canonical pipeline at three layers:
+- **Poll:** `JobRepository.findNextPending(serverId)` INNER-JOINs `sender_identities` on
+  `serverId + status='active'` — foreign/disabled/NULL-owner jobs are never returned.
+- **Atomic claim:** `claimJob(id, nodeId, serverId)` includes the ownership subquery in the
+  same `UPDATE … WHERE status='PENDING'`, so ownership can't race the claim.
+- **Service:** `JobService.startJob(id, serverId)` returns 403 for a non-owned job (security
+  boundary against arbitrary job ids), and `createJob` refuses a job with no active identity.
+
+The controller is the authority for sender config: the poll response carries
+`fromAddr/fromName/domain/dkimSelector/ip` from the identity JOIN; the node never chooses its
+own identity. Legacy `/api/nodes/jobs` is already `serverId`-scoped (verified). Index
+`idx_sender_identities_server(serverId, status, verificationStatus)` supports the ownership +
+readiness filter.
+
+## Provisioning verification (identity is only sendable when its node proves it)
+
+Ownership + correct DNS is not enough: the owning node must prove it is locally provisioned
+(DKIM key + OpenDKIM key/signing tables + Postfix sender transport with the right
+`smtp_bind_address` and `smtp_helo_name`) and that DKIM-DNS + FCrDNS pass. The node POSTs
+`/api/nodes/provisioning-report` (auth = apiKey → server; it never sends a serverId). Reports
+apply only to identities OWNED by the authenticated node; others are rejected. Stored on
+`sender_identities` as **safe metadata only**: `verificationStatus`
+(`unverified|READY|NOT_READY|DNS_UNAVAILABLE`), `lastVerifiedAt`, `verificationReasons`,
+`verifiedIpv4/Hostname/DkimSelector`. Never keys/secrets/paths.
+
+**Sendable = `status='active' AND verificationStatus='READY'`** (`JobRepository.identitySendable`).
+Enforced at: job creation (`JobService.createJob`, `scheduler.queueCanonicalJobForContact` +
+legacy `queueJobForContact`, `routes/send.js`) **and** dispatch (`findNextPending`, `claimJob`,
+`identityOwnedByServer`, legacy `/api/nodes/jobs`). Transitions: a transient `DNS_UNAVAILABLE`
+report never downgrades a proven READY; a `NOT_READY` does. Changing an identity's
+`domain/ip/dkimSelector` via the API resets it to `unverified` (verificationStatus is node-proven,
+not settable through the identity API). Tests: `provisioning.test.js`.
+**Migration:** after deploy, every identity is `unverified` until its node (running the new
+agent) reports READY on registration — sending resumes within seconds per identity.
+
+## OpenDKIM runtime failure guard (defense-in-depth signing)
+
+Two independent layers ensure no production mail leaves unsigned:
+1. **Node-local (final guarantee):** Postfix `milter_default_action = tempfail` defers (4xx) if
+   the OpenDKIM milter is down — never sends unsigned. (mail-node template.)
+2. **Controller early-prevention:** heartbeat carries `opendkim_running` + `opendkim_socket_ok`;
+   `HeartbeatService.deriveSignerHealth` → `servers.openDkimHealthy` (1/0/NULL). Dispatch is
+   withheld when explicitly `0` (`NodeRepository.isSignerHealthy`, enforced in `PollingService.poll`,
+   `JobService.startJob` 409, and legacy `/api/nodes/jobs`). Unknown (NULL) stays permissive —
+   the Postfix layer is the real boundary, so we don't stall on missing telemetry (§13 no-race).
+
+**Retry, not fail:** temporary submission failures requeue instead of failing. Canonical:
+`POST /api/jobs/:id/retry` → `JobService.retryJob` (PROCESSING→PENDING, linear backoff, attempts
+cap `MAX_SEND_ATTEMPTS`=10; on cap → job FAILED but **contact untouched**). Legacy `/api/nodes/results`
+requeues send_jobs for retryable categories without marking the contact. An OpenDKIM outage never
+suppresses/fails contacts or destroys campaigns (§16). Tests: `dkim-guard.test.js`.
+
+## Suppression enforcement (defense-in-depth)
+
+`SuppressionService` is the single source of truth for recipient eligibility. Suppressed =
+`contacts.status='unsubscribed'` (complaints map to it). `failed` is deliberately NOT treated as
+permanent suppression (it conflates hard bounce with transient failure — that separation is the
+future `suppression_list` task). Enforced at every send path:
+- **Creation:** `queueCanonicalJobForContact` / `queueJobForContact` (return false + skip),
+  `routes/send.js` (explicit per-contact skip), `JobService.createJob` (throws).
+- **Claim:** `JobService.startJob` (cancels the job → 409) and `GET /api/nodes/jobs` (cancels +
+  withholds). The controller DB is the authoritative gate right before the node sends.
+- **Proactive:** unsubscribe (`/u/:token`, legacy `/unsubscribe`) and complaints
+  (`DeliveryEventService`) call `cancelOutstandingJobsForContact` to cancel already-queued jobs.
+
+Suppressed jobs become `CANCELLED` (canonical) / `cancelled` (legacy) — never counted as
+sent/bounced; `checkAndCompleteCampaign` treats `CANCELLED` as terminal. Residual race: between
+a node claiming a job and its SMTP submission there is an inherent DB↔SMTP window (not exactly-once).
+
+Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memory DB via DB_PATH).
 
 ---
 
 ## API
 
-All routes except `/api/auth/*`, `/api/nodes/*`, and `/unsubscribe` require a valid JWT.
+All routes except `/api/auth/*`, `/api/nodes/*`, `/u/:token`, and `/unsubscribe` require a valid JWT.
+
+**Unsubscribe (public, token-based — see UNSUBSCRIBE.md):**
+`GET /u/:token` renders a confirmation page (never mutates); `POST /u/:token` performs the
+unsubscribe (confirmation form **and** RFC 8058 one-click `List-Unsubscribe=One-Click`), idempotent.
+Token = HMAC-SHA256-signed contact id (no email/PII in URL). Recipient-facing host is
+`unsubscribe.serawin.net` (env `UNSUBSCRIBE_BASE_URL`); secret is `UNSUBSCRIBE_SECRET` (falls
+back to `JWT_SECRET`). The controller attaches `unsubscribeUrl` to every dispatched job; the
+mail-node emits it as both the `List-Unsubscribe` header and the visible body link. Legacy
+`/unsubscribe?email=` is kept but GET is now non-mutating.
 
 ### Auth
 | Method | Path | Body | Response |

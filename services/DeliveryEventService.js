@@ -1,6 +1,7 @@
 import db from '../db.js';
 import { findOrCreate as findOrCreateStats, applyDeliveryEvent } from './CampaignStatsRepository.js';
 import { checkAndCompleteCampaign } from './CampaignRepository.js';
+import { cancelOutstandingJobsForContact } from './SuppressionService.js';
 
 // ─── DeliveryEventService ─────────────────────────────────────────────────────
 // Processes delivery events reported by mail-nodes from Postfix mail.log.
@@ -110,8 +111,9 @@ function processSingleEvent(event, now) {
 
   // Closure variables set inside the transaction; read after it commits.
   // Used to trigger campaign completion without holding a DB lock.
-  let campaignId    = null;
-  let didTransition = false;  // true when the FSM-gated update path ran
+  let campaignId          = null;
+  let didTransition       = false;  // true when the FSM-gated update path ran
+  let complainedContactId = null;   // set when a complaint suppresses a contact
 
   const result = db.transaction(() => {
     // Resolve job references for both pipelines
@@ -199,6 +201,7 @@ function processSingleEvent(event, now) {
     if (contactId) {
       if (newDeliveryStatus === 'COMPLAINED') {
         markContactUnsubscribed.run(contactId);
+        complainedContactId = contactId;  // cancel their queued jobs after commit
       } else if (newDeliveryStatus === 'BOUNCED') {
         markContactFailed.run(contactId);
       }
@@ -214,6 +217,13 @@ function processSingleEvent(event, now) {
   // the delivery lock.
   if (didTransition && campaignId && TERMINAL_STATUSES.has(newDeliveryStatus)) {
     checkAndCompleteCampaign(campaignId);
+  }
+
+  // A complaint suppresses the contact: cancel any other jobs queued for them so
+  // the complaint can't be compounded by further sends. Runs post-commit (opens
+  // its own transaction).
+  if (complainedContactId != null) {
+    cancelOutstandingJobsForContact(complainedContactId, 'complaint');
   }
 
   return result;

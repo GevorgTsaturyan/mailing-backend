@@ -3,7 +3,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database(path.join(__dirname, 'data', 'mail.db'));
+// DB_PATH lets tests point at an isolated/in-memory database (':memory:').
+// Production leaves it unset and uses the on-disk data/mail.db as before.
+const dbPath = process.env.DB_PATH || path.join(__dirname, 'data', 'mail.db');
+const db = new Database(dbPath);
 
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
@@ -229,6 +232,13 @@ try { db.exec("ALTER TABLE send_log ADD COLUMN reasonDetail     TEXT")    } catc
 try { db.exec("ALTER TABLE send_log ADD COLUMN deliveredAt      TEXT")    } catch {}
 try { db.exec("ALTER TABLE send_log ADD COLUMN lastEventAt      TEXT")    } catch {}
 
+// ─── OpenDKIM runtime health (from heartbeat) ─────────────────────────────────
+// 1 = signer healthy (service active + milter socket reachable), 0 = down,
+// NULL = unknown (older node / no heartbeat yet). Dispatch is withheld only when
+// explicitly 0 — the Postfix `milter_default_action=tempfail` is the final local
+// guarantee, so unknown stays permissive to avoid needless stalls.
+try { db.exec("ALTER TABLE servers ADD COLUMN openDkimHealthy INTEGER") } catch {}
+
 // ─── Node registration metadata (Milestone 1) ─────────────────────────────────
 try { db.exec("ALTER TABLE servers ADD COLUMN node_id      TEXT") } catch {}
 try { db.exec("ALTER TABLE servers ADD COLUMN hostname     TEXT") } catch {}
@@ -355,6 +365,25 @@ try { db.exec("ALTER TABLE delivery_events ADD COLUMN job_id    INTEGER") } catc
 try { db.exec("ALTER TABLE delivery_events ADD COLUMN dedup_key TEXT")    } catch {}
 
 // Indexes for Milestone 6 hot paths (all idempotent)
+// ─── Provisioning verification (controller ↔ node) ───────────────────────────
+// An identity is only sendable when its OWNING node has proven it is locally
+// provisioned (DKIM key + OpenDKIM tables + Postfix transport/bind/HELO) and its
+// DNS (FCrDNS + DKIM public key) checks out. The node posts a report to
+// POST /api/nodes/provisioning-report; only safe metadata is stored here — never
+// keys, secrets, or raw config.
+//   verificationStatus: 'unverified' | 'READY' | 'NOT_READY' | 'DNS_UNAVAILABLE'
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN verificationStatus   TEXT NOT NULL DEFAULT 'unverified'") } catch {}
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN lastVerifiedAt       TEXT")    } catch {}
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN verificationReasons  TEXT")    } catch {}
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN verifiedIpv4         TEXT")    } catch {}
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN verifiedHostname     TEXT")    } catch {}
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN verifiedDkimSelector TEXT")    } catch {}
+
+// Ownership boundary: the canonical poll/claim filter jobs by their identity's
+// owning server. This index supports the serverId+status lookup used by
+// findNextPending's JOIN and claimJob's subquery.
+db.exec(`CREATE INDEX        IF NOT EXISTS idx_sender_identities_server ON sender_identities(serverId, status, verificationStatus)`);
+db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_identity_id        ON jobs(identity_id)`);
 db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_queue_id          ON jobs(queue_id)`);
 db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_campaign_id       ON jobs(campaign_id)`);
 db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_delivery_status   ON jobs(delivery_status)`);

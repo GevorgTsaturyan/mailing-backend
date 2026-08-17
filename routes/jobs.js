@@ -4,6 +4,7 @@ import { findByApiKey } from '../services/NodeRepository.js';
 import { poll }         from '../services/PollingService.js';
 import * as JobService  from '../services/JobService.js';
 import * as CampaignResultService from '../services/CampaignResultService.js';
+import { buildUnsubscribeUrl } from '../services/unsubscribeToken.js';
 
 const router = express.Router();
 
@@ -52,8 +53,13 @@ router.get('/poll', (req, res) => {
   const server = resolveNode(req.query.apiKey, res);
   if (!server) return;
 
-  const job = poll();
+  const job = poll(server.id);
   if (!job) return res.status(204).end();
+  // Signed unsubscribe URL for the header + visible body link (same token).
+  job.unsubscribeUrl = buildUnsubscribeUrl(job.contact_id, {
+    identityId: job.identity_id,
+    campaignId: job.campaign_id,
+  });
   res.json(job);
 });
 
@@ -65,7 +71,7 @@ router.post('/:id/start', (req, res) => {
   const server = resolveNode(req.body.apiKey, res);
   if (!server) return;
 
-  const result = JobService.startJob(Number(req.params.id), nodeIdOf(server));
+  const result = JobService.startJob(Number(req.params.id), server.id);
   if (result.error) return res.status(result.status).json({ error: result.error });
   res.json(result);
 });
@@ -89,6 +95,20 @@ router.post('/:id/complete', (req, res) => {
   } catch (err) {
     console.error(`[jobs/complete] side-effects failed for job #${id}:`, err.message);
   }
+  res.json(result);
+});
+
+// ── POST /api/jobs/:id/retry ──────────────────────────────────────────────────
+// Requeues a PROCESSING job for a later attempt after a TEMPORARY submission
+// failure (e.g. OpenDKIM milter tempfail / 4xx). Does NOT mark the job or contact
+// permanently failed. Only the owning node may retry its own job.
+// Body: { apiKey }
+router.post('/:id/retry', (req, res) => {
+  const server = resolveNode(req.body.apiKey, res);
+  if (!server) return;
+
+  const result = JobService.retryJob(Number(req.params.id), server.id);
+  if (result.error) return res.status(result.status).json({ error: result.error });
   res.json(result);
 });
 

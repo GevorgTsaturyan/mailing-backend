@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "create-admin": "node create-admin.js"
+    "create-admin": "node create-admin.js",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",

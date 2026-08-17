@@ -46,7 +46,8 @@ export function markCompleted(id) {
 // checkAndCompleteCampaign(campaignId)
 // Called after any terminal delivery_status is written to a job.
 // Reads the actual jobs table (not derived counters) to avoid completing prematurely.
-// Terminal states: DELIVERED, BOUNCED, SEND_FAILED, COMPLAINED.
+// Terminal states: DELIVERED, BOUNCED, SEND_FAILED, COMPLAINED (delivery outcomes),
+// plus jobs.status='CANCELLED' (suppressed before send — terminal, will never be sent).
 // Non-terminal: SMTP_PENDING, SMTP_ACCEPTED, DEFERRED.
 // No-op if the campaign is already completed or has no jobs.
 export function checkAndCompleteCampaign(campaignId) {
@@ -56,7 +57,8 @@ export function checkAndCompleteCampaign(campaignId) {
   const { total, terminal_count } = db.prepare(`
     SELECT
       COUNT(*) AS total,
-      SUM(CASE WHEN delivery_status IN ('DELIVERED','BOUNCED','SEND_FAILED','COMPLAINED')
+      SUM(CASE WHEN status = 'CANCELLED'
+                 OR delivery_status IN ('DELIVERED','BOUNCED','SEND_FAILED','COMPLAINED')
                THEN 1 ELSE 0 END) AS terminal_count
     FROM jobs WHERE campaign_id = ?
   `).get(campaignId);

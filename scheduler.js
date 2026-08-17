@@ -2,6 +2,8 @@ import cron from 'node-cron';
 import db from './db.js';
 import * as CampaignRepo from './services/CampaignRepository.js';
 import { findOrCreate as findOrCreateStats, incrementJobs } from './services/CampaignStatsRepository.js';
+import { isContactSuppressed } from './services/SuppressionService.js';
+import { identitySendable } from './services/JobRepository.js';
 
 // ─── Feature flag ─────────────────────────────────────────────────────────────
 // When USE_CANONICAL_QUEUE=true, the scheduler creates `jobs` rows instead of
@@ -30,8 +32,16 @@ function resolveTemplate(templateName, templateContent) {
 // ─── Legacy queue path ────────────────────────────────────────────────────────
 // Creates a send_jobs row + send_log row. Unchanged from Milestone 4.
 
+// Returns true if a job was created, false if the contact was suppressed (skipped).
 function queueJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null) {
+  // Central suppression guard — last line of defense at creation for every legacy
+  // caller (daily batch, recurring, scheduled sends).
+  if (isContactSuppressed(contact.id)) return false;
+
   const identityId  = senderIdentityId ?? pickActiveIdentity();
+  // Provisioning gate (parity with the canonical path): never create a legacy job
+  // for an identity whose owning node hasn't proven it can send it.
+  if (!identitySendable(identityId)) return false;
   const tmpl        = resolveTemplate(templateName, templateContent);
   const contentType = tmpl.content_type || 'html';
   const now         = new Date().toISOString();
@@ -66,6 +76,7 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
 
     db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(contact.id);
   })();
+  return true;
 }
 
 // ─── Canonical queue path ─────────────────────────────────────────────────────
@@ -73,9 +84,17 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
 // planner level (see getIdentityRemainingCapacity), so this function trusts that
 // the caller has already validated capacity.
 
+// Returns true if a job was created, false if skipped (suppressed or no identity).
 export function queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null, campaignId = null) {
+  // Central suppression guard — last line of defense at creation for every canonical
+  // caller (manual send, daily batch, recurring, scheduled sends).
+  if (isContactSuppressed(contact.id)) return false;
+
   const identityId  = senderIdentityId ?? pickActiveIdentity();
-  if (!identityId) return;
+  if (!identityId) return false;
+  // Provisioning gate — never create a canonical job for an identity whose owning
+  // node has not proven it can send it (active + verificationStatus='READY').
+  if (!identitySendable(identityId)) return false;
 
   const tmpl        = resolveTemplate(templateName, templateContent);
   const contentType = tmpl.content_type || 'html';
@@ -116,6 +135,7 @@ export function queueCanonicalJobForContact(contact, templateName, templateConte
 
     db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(contact.id);
   })();
+  return true;
 }
 
 // ─── Daily limit enforcement (canonical queue only) ───────────────────────────
@@ -196,12 +216,13 @@ function planDaySends() {
     });
     findOrCreateStats(dispatch.id);
 
+    let created = 0;
     for (let i = 0; i < contacts.length; i++) {
-      queueCanonicalJobForContact(contacts[i], cfg.template, null, times[i], null, identityId, dispatch.id);
+      if (queueCanonicalJobForContact(contacts[i], cfg.template, null, times[i], null, identityId, dispatch.id)) created++;
     }
-    incrementJobs(dispatch.id, contacts.length);
+    if (created > 0) incrementJobs(dispatch.id, created);
 
-    console.log(`Daily batch (canonical): queued ${contacts.length} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
+    console.log(`Daily batch (canonical): queued ${created} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
   } else {
     const times    = randomTimesInWindow(cfg.startTime, cfg.endTime, cfg.batchSize);
     const contacts = db.prepare(
@@ -265,15 +286,16 @@ function planRecurringCampaigns() {
       });
       findOrCreateStats(dispatch.id);
 
+      let created = 0;
       for (let i = 0; i < contacts.length; i++) {
-        queueCanonicalJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId, dispatch.id);
+        if (queueCanonicalJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId, dispatch.id)) created++;
       }
-      incrementJobs(dispatch.id, contacts.length);
+      if (created > 0) incrementJobs(dispatch.id, created);
 
       db.prepare('UPDATE recurring_campaigns SET lastRunDate=?, currentDay=? WHERE id=?')
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
-      console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${contacts.length} jobs`);
+      console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
     } else {
       const times    = randomTimesInWindow(campaign.startTime, campaign.endTime, requestedCount);
       const contacts = db.prepare(
@@ -339,7 +361,8 @@ function checkScheduledSends() {
           if (capacity <= 0) break;
           const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(contactId);
           if (!contact) continue;
-          queueCanonicalJobForContact(contact, task.templateName, templateContent, null, task.id, identityId, dispatch.id);
+          // Suppressed recipients are skipped without consuming daily capacity.
+          if (!queueCanonicalJobForContact(contact, task.templateName, templateContent, null, task.id, identityId, dispatch.id)) continue;
           capacity--;
           jobsQueued++;
         }

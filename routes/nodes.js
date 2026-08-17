@@ -3,6 +3,10 @@ import db from '../db.js';
 import { register } from '../services/NodeRegistrationService.js';
 import { recordHeartbeat } from '../services/HeartbeatService.js';
 import { processEvents } from '../services/DeliveryEventService.js';
+import { buildUnsubscribeUrl } from '../services/unsubscribeToken.js';
+import { suppressedContactIdSet } from '../services/SuppressionService.js';
+import { applyReports } from '../services/ProvisioningService.js';
+import { isSignerHealthy } from '../services/NodeRepository.js';
 
 const router = express.Router();
 
@@ -41,6 +45,10 @@ router.get('/jobs', (req, res) => {
   if (!server) return res.status(401).json({ error: 'Invalid apiKey' });
   touch(server.id);
 
+  // Signer-health gate (legacy pipeline): withhold jobs when this node's DKIM
+  // signer is reported down. Postfix tempfail is still the final guarantee.
+  if (!isSignerHealthy(server.id)) return res.json({ jobs: [] });
+
   const today = new Date().toISOString().slice(0, 10);
 
   db.prepare(`
@@ -48,7 +56,9 @@ router.get('/jobs', (req, res) => {
     WHERE serverId=? AND (lastResetDate IS NULL OR lastResetDate != ?)
   `).run(today, server.id, today);
 
-  const identities = db.prepare("SELECT * FROM sender_identities WHERE serverId=? AND status='active'").all(server.id);
+  // Legacy dispatch gate: only hand out jobs for identities the node has proven it
+  // can send (active + provisioning-verified READY).
+  const identities = db.prepare("SELECT * FROM sender_identities WHERE serverId=? AND status='active' AND verificationStatus='READY'").all(server.id);
   if (identities.length === 0) return res.json({ jobs: [] });
 
   const now  = new Date().toISOString();
@@ -73,10 +83,31 @@ router.get('/jobs', (req, res) => {
     if (jobs.length >= cap) break;
   }
 
+  // ── Claim-time suppression gate (legacy pipeline) ─────────────────────────────
+  // A recipient may have unsubscribed after the job was queued. Cancel suppressed
+  // candidates instead of claiming them, and never hand them to the node.
+  if (jobs.length > 0) {
+    const suppressed = suppressedContactIdSet(jobs.map((j) => j.contactId));
+    if (suppressed.size > 0) {
+      const cancel = db.prepare(
+        "UPDATE send_jobs SET status='cancelled', reasonCategory='suppressed', reasonDetail='recipient unsubscribed' WHERE id=? AND status='queued'"
+      );
+      for (const j of jobs) if (suppressed.has(j.contactId)) cancel.run(j.id);
+    }
+    for (let i = jobs.length - 1; i >= 0; i--) if (suppressed.has(jobs[i].contactId)) jobs.splice(i, 1);
+  }
+
   if (jobs.length > 0) {
     const claimedAt = new Date().toISOString();
     const stmt = db.prepare("UPDATE send_jobs SET status='claimed', claimedAt=? WHERE id=?");
     for (const j of jobs) stmt.run(claimedAt, j.id);
+  }
+
+  // Attach the signed unsubscribe URL so the node emits the same token in the
+  // List-Unsubscribe header and the visible body link. The controller is the sole
+  // token authority; the node never needs the signing secret.
+  for (const j of jobs) {
+    j.unsubscribeUrl = buildUnsubscribeUrl(j.contactId, { identityId: j.senderIdentityId });
   }
 
   res.json({ jobs });
@@ -102,9 +133,22 @@ router.post('/results', (req, res) => {
   `);
   const updateContact = db.prepare("UPDATE contacts SET status=?, sentAt=? WHERE id=?");
 
+  // Temporary submission failures (e.g. OpenDKIM milter tempfail / 4xx) must not
+  // mark the job or contact permanently failed — requeue for retry instead.
+  const RETRYABLE = new Set(['greylisted', 'rate_limited', 'connection_error', 'deferred', 'signing_unavailable']);
+  const requeueJob = db.prepare(
+    "UPDATE send_jobs SET status='queued', claimedAt=NULL, reasonCategory=?, reasonDetail=? WHERE id=?"
+  );
+
   for (const r of results) {
     const job = db.prepare('SELECT * FROM send_jobs WHERE id=?').get(r.jobId);
     if (!job) continue;
+
+    if (r.status !== 'sent' && RETRYABLE.has(r.reasonCategory)) {
+      // Keep it retryable; leave the contact untouched (infra issue, not a bad address).
+      requeueJob.run(r.reasonCategory, r.reasonDetail || null, r.jobId);
+      continue;
+    }
 
     updateJob.run(
       r.status, r.queueId || null, r.dsnCode || null, r.relay || null,
@@ -133,6 +177,22 @@ router.post('/results', (req, res) => {
   }
 
   res.json({ ok: true });
+});
+
+// ─── POST /api/nodes/provisioning-report ─────────────────────────────────────
+// A node proves it is locally provisioned to send its identities. Authenticated by
+// apiKey → server (authoritative); the node never supplies a serverId. Reports are
+// applied only to identities OWNED by the authenticated node (others are rejected).
+// Idempotent. Stores only safe metadata (no keys/secrets).
+router.post('/provisioning-report', (req, res) => {
+  const { apiKey, reports } = req.body;
+  const server = getServer(apiKey);
+  if (!server) return res.status(401).json({ error: 'Invalid apiKey' });
+  if (!Array.isArray(reports)) return res.status(400).json({ error: 'reports array required' });
+  touch(server.id);
+
+  const { applied, rejected } = applyReports(server.id, reports);
+  res.json({ ok: true, applied, rejected });
 });
 
 // ─── POST /api/nodes/delivery-events ─────────────────────────────────────────

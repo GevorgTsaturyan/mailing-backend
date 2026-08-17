@@ -24,6 +24,8 @@ import serversRouter            from './routes/servers.js';
 import senderIdentitiesRouter   from './routes/sender-identities.js';
 import nodesRouter              from './routes/nodes.js';
 import jobsRouter               from './routes/jobs.js';
+import unsubscribeRouter        from './routes/unsubscribe.js';
+import { cancelOutstandingJobsForContact } from './services/SuppressionService.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
 import { startOfflineWatcher } from './services/HeartbeatService.js';
@@ -49,16 +51,42 @@ app.use('/api/nodes', nodesRouter);
 // POST /api/jobs (create) applies requireAuth internally via the router.
 app.use('/api/jobs', jobsRouter);
 
-// Unsubscribe link — public, no auth needed
-app.get('/unsubscribe', (req, res) => {
+// Token-based unsubscribe (RFC 8058 one-click + visible-body flow) — public.
+// Recipient-facing routes: GET/POST /u/:token   (see routes/unsubscribe.js)
+app.use(unsubscribeRouter);
+
+// ── Legacy unsubscribe compatibility shim (deprecated) ────────────────────────
+// Emails sent before the token system used `/unsubscribe?email=<addr>`. Those
+// links must keep working, but the GET must NOT mutate (link scanners/prefetchers
+// would otherwise unsubscribe engaged users). GET now renders a confirmation
+// page; the POST performs the change. New emails never use this path.
+app.get('/unsubscribe', express.urlencoded({ extended: false }), (req, res) => {
   const email = req.query.email;
   if (!email) return res.status(400).send('Missing email');
-  db.prepare("UPDATE contacts SET status='unsubscribed' WHERE email=?").run(email.toLowerCase());
-  const safe = email.replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  const safe = String(email).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
   res.send(`
-    <html><body style="font-family:sans-serif;text-align:center;padding:60px">
+    <html><body style="font-family:system-ui,sans-serif;text-align:center;padding:60px">
+      <h2>Unsubscribe from our emails?</h2>
+      <p>Confirm to stop receiving campaigns at <strong>${safe}</strong>.</p>
+      <form method="POST" action="/unsubscribe">
+        <input type="hidden" name="email" value="${safe}">
+        <button type="submit" style="font-size:16px;padding:12px 28px;border:0;border-radius:6px;background:#d33;color:#fff;cursor:pointer">Unsubscribe</button>
+      </form>
+    </body></html>
+  `);
+});
+app.post('/unsubscribe', express.urlencoded({ extended: false }), (req, res) => {
+  const email = req.body?.email || req.query.email;
+  if (!email) return res.status(400).send('Missing email');
+  const norm = String(email).toLowerCase();
+  const contact = db.prepare('SELECT id FROM contacts WHERE email=?').get(norm);
+  db.prepare("UPDATE contacts SET status='unsubscribed' WHERE email=? AND status!='unsubscribed'").run(norm);
+  // Cancel any jobs queued before this unsubscribe.
+  if (contact) cancelOutstandingJobsForContact(contact.id, 'unsubscribed');
+  res.status(200).send(`
+    <html><body style="font-family:system-ui,sans-serif;text-align:center;padding:60px">
       <h2>You have been unsubscribed</h2>
-      <p>The email address <strong>${safe}</strong> will no longer receive campaigns.</p>
+      <p>You will no longer receive campaigns at this address.</p>
     </body></html>
   `);
 });

@@ -1,5 +1,7 @@
 import nodemailer from 'nodemailer';
 import db from './db.js';
+import { buildUnsubscribeUrl } from './services/unsubscribeToken.js';
+import { isEmailSuppressed } from './services/SuppressionService.js';
 
 let _transporter = null;
 let _transporterConfig = null;
@@ -49,6 +51,11 @@ function renderTemplate(content, variables) {
 }
 
 export async function sendCampaignEmail({ to, templateName, templateContent, variables = {} }) {
+  // Suppression gate — defense-in-depth even on this legacy/unused direct-send path.
+  if (isEmailSuppressed(to)) {
+    throw new Error(`refusing to send: ${to} is suppressed (unsubscribed)`);
+  }
+
   let tmpl;
   if (templateContent) {
     tmpl = { subject: templateContent.subject || '', html: templateContent.html || '', txt: templateContent.txt || '' };
@@ -59,11 +66,15 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
 
   const cfg = db.prepare('SELECT * FROM smtp_config WHERE id = 1').get();
 
-  const baseUrl = process.env.APP_URL || 'http://localhost:3001';
+  // Use the same token-based unsubscribe mechanism as the node pipeline: resolve
+  // the contact by email → signed URL with no PII. (This direct-send path is
+  // legacy/unused, but must never regenerate the old email-in-URL / mailto form.)
+  const contact = db.prepare('SELECT id FROM contacts WHERE email = ?').get(String(to).toLowerCase());
+  const unsubscribeUrl = contact ? buildUnsubscribeUrl(contact.id) : null;
   const mergedVars = {
     bonusAmount: '100',
     promoCode: 'WELCOME100',
-    unsubscribeLink: `${baseUrl}/unsubscribe?email=${encodeURIComponent(to)}`,
+    unsubscribeLink: unsubscribeUrl || '',
     ...variables,
   };
 
@@ -79,10 +90,11 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
     subject: renderedSubject,
     text:    renderedTxt,
     html:    renderedHtml,
-    headers: {
-      'List-Unsubscribe': `<mailto:unsubscribe@example.com>, <${baseUrl}/unsubscribe?email=${encodeURIComponent(to)}>`,
-      'X-Mailer': 'MailCampaignManager/2.0',
-    },
+    // HTTPS RFC 8058 one-click only. No mailto: (unroutable), no X-Mailer (spam signal).
+    headers: unsubscribeUrl ? {
+      'List-Unsubscribe':      `<${unsubscribeUrl}>`,
+      'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+    } : {},
   });
 
   const previewUrl = nodemailer.getTestMessageUrl(info) || null;

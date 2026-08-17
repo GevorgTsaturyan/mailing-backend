@@ -49,21 +49,41 @@ router.put('/:id', (req, res) => {
   const si = db.prepare('SELECT * FROM sender_identities WHERE id = ?').get(req.params.id);
   if (!si) return res.status(404).json({ error: 'Not found' });
   const { domain, ip, fromName, fromAddr, dkimSelector, dailyLimit, warmupStage, status } = req.body;
+  const newDomain   = domain?.trim() ?? si.domain;
+  const newIp       = ip?.trim() ?? si.ip;
+  const newSelector = dkimSelector?.trim() ?? si.dkimSelector;
+
+  // verificationStatus is node-proven and NOT settable via this API. If any of the
+  // verified-defining attributes (domain / ip / DKIM selector) change, the prior
+  // proof no longer applies — reset to 'unverified' so the identity cannot send
+  // until the owning node re-verifies the new configuration.
+  const invalidatesVerification =
+    newDomain !== si.domain || newIp !== si.ip || newSelector !== si.dkimSelector;
+
   db.prepare(`
     UPDATE sender_identities
     SET domain=?, ip=?, fromName=?, fromAddr=?, dkimSelector=?, dailyLimit=?, warmupStage=?, status=?
     WHERE id=?
   `).run(
-    domain?.trim() ?? si.domain,
-    ip?.trim() ?? si.ip,
+    newDomain, newIp,
     fromName?.trim() ?? si.fromName,
     fromAddr?.trim() ?? si.fromAddr,
-    dkimSelector?.trim() ?? si.dkimSelector,
+    newSelector,
     dailyLimit ?? si.dailyLimit,
     warmupStage ?? si.warmupStage,
     status ?? si.status,
     req.params.id
   );
+
+  if (invalidatesVerification) {
+    db.prepare(`
+      UPDATE sender_identities
+      SET verificationStatus='unverified', lastVerifiedAt=NULL, verificationReasons=NULL,
+          verifiedIpv4=NULL, verifiedHostname=NULL, verifiedDkimSelector=NULL
+      WHERE id=?
+    `).run(req.params.id);
+  }
+
   res.json(db.prepare('SELECT * FROM sender_identities WHERE id = ?').get(req.params.id));
 });
 

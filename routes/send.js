@@ -3,6 +3,8 @@ import db from '../db.js';
 import { findOrCreateManual } from '../services/CampaignRepository.js';
 import { findOrCreate as findOrCreateStats, incrementJobs } from '../services/CampaignStatsRepository.js';
 import { queueCanonicalJobForContact } from '../scheduler.js';
+import { isContactSuppressed } from '../services/SuppressionService.js';
+import { identitySendable } from '../services/JobRepository.js';
 
 const router = express.Router();
 
@@ -38,11 +40,22 @@ router.post('/', (req, res) => {
     resolvedContentType = contentType || tmpl.content_type || 'html';
   }
 
-  // Pick identity: use provided, or fall back to first active
+  // Pick identity: use provided, or fall back to first sendable (active + READY).
   let identityId = senderIdentityId || null;
   if (!identityId) {
-    const first = db.prepare("SELECT id FROM sender_identities WHERE status='active' ORDER BY id LIMIT 1").get();
+    const first = db.prepare(
+      "SELECT id FROM sender_identities WHERE status='active' AND verificationStatus='READY' ORDER BY id LIMIT 1"
+    ).get();
     identityId = first?.id || null;
+  }
+
+  // Provisioning gate — refuse to queue for an identity whose owning node has not
+  // proven it can send it. Prevents wrong-IP/HELO/unsigned-DKIM sends up front.
+  if (identityId && !identitySendable(identityId)) {
+    return res.status(409).json({
+      error: 'Sending identity is not provisioning-verified (READY) — cannot send',
+      identityId,
+    });
   }
 
   const now     = new Date().toISOString();
@@ -61,6 +74,12 @@ router.post('/', (req, res) => {
       const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(id);
       if (!contact) {
         results.push({ id, status: 'error', error: 'Contact not found' });
+        continue;
+      }
+
+      // Suppression gate — an unsubscribed/complained recipient is never queued.
+      if (isContactSuppressed(id)) {
+        results.push({ id, email: contact.email, status: 'skipped', note: 'Suppressed (unsubscribed)' });
         continue;
       }
 
@@ -98,6 +117,12 @@ router.post('/', (req, res) => {
         const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(id);
         if (!contact) {
           results.push({ id, status: 'error', error: 'Contact not found' });
+          continue;
+        }
+
+        // Suppression gate — an unsubscribed/complained recipient is never queued.
+        if (isContactSuppressed(id)) {
+          results.push({ id, email: contact.email, status: 'skipped', note: 'Suppressed (unsubscribed)' });
           continue;
         }
 

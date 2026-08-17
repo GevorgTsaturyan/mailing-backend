@@ -25,11 +25,19 @@ export function updateRegistration(serverId, { node_id, hostname, version, ip, p
   );
 }
 
-export function updateHeartbeat(serverId, health) {
+export function updateHeartbeat(serverId, health, openDkimHealthy = null) {
   db.prepare(`
-    UPDATE servers SET status='online', lastSeenAt=?, health=?
+    UPDATE servers SET status='online', lastSeenAt=?, health=?, openDkimHealthy=?
     WHERE id=?
-  `).run(new Date().toISOString(), JSON.stringify(health), serverId);
+  `).run(new Date().toISOString(), JSON.stringify(health), openDkimHealthy, serverId);
+}
+
+// Early-prevention dispatch gate: is this server's DKIM signer usable right now?
+// Returns false only when the last heartbeat explicitly reported it down (0).
+// Unknown (NULL) stays permissive — Postfix tempfail is the hard local guarantee.
+export function isSignerHealthy(serverId) {
+  const row = db.prepare('SELECT openDkimHealthy FROM servers WHERE id = ?').get(serverId);
+  return !row || row.openDkimHealthy !== 0;
 }
 
 // Mark nodes offline when they haven't sent a heartbeat within thresholdMs.
