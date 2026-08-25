@@ -5,6 +5,8 @@ import { findOrCreate as findOrCreateStats, incrementJobs } from '../services/Ca
 import { queueCanonicalJobForContact } from '../scheduler.js';
 import { isContactSuppressed } from '../services/SuppressionService.js';
 import { identitySendable } from '../services/JobRepository.js';
+import { assertTemplateButtonsValid } from '../services/CampaignBodyCompiler.js';
+import { hasButtonPlaceholder } from '../services/BodyCompiler.js';
 
 const router = express.Router();
 
@@ -63,6 +65,14 @@ router.post('/', (req, res) => {
 
   if (process.env.USE_CANONICAL_QUEUE === 'true' && identityId) {
     // ── Canonical path: jobs table + delivery tracking ──────────────────────────
+    // Hard-fail up front (before creating any job) if the template references a
+    // missing/inactive button — never send a campaign with a broken CTA.
+    try {
+      assertTemplateButtonsValid({ html: resolvedHtml, txt: resolvedTxt });
+    } catch (e) {
+      return res.status(422).json({ error: e.message });
+    }
+
     const today    = now.slice(0, 10);
     const dispatch = findOrCreateManual(today, identityId);
     findOrCreateStats(dispatch.id);
@@ -99,6 +109,13 @@ router.post('/', (req, res) => {
     if (jobsCreated > 0) incrementJobs(dispatch.id, jobsCreated);
   } else {
     // ── Legacy path: send_jobs table (unchanged) ────────────────────────────────
+    // Tracked buttons require the canonical queue — refuse rather than send an
+    // untracked/broken CTA through the legacy pipeline (decision Z-8).
+    if (hasButtonPlaceholder(resolvedHtml) || hasButtonPlaceholder(resolvedTxt)) {
+      return res.status(422).json({
+        error: 'This template uses tracked buttons, which require the canonical queue (USE_CANONICAL_QUEUE=true).',
+      });
+    }
     const insertLog = db.prepare(`
       INSERT INTO send_log (date, contactId, name, email, template, status, subject, body, senderIdentityId)
       VALUES (@date, @contactId, @name, @email, @template, @status, @subject, @body, @senderIdentityId)

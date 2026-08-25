@@ -1021,6 +1021,75 @@ The scheduler now routes new campaign sends to the `jobs` table when `USE_CANONI
 
 ---
 
+## Campaign Engagement (Buttons + Click/Open Tracking)
+
+Reusable CTA buttons, click redirects, bot/scanner classification, and open
+tracking. **Central controller owns everything; mail-nodes stay stateless and
+button/token/pixel-unaware.** Full spec + infra wiring: **`TRACKING.md`**.
+
+**Tables** (`db.js`): `buttons` (reusable CTA library), `campaign_buttons` (frozen
+per-campaign snapshot — the redirect resolves its destination from HERE, so editing
+a button never changes an already-queued campaign), `click_events` + `open_events`
+(immutable raw logs; one row per request; `classification` is analytics-only; no raw
+IP stored — only a salted `ip_hash` + a `signals` JSON for reclassification),
+`tracking_config` (global open-tracking toggle, default **ON**). Added columns:
+`campaigns.open_tracking_override` (NULL=inherit / 0 / 1), `jobs.body_text` (compiled
+plain-text alternative for button emails, surfaced to the node as `txt`).
+
+**Open-tracking readiness gate** (`TrackingHostReadiness.js`): open tracking is ON by
+default, but a pixel is injected for a domain only when `effective_intent AND
+isReady(domain)`. Readiness = a background probe of `https://click.<domain>/tracking-health`
+(validates DNS+TLS+nginx+endpoint) with a **local hairpin fallback** (probe
+`127.0.0.1:<port>/tracking-health` with the correct `Host` header when the public
+probe fails — NAT hairpin must not silently suppress pixels). `isReady()` is
+sync/cache-only (safe on the send path); never probes in the `/c` or `/o` request
+path. The periodic watcher **skips probing while open tracking is globally off and
+no campaign overrides it on**; admin re-check always probes. Not-ready ⇒ email
+sends clean with no pixel (logged once per campaign/domain; shown in the Campaigns
+UI via `GET/POST /api/engagement/tracking-readiness`). Watcher started in `index.js`.
+
+**Services**: `trackingToken.js` (HMAC-signed opaque click/open tokens, dedicated
+`TRACKING_SECRET`, no PII/destination in token, `hashIp` via `TRACKING_IP_SALT`),
+`trackingClassifier.js` (pure — clicks → `human|scanner|unknown`; opens →
+`open|prefetch`, deliberately NO "human open" claim: Gmail proxies+caches images
+and Apple MPP pre-fetches, so proxy-UA/datacenter-IP signals are NOT used for
+opens), `trackingScanners.js` (static CIDR/UA lists — no network calls),
+`BodyCompiler.js` (pure: expand `{{button:ID}}` → email-safe table button /
+`TEXT: url`; inject 1×1 pixel), `ButtonRepository.js`, `CampaignButtonRepository.js`
+(snapshot + hard-fail on missing/inactive), `CampaignBodyCompiler.js` (queue-time
+glue), `EngagementRepository.js` (report aggregation), `TrackingConfigRepository.js`,
+`EventRetention.js` (daily purge of raw click/open events after
+`TRACKING_EVENT_RETENTION_DAYS`, default 90 — mirrors delivery_events convention).
+
+**Abuse/trust hardening**: `index.js` sets Express `trust proxy` (default
+`loopback`, override `TRUST_PROXY`) so `req.ip` is the nginx-appended hop — a
+client-supplied X-Forwarded-For cannot spoof `ip_hash`/classification. `/c`+`/o`
+collapse near-instant same-client duplicates (`TRACKING_DEDUP_WINDOW_SECONDS`,
+default 2s — legitimate spaced repeat clicks still record; NOT single-use) and a
+burst signal (`TRACKING_BURST_WINDOW_SECONDS`, default 5s: same recipient fetching
+a different button of the same email ⇒ scanner).
+
+**Routes**: public `routes/track.js` — `GET /c/:token` (single 302 to the frozen
+destination for ALL classifications — no cloaking; `no-store` + `no-referrer`;
+invalid token → 404) and `GET /o/:file` (1×1 gif always; records only on valid
+token). Mounted **before** `app.use('/api', requireAuth)`. Authed: `routes/buttons.js`
+(`/api/buttons` CRUD + `/:id/preview`), `routes/engagement.js` (`/api/engagement/config`,
+`/campaigns`, `/campaigns/:id/report`, `/campaigns/:id/open-tracking`).
+
+**Transformation point**: queue time only, inside `scheduler.js:queueCanonicalJobForContact`
+(via `CampaignBodyCompiler`). No-button + open-off templates are byte-identical to before.
+**Canonical queue is required**; a tracked-button template on the legacy pipeline
+**fails clearly** (never a silent untracked link). **No external calls in the
+redirect/pixel path.** Env: `TRACKING_SUBDOMAIN`, `TRACKING_SECRET`, `TRACKING_IP_SALT`,
+`TRACKING_FAST_THRESHOLD_SECONDS`, `TRACKING_DEDUP_WINDOW_SECONDS`,
+`TRACKING_BURST_WINDOW_SECONDS`, `TRACKING_EVENT_RETENTION_DAYS`, `TRUST_PROXY`.
+Tests: `tracking.test.js`, `tracking-integration.test.js`, `tracking-hardening.test.js`
+(XFF trust, dedup, burst, HEAD, secondsSinceSend, readiness fallback, retention,
+legacy hard-fail); node-side MIME verification lives in mail-node `tracking-mime.test.js`.
+
+**mail-node impact: none** — tracking terminates at the controller under
+`click.<sending-domain>` (reverse-proxied), exactly like `unsubscribe.<domain>`.
+
 ## Roadmap
 
 - Job retry logic for deferred/failed jobs

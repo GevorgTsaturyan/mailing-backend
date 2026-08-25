@@ -25,13 +25,31 @@ import senderIdentitiesRouter   from './routes/sender-identities.js';
 import nodesRouter              from './routes/nodes.js';
 import jobsRouter               from './routes/jobs.js';
 import unsubscribeRouter        from './routes/unsubscribe.js';
+import trackRouter              from './routes/track.js';
+import buttonsRouter            from './routes/buttons.js';
+import engagementRouter         from './routes/engagement.js';
 import { cancelOutstandingJobsForContact } from './services/SuppressionService.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
 import { startOfflineWatcher } from './services/HeartbeatService.js';
+import { startReadinessWatcher } from './services/TrackingHostReadiness.js';
 
 const app = express();
 const PORT = 3001;
+
+// Trusted-proxy configuration so req.ip reflects the real client (the hop our own
+// reverse proxy appended) and a client-supplied X-Forwarded-For cannot spoof it.
+// Default 'loopback' = trust only a local nginx (controller sits behind local
+// nginx per TRACKING.md/UNSUBSCRIBE.md). Override with TRUST_PROXY (number of
+// proxies, a boolean, or a subnet list) for other topologies.
+function parseTrustProxy(v) {
+  if (v == null || v === '') return 'loopback';
+  if (v === 'true')  return true;
+  if (v === 'false') return false;
+  const n = Number(v);
+  return Number.isInteger(n) ? n : v;
+}
+app.set('trust proxy', parseTrustProxy(process.env.TRUST_PROXY));
 
 const allowedOrigins = [
   'http://localhost:5173',
@@ -54,6 +72,11 @@ app.use('/api/jobs', jobsRouter);
 // Token-based unsubscribe (RFC 8058 one-click + visible-body flow) — public.
 // Recipient-facing routes: GET/POST /u/:token   (see routes/unsubscribe.js)
 app.use(unsubscribeRouter);
+
+// Public click/open tracking — no JWT. Recipient-facing routes served under
+// click.<sending-domain>: GET /c/:token (302 redirect) + GET /o/:token.gif (pixel).
+// Mounted before requireAuth, exactly like the unsubscribe routes. (see routes/track.js)
+app.use(trackRouter);
 
 // ── Legacy unsubscribe compatibility shim (deprecated) ────────────────────────
 // Emails sent before the token system used `/unsubscribe?email=<addr>`. Those
@@ -104,6 +127,8 @@ app.use('/api/smtp',                 smtpRouter);
 app.use('/api/providers',            providersRouter);
 app.use('/api/servers',              serversRouter);
 app.use('/api/sender-identities',    senderIdentitiesRouter);
+app.use('/api/buttons',              buttonsRouter);
+app.use('/api/engagement',           engagementRouter);
 
 seedDevData();
 
@@ -114,4 +139,6 @@ app.listen(PORT, () => {
   initScheduler();
   console.log('[startup] Scheduler initialized');
   startOfflineWatcher();
+  startReadinessWatcher();
+  console.log('[startup] Tracking-host readiness watcher started');
 });

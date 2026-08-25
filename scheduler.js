@@ -4,6 +4,27 @@ import * as CampaignRepo from './services/CampaignRepository.js';
 import { findOrCreate as findOrCreateStats, incrementJobs } from './services/CampaignStatsRepository.js';
 import { isContactSuppressed } from './services/SuppressionService.js';
 import { identitySendable } from './services/JobRepository.js';
+import { compileForContact, assertTemplateButtonsValid } from './services/CampaignBodyCompiler.js';
+import { hasButtonPlaceholder } from './services/BodyCompiler.js';
+import { purgeOldEvents, retentionDays } from './services/EventRetention.js';
+
+// Pre-validate a template before queueing a campaign's jobs. Returns true when
+// safe to proceed. On a problem it logs an actionable error and returns false so
+// the caller skips the campaign — never sends a broken CTA, never partially queues.
+//   • tracked buttons on the legacy pipeline → hard-fail (buttons require canonical)
+//   • missing/inactive button                → hard-fail (decision Z-7/Z-8)
+function campaignBodyOkOrSkip(tmpl, label) {
+  try {
+    if (!useCanonicalQueue() && (hasButtonPlaceholder(tmpl.html) || hasButtonPlaceholder(tmpl.txt))) {
+      throw new Error('template uses tracked buttons, which require the canonical queue (USE_CANONICAL_QUEUE=true)');
+    }
+    assertTemplateButtonsValid(tmpl);
+    return true;
+  } catch (e) {
+    console.error(`${label}: ${e.message} — skipping.`);
+    return false;
+  }
+}
 
 // ─── Feature flag ─────────────────────────────────────────────────────────────
 // When USE_CANONICAL_QUEUE=true, the scheduler creates `jobs` rows instead of
@@ -43,6 +64,12 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
   // for an identity whose owning node hasn't proven it can send it.
   if (!identitySendable(identityId)) return false;
   const tmpl        = resolveTemplate(templateName, templateContent);
+  // Button/open tracking requires the canonical queue (it needs a campaign_id for
+  // per-recipient snapshots and attribution). Fail clearly rather than silently
+  // sending an untracked/broken CTA through the legacy pipeline (decision Z-8).
+  if (hasButtonPlaceholder(tmpl.html) || hasButtonPlaceholder(tmpl.txt)) {
+    throw new Error('This template uses tracked buttons, which require the canonical queue (USE_CANONICAL_QUEUE=true). Refusing to send via the legacy pipeline.');
+  }
   const contentType = tmpl.content_type || 'html';
   const now         = new Date().toISOString();
 
@@ -99,8 +126,18 @@ export function queueCanonicalJobForContact(contact, templateName, templateConte
   const tmpl        = resolveTemplate(templateName, templateContent);
   const contentType = tmpl.content_type || 'html';
   // Store the relevant content body based on mode: text jobs use txt, html jobs use html.
-  const body        = contentType === 'text' ? (tmpl.txt || '') : (tmpl.html || '');
+  let body          = contentType === 'text' ? (tmpl.txt || '') : (tmpl.html || '');
+  let bodyText      = null;
   const now         = new Date().toISOString();
+
+  // Campaign-specific tracking transforms (buttons + open pixel) happen HERE, at
+  // queue time, centrally — so the mail-node stays unaware. Returns null when the
+  // template uses no buttons and open tracking is disabled (body unchanged).
+  const campaign = campaignId ? CampaignRepo.findById(campaignId) : null;
+  if (campaign) {
+    const compiled = compileForContact({ campaign, contact, identityId, tmpl });
+    if (compiled) { body = compiled.body; bodyText = compiled.bodyText; }
+  }
 
   db.transaction(() => {
     const logRow = db.prepare(`
@@ -117,14 +154,15 @@ export function queueCanonicalJobForContact(contact, templateName, templateConte
 
     db.prepare(`
       INSERT INTO jobs
-        (status, identity_id, recipient, subject, body, content_type,
+        (status, identity_id, recipient, subject, body, body_text, content_type,
          scheduled_for, contact_id, send_log_id, campaign_id, created_at)
-      VALUES ('PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES ('PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       identityId,
       contact.email,
       tmpl.subject || '',
       body,
+      bodyText,
       contentType,
       scheduledFor,
       contact.id,
@@ -187,6 +225,8 @@ function randomTimesInWindow(startTime, endTime, count) {
 function planDaySends() {
   const cfg = db.prepare('SELECT * FROM schedule_config WHERE id=1').get();
   if (!cfg.enabled || cfg.batchSize <= 0) return;
+
+  if (!campaignBodyOkOrSkip(resolveTemplate(cfg.template, null), 'Daily batch')) return;
 
   if (useCanonicalQueue()) {
     const identityId = pickActiveIdentity();
@@ -255,6 +295,8 @@ function planRecurringCampaigns() {
     const templateContent = campaign.subject
       ? { subject: campaign.subject, html: campaign.html || '', txt: campaign.txt || '', content_type: campaign.content_type || 'html' }
       : null;
+
+    if (!campaignBodyOkOrSkip(resolveTemplate(campaign.templateName, templateContent), `Recurring "${campaign.name}"`)) continue;
 
     if (useCanonicalQueue()) {
       const identityId = pickActiveIdentity();
@@ -338,6 +380,13 @@ function checkScheduledSends() {
       ? { subject: task.subject, html: task.html || '', txt: task.txt || '', content_type: task.content_type || 'html' }
       : null;
 
+    // Fail the task clearly (rather than looping forever) if its buttons are
+    // invalid or it needs the canonical queue but the legacy pipeline is active.
+    if (!campaignBodyOkOrSkip(resolveTemplate(task.templateName, templateContent), `Scheduled send #${task.id}`)) {
+      db.prepare("UPDATE scheduled_sends SET status='failed' WHERE id=?").run(task.id);
+      continue;
+    }
+
     console.log(`Scheduled send #${task.id}: queuing ${contactIds.length} job(s)`);
 
     db.transaction(() => {
@@ -389,4 +438,13 @@ export function initScheduler() {
   planRecurringCampaigns();
   cron.schedule('0 0 * * *', () => { planDaySends(); planRecurringCampaigns(); }, { timezone: 'UTC' });
   cron.schedule('* * * * *', checkScheduledSends);
+  // Daily retention sweep for raw tracking events (bounds growth + privacy).
+  cron.schedule('30 3 * * *', () => {
+    try {
+      const r = purgeOldEvents();
+      console.log(`[retention] purged tracking events older than ${retentionDays()}d: ${r.clicksDeleted} clicks, ${r.opensDeleted} opens`);
+    } catch (err) {
+      console.error('[retention] purge failed:', err.message);
+    }
+  }, { timezone: 'UTC' });
 }

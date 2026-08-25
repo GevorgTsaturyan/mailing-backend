@@ -390,4 +390,110 @@ db.exec(`CREATE INDEX        IF NOT EXISTS idx_jobs_delivery_status   ON jobs(de
 db.exec(`CREATE INDEX        IF NOT EXISTS idx_delivery_events_job_id ON delivery_events(job_id)`);
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_events_dedup  ON delivery_events(dedup_key)`);
 
+// ─── Campaign Engagement: Buttons, Click Tracking, Open Tracking ───────────────
+//
+// buttons          — reusable CTA definition library (admin-facing).
+// campaign_buttons — per-campaign FROZEN snapshot of a button (text+URL+style).
+//                    The click redirect ALWAYS resolves its destination from here,
+//                    so editing/deleting a button never changes an already-queued
+//                    campaign's links. One row per (campaign, button) actually used.
+// click_events     — immutable raw log; ONE row per /c/<token> request. Never a
+//                    boolean. classification is analytics-only (never gates redirect).
+// open_events      — immutable raw log; ONE row per /o/<token>.gif request.
+//
+// Neither event table stores the raw client IP — only a salted ip_hash + the
+// derived `signals` JSON, so historical events can be reclassified without PII.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS buttons (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    internal_name   TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    destination_url TEXT NOT NULL,
+    style           TEXT NOT NULL DEFAULT '{}',
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_buttons_status ON buttons(status);
+
+  CREATE TABLE IF NOT EXISTS campaign_buttons (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     INTEGER NOT NULL REFERENCES campaigns(id),
+    button_id       INTEGER NOT NULL REFERENCES buttons(id),
+    text            TEXT NOT NULL,
+    destination_url TEXT NOT NULL,
+    style           TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_campaign_buttons_unique   ON campaign_buttons(campaign_id, button_id);
+  CREATE INDEX        IF NOT EXISTS idx_campaign_buttons_campaign ON campaign_buttons(campaign_id);
+
+  CREATE TABLE IF NOT EXISTS click_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_button_id INTEGER NOT NULL REFERENCES campaign_buttons(id),
+    campaign_id        INTEGER NOT NULL REFERENCES campaigns(id),
+    contact_id         INTEGER,
+    clicked_at         TEXT NOT NULL,
+    http_method        TEXT,
+    user_agent         TEXT,
+    ip_hash            TEXT,
+    is_prefetch        INTEGER NOT NULL DEFAULT 0,
+    seconds_since_send INTEGER,
+    signals            TEXT,
+    classification     TEXT NOT NULL DEFAULT 'unknown',
+    classified_reason  TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_click_events_campaign ON click_events(campaign_id);
+  CREATE INDEX IF NOT EXISTS idx_click_events_cbutton  ON click_events(campaign_button_id);
+  CREATE INDEX IF NOT EXISTS idx_click_events_contact  ON click_events(contact_id);
+
+  CREATE TABLE IF NOT EXISTS open_events (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id        INTEGER NOT NULL REFERENCES campaigns(id),
+    contact_id         INTEGER,
+    opened_at          TEXT NOT NULL,
+    http_method        TEXT,
+    user_agent         TEXT,
+    ip_hash            TEXT,
+    is_prefetch        INTEGER NOT NULL DEFAULT 0,
+    seconds_since_send INTEGER,
+    signals            TEXT,
+    classification     TEXT NOT NULL DEFAULT 'unknown',
+    classified_reason  TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_open_events_campaign ON open_events(campaign_id);
+  CREATE INDEX IF NOT EXISTS idx_open_events_contact  ON open_events(contact_id);
+`);
+
+// Global tracking config (singleton row id=1). open_tracking_enabled defaults to
+// 1 (ON) — opens-by-default is a core engagement-report requirement. A pixel is
+// still injected ONLY when tracking is effectively enabled AND the sending
+// domain's click.<domain> tracking host is provisioned/ready (readiness gate in
+// services/TrackingHostReadiness.js), so an ON default never ships a broken pixel.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS tracking_config (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    open_tracking_enabled INTEGER NOT NULL DEFAULT 1
+  );
+  INSERT OR IGNORE INTO tracking_config (id, open_tracking_enabled) VALUES (1, 1);
+`);
+
+// Per-campaign open-tracking override: NULL = inherit global, 0 = force off, 1 = force on.
+try { db.exec("ALTER TABLE campaigns ADD COLUMN open_tracking_override INTEGER") } catch {}
+
+// Composite indexes that materially support real query patterns:
+//   • click_events(campaign_id, contact_id, clicked_at) — recipientRows GROUP BY,
+//     the burst signal (distinct buttons per recipient in a window), and dedup.
+//   • open_events(campaign_id, contact_id, opened_at)   — recipientRows GROUP BY + dedup.
+db.exec("CREATE INDEX IF NOT EXISTS idx_click_events_campaign_contact ON click_events(campaign_id, contact_id, clicked_at)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_open_events_campaign_contact  ON open_events(campaign_id, contact_id, opened_at)");
+
+// Compiled plain-text alternative for canonical jobs whose HTML body contains
+// tracked buttons. When set, the poll endpoint surfaces it to the node as `txt`
+// so the plain-text part keeps the button CTA ("TEXT: url") instead of the node
+// stripping the HTML (which would drop the tracking link). NULL for every job that
+// does not use buttons → existing send behaviour is unchanged.
+try { db.exec("ALTER TABLE jobs ADD COLUMN body_text TEXT") } catch {}
+
 export default db;

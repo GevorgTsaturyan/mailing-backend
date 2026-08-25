@@ -60,6 +60,11 @@ router.get('/poll', (req, res) => {
     identityId: job.identity_id,
     campaignId: job.campaign_id,
   });
+  // When the controller compiled a plain-text alternative (HTML jobs with tracked
+  // buttons), surface it as `txt` so the node's plain-text MIME part keeps the CTA
+  // link instead of stripping the HTML. NULL for every non-button job → the node's
+  // existing behaviour is unchanged.
+  if (job.body_text != null) job.txt = job.body_text;
   res.json(job);
 });
 
