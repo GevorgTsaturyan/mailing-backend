@@ -8,6 +8,7 @@ import express from 'express';
 
 process.env.UNSUBSCRIBE_SECRET ||= 'test-unsubscribe-secret';
 process.env.DB_PATH            ||= ':memory:';
+process.env.UNSUBSCRIBE_REQUIRE_READY ||= 'false'; // gate under test in unsubscribe-readiness.test.js
 
 const db                 = (await import('./db.js')).default;
 const nodesRouter        = (await import('./routes/nodes.js')).default;

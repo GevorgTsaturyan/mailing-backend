@@ -7,6 +7,7 @@ import { buildUnsubscribeUrl } from '../services/unsubscribeToken.js';
 import { suppressedContactIdSet } from '../services/SuppressionService.js';
 import { applyReports } from '../services/ProvisioningService.js';
 import { isSignerHealthy } from '../services/NodeRepository.js';
+import { allowDispatch as unsubscribeHostAllowsDispatch } from '../services/UnsubscribeHostReadiness.js';
 
 const router = express.Router();
 
@@ -48,6 +49,12 @@ router.get('/jobs', (req, res) => {
   // Signer-health gate (legacy pipeline): withhold jobs when this node's DKIM
   // signer is reported down. Postfix tempfail is still the final guarantee.
   if (!isSignerHealthy(server.id)) return res.json({ jobs: [] });
+
+  // Unsubscribe-host gate (legacy pipeline): every send_jobs row is contact-bound
+  // and advertises the List-Unsubscribe URL — withhold the whole batch while the
+  // unsubscribe host is unverified. Jobs stay queued; dispatch resumes once the
+  // host verifies (see services/UnsubscribeHostReadiness.js).
+  if (!unsubscribeHostAllowsDispatch()) return res.json({ jobs: [] });
 
   const today = new Date().toISOString().slice(0, 10);
 

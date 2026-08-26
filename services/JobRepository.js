@@ -32,7 +32,12 @@ export function findById(id) {
 // (fromAddr/fromName/domain/dkimSelector/ip) without a second round-trip, and
 // LEFT JOINs contacts for firstName/lastName template variables.
 // Respects scheduled_for (future → withheld; NULL → immediately dispatchable).
-export function findNextPending(serverId) {
+//
+// campaignJobs=false additionally restricts to jobs with NO contact (raw jobs).
+// Used by the unsubscribe-host readiness gate: contact-bound jobs advertise the
+// unsubscribe URL and are withheld while the host is unverified; raw jobs never
+// carry List-Unsubscribe and stay dispatchable.
+export function findNextPending(serverId, { campaignJobs = true } = {}) {
   const now = new Date().toISOString();
   return db.prepare(`
     SELECT j.*, si.fromAddr, si.fromName, si.domain, si.dkimSelector, si.ip,
@@ -44,9 +49,10 @@ export function findNextPending(serverId) {
     LEFT   JOIN contacts c ON c.id = j.contact_id
     WHERE  j.status = 'PENDING'
       AND  (j.scheduled_for IS NULL OR j.scheduled_for <= ?)
+      AND  (? OR j.contact_id IS NULL)
     ORDER  BY j.priority DESC, j.created_at ASC
     LIMIT  1
-  `).get(serverId, now) ?? null;
+  `).get(serverId, now, campaignJobs ? 1 : 0) ?? null;
 }
 
 // True iff the identity exists, is active, provisioning-verified (READY), and is

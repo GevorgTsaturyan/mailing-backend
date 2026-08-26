@@ -57,6 +57,16 @@ ${body}
 </body></html>`;
 }
 
+// GET /unsubscribe-health — readiness probe target.
+// Hit by UnsubscribeHostReadiness via the public
+// https://unsubscribe.<domain>/unsubscribe-health URL to confirm the
+// DNS/TLS/nginx/endpoint chain is live. Campaign dispatch is withheld until this
+// answers 200 (see services/UnsubscribeHostReadiness.js).
+router.get('/unsubscribe-health', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true });
+});
+
 // GET /u/:token — confirmation page ONLY. Never changes state (scanner-safe).
 router.get('/u/:token', (req, res) => {
   const contact = resolveContact(req.params.token);

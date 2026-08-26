@@ -2,6 +2,7 @@ import * as JobRepository from './JobRepository.js';
 import { isEmailSuppressed, isJobRecipientSuppressed } from './SuppressionService.js';
 import { checkAndCompleteCampaign } from './CampaignRepository.js';
 import { isSignerHealthy } from './NodeRepository.js';
+import { allowDispatch as unsubscribeHostAllowsDispatch } from './UnsubscribeHostReadiness.js';
 
 const MAX_SEND_ATTEMPTS = parseInt(process.env.MAX_SEND_ATTEMPTS || '10');
 
@@ -75,6 +76,14 @@ export function startJob(id, serverId) {
   // down (the send would only tempfail). 409 → node re-polls once healthy again.
   if (!isSignerHealthy(serverId)) {
     return { error: 'DKIM signer (OpenDKIM) is unavailable on this node', status: 409 };
+  }
+
+  // Unsubscribe-host gate — a contact-bound job advertises the List-Unsubscribe
+  // URL; refuse to claim it while the unsubscribe host is unverified (mail must
+  // never ship a dead unsubscribe endpoint). 409 → job stays PENDING and is
+  // re-polled once the host verifies. Raw jobs (no contact) are not gated.
+  if (job.contact_id != null && !unsubscribeHostAllowsDispatch()) {
+    return { error: 'unsubscribe host is not ready — campaign dispatch withheld', status: 409 };
   }
 
   // ── Claim-time suppression gate (the authoritative last DB gate before send) ──

@@ -22,6 +22,28 @@ recipient excluded from all future campaigns
 - **POST /u/:token** → performs the unsubscribe. Handles both the confirmation-form
   submit and the RFC 8058 one-click POST (`Content-Type: application/x-www-form-urlencoded`,
   body `List-Unsubscribe=One-Click`). Idempotent; already-unsubscribed still returns 200.
+- **GET /unsubscribe-health** → `{ok:true}` probe target for the readiness gate below.
+
+## Readiness gate (fail-closed — campaign dispatch requires a working unsubscribe host)
+
+Every campaign email advertises this host in `List-Unsubscribe`/`List-Unsubscribe-Post`
+and the visible footer link. A dead unsubscribe endpoint is a critical deliverability
+failure (recipients' only working exit becomes "Report spam"; Gmail/Yahoo probe the
+one-click endpoint). Therefore the controller **withholds contact-bound job dispatch
+until it has verified the host end-to-end** (`services/UnsubscribeHostReadiness.js`):
+
+- Background watcher probes `https://<host>/unsubscribe-health` (validates DNS → TLS →
+  nginx → endpoint in one request), with a local hairpin fallback (`127.0.0.1:<port>`
+  with the correct `Host` header) so a NAT-hairpin false-negative never halts sending.
+- Enforced at all three dispatch points, mirroring the DKIM signer-health gate:
+  `PollingService.poll` (canonical), `JobService.startJob` (409, claim-time), and
+  legacy `GET /api/nodes/jobs` (empty batch).
+- Withheld jobs stay `PENDING`/`queued` — nothing is failed or lost; dispatch resumes
+  automatically within one refresh interval (default 5 min) of the host going live.
+- **Raw jobs** (no contact) carry no unsubscribe URL by design and are NOT gated —
+  useful for test sends while wiring up the host.
+- Escape hatch for local dev/tests only: `UNSUBSCRIBE_REQUIRE_READY=false`.
+  **Never set this in production.**
 
 ## Token
 

@@ -22,9 +22,10 @@ import crypto from 'crypto';
 // so the unsubscribe host aligns with the authenticated From domain.  The
 // controller/backend may live on a different (internal) domain and be reached via
 // a reverse proxy — see UNSUBSCRIBE.md for the DNS/Nginx wiring.
-function baseUrl() {
+export function unsubscribeBaseUrl() {
   return (process.env.UNSUBSCRIBE_BASE_URL || 'https://unsubscribe.serawin.net').replace(/\/+$/, '');
 }
+const baseUrl = unsubscribeBaseUrl;
 
 // Server-side secret.  Prefers a dedicated UNSUBSCRIBE_SECRET; falls back to
 // JWT_SECRET (already required at boot) so there is always a high-entropy key.

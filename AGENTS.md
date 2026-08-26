@@ -58,6 +58,7 @@ backend/
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   services/
     unsubscribeToken.js     # HMAC-signed unsubscribe tokens (no PII): signToken/verifyToken/buildUnsubscribeUrl — sole token authority
+    UnsubscribeHostReadiness.js  # Fail-closed dispatch gate: contact-bound jobs are withheld until https://<unsubscribe-host>/unsubscribe-health verifies (probe + hairpin fallback; mirrors the signer-health gate)
     SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact
     ProvisioningService.js  # Applies node provisioning reports to sender_identities.verificationStatus (ownership-checked, safe metadata only)
     NodeRepository.js       # All DB queries for the servers table (node layer)
@@ -175,6 +176,13 @@ Token = HMAC-SHA256-signed contact id (no email/PII in URL). Recipient-facing ho
 back to `JWT_SECRET`). The controller attaches `unsubscribeUrl` to every dispatched job; the
 mail-node emits it as both the `List-Unsubscribe` header and the visible body link. Legacy
 `/unsubscribe?email=` is kept but GET is now non-mutating.
+`GET /unsubscribe-health` (public) is the probe target for the **unsubscribe-host readiness
+gate** (`UnsubscribeHostReadiness.js`, fail-closed): contact-bound jobs are withheld at all
+three dispatch points (`PollingService.poll`, `JobService.startJob` → 409, legacy
+`GET /api/nodes/jobs` → empty batch) until the host verifies — mail never ships a dead
+`List-Unsubscribe` endpoint. Withheld jobs stay PENDING/queued and dispatch resumes
+automatically. Raw jobs (no contact, no unsubscribe URL) are not gated. Dev/test escape
+hatch: `UNSUBSCRIBE_REQUIRE_READY=false`. Tests: `unsubscribe-readiness.test.js`.
 
 ### Auth
 | Method | Path | Body | Response |
@@ -685,6 +693,8 @@ Passwords are hashed with bcrypt (rounds=12). `create-admin.js` is the only way 
 | `APP_URL` | Yes | Full public URL of the backend, e.g. `https://serawin.net`. Used in unsubscribe links. |
 | `NODE_ENV` | Yes | Set to `production` to skip seed data. Any other value enables seeding. |
 | `USE_CANONICAL_QUEUE` | No | `true` to route new campaign sends to the `jobs` table (canonical pipeline). Omit or set `false` to use the legacy `send_jobs` pipeline. Flip to `true` only after validating the canonical pipeline in production. |
+| `UNSUBSCRIBE_REQUIRE_READY` | No | Default `true` (fail-closed): contact-bound job dispatch is withheld until the unsubscribe host passes its `/unsubscribe-health` probe. Set `false` ONLY for local dev/tests — never in production. |
+| `UNSUBSCRIBE_READINESS_TTL_MS` / `_REFRESH_MS` / `_TIMEOUT_MS` | No | Unsubscribe-host probe tuning (defaults 600000 / 300000 / 4000), mirroring the `TRACKING_READINESS_*` knobs. |
 
 File: `backend/.env` (gitignored). Copy from `.env.example`.
 
