@@ -89,7 +89,10 @@ export async function verify(domain, _fetch = fetch) {
 
 // Probe every active sending domain. Returns the per-domain results.
 export async function verifyAll() {
-  return Promise.all(activeDomains().map(verify));
+  // Wrap in an arrow so Array.map's (element, index, array) callback args are NOT
+  // forwarded to verify() — otherwise the numeric index is passed as `_fetch`,
+  // which is not callable and makes every probe throw "_fetch is not a function".
+  return Promise.all(activeDomains().map(domain => verify(domain)));
 }
 
 // Current cached status for every active domain (does not probe).
