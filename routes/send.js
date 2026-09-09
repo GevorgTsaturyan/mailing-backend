@@ -7,6 +7,7 @@ import { isContactSuppressed } from '../services/SuppressionService.js';
 import { identitySendable } from '../services/JobRepository.js';
 import { assertTemplateButtonsValid } from '../services/CampaignBodyCompiler.js';
 import { hasButtonPlaceholder } from '../services/BodyCompiler.js';
+import * as Groups from '../services/GroupRepository.js';
 
 const router = express.Router();
 
@@ -14,11 +15,19 @@ const router = express.Router();
 // Creates send_jobs (queued) for the given contacts instead of sending directly.
 // A mail-node will poll, claim, and execute them via its local Postfix.
 // contentType: 'html' (default) | 'text' — controls which MIME part the node sends.
+//
+// Recipients = union of explicit contactIds + members of any groupIds, DISTINCT.
+// The union is de-duplicated ONLY within this operation (no historical dedup);
+// the in-flight guard below still prevents queueing a contact that already has a
+// pending/in-progress job. When groupIds is absent this is identical to before.
 router.post('/', (req, res) => {
-  const { contactIds, templateName, subject, html, txt, senderIdentityId, contentType } = req.body;
+  const { contactIds, groupIds, templateName, subject, html, txt, senderIdentityId, contentType } = req.body;
 
-  if (!Array.isArray(contactIds) || contactIds.length === 0) {
-    return res.status(400).json({ error: 'contactIds must be a non-empty array' });
+  const fromGroups = groupIds?.length ? Groups.contactIdsInGroups(groupIds) : [];
+  const effectiveIds = [...new Set([...(Array.isArray(contactIds) ? contactIds : []), ...fromGroups])];
+
+  if (effectiveIds.length === 0) {
+    return res.status(400).json({ error: 'contactIds or groupIds must resolve to at least one recipient' });
   }
   if (!templateName && !subject) {
     return res.status(400).json({ error: 'templateName or subject is required' });
@@ -80,7 +89,7 @@ router.post('/', (req, res) => {
     const templateContent = { subject: resolvedSubject, html: resolvedHtml, txt: resolvedTxt, content_type: resolvedContentType };
     let jobsCreated = 0;
 
-    for (const id of contactIds) {
+    for (const id of effectiveIds) {
       const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(id);
       if (!contact) {
         results.push({ id, status: 'error', error: 'Contact not found' });
@@ -130,7 +139,7 @@ router.post('/', (req, res) => {
     `);
 
     db.transaction(() => {
-      for (const id of contactIds) {
+      for (const id of effectiveIds) {
         const contact = db.prepare('SELECT * FROM contacts WHERE id=?').get(id);
         if (!contact) {
           results.push({ id, status: 'error', error: 'Contact not found' });

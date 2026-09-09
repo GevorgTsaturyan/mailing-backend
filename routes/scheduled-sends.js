@@ -1,5 +1,6 @@
 import express from 'express';
 import db from '../db.js';
+import * as Groups from '../services/GroupRepository.js';
 
 const router = express.Router();
 
@@ -37,10 +38,16 @@ router.get('/:id', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { label, contactIds, templateName, subject, html, txt, scheduledAt, content_type } = req.body;
+  const { label, contactIds, groupIds, templateName, subject, html, txt, scheduledAt, content_type } = req.body;
 
-  if (!Array.isArray(contactIds) || contactIds.length === 0)
-    return res.status(400).json({ error: 'contactIds required' });
+  // Resolve groups to member ids AT CREATION TIME and snapshot the distinct union
+  // of explicit contactIds + group members. The snapshot is fixed once stored —
+  // later membership changes never alter this one-off send. No historical dedup.
+  const fromGroups = groupIds?.length ? Groups.contactIdsInGroups(groupIds) : [];
+  const snapshot   = [...new Set([...(Array.isArray(contactIds) ? contactIds : []), ...fromGroups])];
+
+  if (snapshot.length === 0)
+    return res.status(400).json({ error: 'contactIds or groupIds must resolve to at least one recipient' });
   if (!scheduledAt)
     return res.status(400).json({ error: 'scheduledAt required' });
   if (!templateName && !subject)
@@ -54,7 +61,7 @@ router.post('/', (req, res) => {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
   `).run(
     label || null,
-    JSON.stringify(contactIds),
+    JSON.stringify(snapshot),
     templateName || null,
     subject || null,
     html || null,

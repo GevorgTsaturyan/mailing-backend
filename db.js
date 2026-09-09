@@ -496,4 +496,68 @@ db.exec("CREATE INDEX IF NOT EXISTS idx_open_events_campaign_contact  ON open_ev
 // does not use buttons → existing send behaviour is unchanged.
 try { db.exec("ALTER TABLE jobs ADD COLUMN body_text TEXT") } catch {}
 
+// ─── Contact Groups + campaign targeting (Phase 0: additive schema only) ───────
+//
+// Groups let imported contacts be organised into named lists that campaigns and
+// schedules can target. This phase adds STORAGE ONLY — nothing reads these tables
+// or columns yet, so behaviour is unchanged.
+//
+// Membership is many-to-many (a contact can live in several lists). Targeting is
+// stored as a SET of groups per source (recurring campaign / daily batch); an
+// empty set is NOT "all" — target_mode makes the intent explicit (default 'all'
+// preserves today's whole-pool behaviour for existing rows).
+//
+// campaign_send_ledger is the per-campaign de-duplication record ("this contact
+// has been committed to this source"): source_type ∈ 'recurring' | 'daily_batch',
+// source_id = recurring_campaigns.id (or the fixed sentinel 1 for the singleton
+// daily batch). It is written at queue time by later phases — empty for now.
+//
+// FK policy: membership + ledger cascade on contact/group delete (rows are
+// meaningless without their parent). The two TARGETING junctions use RESTRICT on
+// group_id so a later phase's app-level "block deletion when in use" check wins
+// rather than a group silently vanishing from a live campaign's audience.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS contact_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    createdAt   TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS contact_group_members (
+    group_id   INTEGER NOT NULL REFERENCES contact_groups(id) ON DELETE CASCADE,
+    contact_id INTEGER NOT NULL REFERENCES contacts(id)       ON DELETE CASCADE,
+    addedAt    TEXT NOT NULL,
+    PRIMARY KEY (group_id, contact_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_contact_group_members_contact ON contact_group_members(contact_id);
+
+  CREATE TABLE IF NOT EXISTS recurring_campaign_groups (
+    recurring_campaign_id INTEGER NOT NULL REFERENCES recurring_campaigns(id) ON DELETE CASCADE,
+    group_id              INTEGER NOT NULL REFERENCES contact_groups(id)      ON DELETE RESTRICT,
+    PRIMARY KEY (recurring_campaign_id, group_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_recurring_campaign_groups_group ON recurring_campaign_groups(group_id);
+
+  CREATE TABLE IF NOT EXISTS daily_batch_groups (
+    group_id INTEGER NOT NULL REFERENCES contact_groups(id) ON DELETE RESTRICT,
+    PRIMARY KEY (group_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS campaign_send_ledger (
+    source_type TEXT    NOT NULL,
+    source_id   INTEGER NOT NULL,
+    contact_id  INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+    queued_at   TEXT    NOT NULL,
+    PRIMARY KEY (source_type, source_id, contact_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_campaign_send_ledger_contact ON campaign_send_ledger(contact_id);
+`);
+
+// Explicit targeting mode. DEFAULT 'all' keeps every existing recurring campaign
+// and the daily batch targeting the whole pool exactly as before (no behaviour
+// change). Later phases add 'groups'. Idempotent — safe to re-run on upgrades.
+try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN target_mode TEXT NOT NULL DEFAULT 'all'") } catch {}
+try { db.exec("ALTER TABLE schedule_config     ADD COLUMN target_mode TEXT NOT NULL DEFAULT 'all'") } catch {}
+
 export default db;

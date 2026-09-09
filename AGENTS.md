@@ -42,7 +42,8 @@ backend/
     auth.js                 # requireAuth: validates JWT Bearer token, sets req.user
   routes/
     auth.js                 # POST /api/auth/login, GET /api/auth/me
-    contacts.js             # CRUD /api/contacts + POST /api/contacts/import (CSV)
+    contacts.js             # CRUD /api/contacts (+ ?groupId filter) + POST /api/contacts/import (CSV, optional group)
+    groups.js               # CRUD /api/groups + members + delete guard (409 / ?detach=true)
     templates.js            # CRUD /api/templates/:name
     send.js                 # POST /api/send (queue jobs), GET /api/send/jobs (queue overview)
     schedule.js             # GET/POST /api/schedule (daily batch config)
@@ -59,7 +60,9 @@ backend/
   services/
     unsubscribeToken.js     # HMAC-signed unsubscribe tokens (no PII): signToken/verifyToken/buildUnsubscribeUrl — sole token authority
     UnsubscribeHostReadiness.js  # Fail-closed dispatch gate: contact-bound jobs are withheld until https://<unsubscribe-host>/unsubscribe-health verifies (probe + hairpin fallback; mirrors the signer-health gate)
-    SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact
+    SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact/suppressionExclusionSql
+    GroupRepository.js      # DB layer for contact groups: CRUD, membership, contactIdsInGroups (union), usages (deletion guard)
+    SendLedger.js           # Per-campaign de-dup ledger: record, eligibleContacts (target_mode/groups + suppression), runBackfillOnce; DAILY_BATCH_SOURCE_ID
     ProvisioningService.js  # Applies node provisioning reports to sender_identities.verificationStatus (ownership-checked, safe metadata only)
     NodeRepository.js       # All DB queries for the servers table (node layer)
     NodeRegistrationService.js  # register(): validates apiKey, writes system info, returns identities
@@ -84,7 +87,14 @@ backend/
   unsubscribe.test.js       # Tests for the token-based unsubscribe endpoints (node --test)
   suppression.test.js       # Defense-in-depth suppression enforcement tests (node --test)
   ownership.test.js         # Multi-node identity/job ownership isolation tests (node --test)
+  groups.test.js            # Contact groups CRUD, membership, group-aware CSV import (node --test)
+  send-groups.test.js       # Groups as extra recipient source for manual + one-off sends (both queue modes)
+  ledger.test.js            # SendLedger unit tests: claims, eligibility, guarded backfill
+  scheduler-targeting.test.js  # End-to-end automated targeting via the ledger (both queue modes)
+  groups-targeting.test.js  # target_mode config + group deletion safety (409 / detach) (both queue modes)
 ```
+
+> Run the suite in **both** queue modes: `npm test` (legacy) and `USE_CANONICAL_QUEUE=true npm test` (canonical).
 
 ## Node / identity / job ownership (multi-node boundary)
 
@@ -197,7 +207,21 @@ hatch: `UNSUBSCRIBE_REQUIRE_READY=false`. Tests: `unsubscribe-readiness.test.js`
 | POST | `/api/contacts` | `{firstName, lastName, email, status?}` |
 | PUT | `/api/contacts/:id` | Partial update (any field) |
 | DELETE | `/api/contacts/:id` | — |
-| POST | `/api/contacts/import` | Multipart `file` field, CSV (firstName/lastName/email). Accepts alternate column names: first_name, firstname, Email, EMAIL. Skips duplicates. Returns `{imported, skipped}` |
+| GET | `/api/contacts?groupId=N` | Only contacts in group N (JOIN contact_group_members) |
+| POST | `/api/contacts/import` | Multipart `file` field, CSV (firstName/lastName/email). Accepts alternate column names: first_name, firstname, Email, EMAIL. Skips duplicates. Optional multipart `groupId` **or** `newGroupName` adds **every** row (new *and* pre-existing) to that group. Returns `{imported, skipped, group?:{id,name,addedToGroup}}` |
+
+### Contact Groups
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/groups` | Groups with `memberCount` |
+| POST | `/api/groups` | `{name, description?}`. 409 on duplicate name |
+| PUT | `/api/groups/:id` | `{name?, description?}` |
+| DELETE | `/api/groups/:id` | **409** with `{usages:{recurring[],dailyBatch}}` if targeted by an active/paused recurring campaign or the group-mode daily batch |
+| DELETE | `/api/groups/:id?detach=true` | Detaches the group from those targets, **pauses** recurring campaigns / **disables** the daily batch left with zero groups, then deletes. Returns `{ok, detached:true, paused[], dailyBatchDisabled}` |
+| POST | `/api/groups/:id/members` | `{contactIds[]}` → `{added, group}` (idempotent) |
+| DELETE | `/api/groups/:id/members` | `{contactIds[]}` → `{removed, group}` |
+
+Completed recurring campaigns and one-off/manual sends never block group deletion.
 
 ### Templates
 | Method | Path | Notes |
@@ -211,33 +235,33 @@ hatch: `UNSUBSCRIBE_REQUIRE_READY=false`. Tests: `unsubscribe-readiness.test.js`
 ### Send
 | Method | Path | Notes |
 |--------|------|-------|
-| POST | `/api/send` | `{contactIds[], templateName?, subject?, html?, txt?, senderIdentityId?, contentType?}`. `contentType`: `'html'` (default) or `'text'`. Creates job queue rows. Returns `{results[], noIdentity}` |
+| POST | `/api/send` | `{contactIds[], groupIds?[], templateName?, subject?, html?, txt?, senderIdentityId?, contentType?}`. Recipients = DISTINCT union of `contactIds` + members of `groupIds` (dedup **within this operation only**; the in-flight guard still applies; no ledger). `contentType`: `'html'` (default) or `'text'`. Returns `{results[], noIdentity}` |
 | GET | `/api/send/jobs` | Queue overview with `?status=&limit=` filters. Joins identities, servers, providers. |
 
 ### Schedule (daily batch)
 | Method | Path | Notes |
 |--------|------|-------|
-| GET | `/api/schedule` | Returns `schedule_config` row |
-| POST | `/api/schedule` | `{startTime?, endTime?, batchSize?, template?, enabled?}`. Immediately calls planDaySends() |
+| GET | `/api/schedule` | Returns `schedule_config` row + `groupIds[]` |
+| POST | `/api/schedule` | `{startTime?, endTime?, batchSize?, template?, enabled?, target_mode?, groupIds?[]}`. `target_mode`: `'all'` (default) or `'groups'`. **400** if enabling `groups` mode with zero groups. Immediately calls planDaySends() |
 
 ### Scheduled Sends (one-off sends at a future datetime)
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | `/api/scheduled-sends` | All, ordered by scheduledAt ASC. Includes `lastSendLogId` |
 | GET | `/api/scheduled-sends/:id` | Single with `logs[]` and `contacts[]` |
-| POST | `/api/scheduled-sends` | `{contactIds[], scheduledAt, templateName? or subject+html+txt, label?, content_type?}`. `content_type`: `'html'` (default) or `'text'` |
-| PUT | `/api/scheduled-sends/:id` | Only pending rows. `{label?, scheduledAt?, templateName?, subject?, html?, txt?, content_type?}` |
+| POST | `/api/scheduled-sends` | `{contactIds[], groupIds?[], scheduledAt, templateName? or subject+html+txt, label?, content_type?}`. `groupIds` are resolved to member ids **at creation** and merged into a DISTINCT `contactIds` snapshot (frozen — later membership changes don't affect it). `content_type`: `'html'` (default) or `'text'` |
+| PUT | `/api/scheduled-sends/:id` | Only pending rows. `{label?, scheduledAt?, templateName?, subject?, html?, txt?, content_type?}` (recipient snapshot is not edited) |
 | DELETE | `/api/scheduled-sends/:id` | — |
 
 ### Recurring Campaigns (day-over-day warmup sends)
 | Method | Path | Notes |
 |--------|------|-------|
-| GET | `/api/recurring-campaigns` | All, ordered by createdAt DESC |
-| POST | `/api/recurring-campaigns` | `{name, templateName? or subject+html+txt, startTime, endTime, initialCount, increasePercent, content_type?}`. `content_type`: `'html'` (default) or `'text'` |
-| PUT | `/api/recurring-campaigns/:id` | Update config fields including `content_type?` |
+| GET | `/api/recurring-campaigns` | All, ordered by createdAt DESC. Each row includes `target_mode` and `groupIds[]` |
+| POST | `/api/recurring-campaigns` | `{name, templateName? or subject+html+txt, startTime, endTime, initialCount, increasePercent, content_type?, target_mode?, groupIds?[]}`. `target_mode`: `'all'` (default) or `'groups'`; **400** if `groups` with zero groups |
+| PUT | `/api/recurring-campaigns/:id` | Update config fields incl. `content_type?`, `target_mode?`, `groupIds?`. Switching to `all` clears targeted groups; `groups` with zero groups → 400 |
 | POST | `/api/recurring-campaigns/:id/pause` | Sets status=paused |
 | POST | `/api/recurring-campaigns/:id/resume` | Sets status=active |
-| DELETE | `/api/recurring-campaigns/:id` | — |
+| DELETE | `/api/recurring-campaigns/:id` | Also clears its ledger rows (`campaign_send_ledger` source `recurring`) |
 
 ### Log
 | Method | Path | Notes |
@@ -466,7 +490,92 @@ campaign_stats (
 -- Permanent record: survives the 90-day delivery_events retention window.
 -- Updated transactionally on every delivery event (same db.transaction as delivery_events INSERT).
 -- Nightly reconciliation compares counters to delivery_events for recently-active campaigns.
+
+-- ── Contact groups + campaign targeting ──────────────────────────────────────
+contact_groups (
+  id INTEGER PK, name TEXT UNIQUE NOT NULL, description TEXT, createdAt TEXT NOT NULL
+)
+contact_group_members (
+  group_id INTEGER FK→contact_groups ON DELETE CASCADE,
+  contact_id INTEGER FK→contacts ON DELETE CASCADE,
+  addedAt TEXT NOT NULL, PRIMARY KEY (group_id, contact_id)
+)   -- index on contact_id
+
+-- Targeting junctions. group_id FK is ON DELETE RESTRICT so the app-level deletion
+-- guard (409 / ?detach) decides, rather than a group silently vanishing from a live target.
+recurring_campaign_groups (
+  recurring_campaign_id INTEGER FK→recurring_campaigns ON DELETE CASCADE,
+  group_id INTEGER FK→contact_groups ON DELETE RESTRICT,
+  PRIMARY KEY (recurring_campaign_id, group_id)
+)   -- index on group_id
+daily_batch_groups ( group_id INTEGER FK→contact_groups ON DELETE RESTRICT PRIMARY KEY )
+
+-- Per-campaign de-dup ledger (Phase 3): "this contact has been committed to this source".
+-- Decoupled from contacts.status and from jobs/send_jobs (survives their archival).
+campaign_send_ledger (
+  source_type TEXT NOT NULL,   -- 'recurring' | 'daily_batch'
+  source_id   INTEGER NOT NULL,-- recurring_campaigns.id, or DAILY_BATCH_SOURCE_ID (=1) for the batch
+  contact_id  INTEGER FK→contacts ON DELETE CASCADE,
+  queued_at   TEXT NOT NULL, PRIMARY KEY (source_type, source_id, contact_id)
+)   -- index on contact_id
+
+-- target_mode column added to both (ALTER, DEFAULT 'all' → existing rows keep whole-pool behaviour):
+recurring_campaigns.target_mode TEXT NOT NULL DEFAULT 'all'  -- 'all' | 'groups'
+schedule_config.target_mode     TEXT NOT NULL DEFAULT 'all'  -- 'all' | 'groups'
+
+-- One-time migration marker (SendLedger.runBackfillOnce):
+schema_migrations ( name TEXT PK, ran_at TEXT NOT NULL )
 ```
+
+---
+
+## Contact Groups & Campaign Targeting (groups + ledger)
+
+Imported contacts can be organised into named **groups** (many-to-many). Recurring
+campaigns and the daily batch **target** either all contacts or a set of groups;
+manual send and one-off scheduled sends can add groups as an extra recipient source.
+
+### target_mode semantics
+- `recurring_campaigns.target_mode` / `schedule_config.target_mode` ∈ `'all' | 'groups'`.
+- `'all'` = the whole contact pool. `'groups'` = DISTINCT union of the targeted groups' members.
+- **An empty group set is NEVER "all"** — it yields zero recipients. The API rejects
+  saving/enabling a `groups`-mode source with no groups (400). Existing rows default to `'all'`.
+
+### De-duplication (three layers)
+1. **Within one operation** — recipient sets are `DISTINCT` (manual send, one-off snapshot, group union).
+2. **Per-campaign ledger** — `campaign_send_ledger` records each (source, contact) at queue
+   time, so recurring campaigns / daily batch send a given contact **once per source, ever**
+   (across days and overlapping groups). Different sources are independent — the same contact
+   can be reached once by each campaign.
+3. **In-flight guard** — manual send still skips a contact with a PENDING/PROCESSING job.
+
+Only `unsubscribed` contacts are excluded from automated selection before `LIMIT`
+(`SuppressionService.suppressionExclusionSql`); `sent`/`queued`/`failed` are **not** selection
+filters — "already handled for this campaign" is the ledger's job (so a `failed` contact stays
+eligible for a *different* campaign).
+
+### Ledger write — atomic, ledger-first
+`queueJobForContact` (legacy) and `queueCanonicalJobForContact` (canonical) take an optional
+`ledger = {sourceType, sourceId}`. Inside the **same transaction** as the job insert, the
+ledger claim (`INSERT OR IGNORE`) runs **first**; if it's a no-op (already committed) no job is
+created. Net: never a ledger row without a queued job, never a queued job without its ledger row.
+`DAILY_BATCH_SOURCE_ID = 1` is the fixed sentinel used for the singleton daily batch everywhere
+(selection, write, backfill). Manual / one-off sends pass no ledger → unchanged.
+
+### Migration backfill (`SendLedger.runBackfillOnce`, called in index.js before initScheduler)
+Because automated selection moved off `status='pending'`, existing sources are seeded so they
+don't resend already-handled contacts: every contact with `status <> 'pending'` is inserted into
+the ledger of each `active`/`paused` recurring campaign and the daily-batch sentinel — faithfully
+reproducing the old shared-pool behaviour. It is **guarded + atomic**: seeding and the
+`schema_migrations` marker commit in one transaction, so it runs **exactly once** (a crash rolls
+back and re-runs; it never re-seeds contacts that became non-pending *after* migration). New
+campaigns created post-migration start with an empty ledger (can reach anyone — intended).
+
+### Group deletion safety
+`DELETE /api/groups/:id` returns **409** (with `usages`) when the group is targeted by an
+`active`/`paused` recurring campaign or the group-mode daily batch. `?detach=true` removes the
+group from those targets, **pauses** recurring campaigns / **disables** the daily batch left with
+zero groups, and deletes. Completed recurring campaigns and one-off/manual sends never block.
 
 ---
 
@@ -569,18 +678,20 @@ Does NOT send email. Creates job queue rows for mail-nodes to pick up.
 
 **Daily limit enforcement (canonical path only)**: `getIdentityRemainingCapacity(identityId)` resets `dailySentCount` if the calendar day changed, then returns `max(0, dailyLimit - dailySentCount)`. Planners cap their batch at this capacity before fetching contacts — the queue only holds dispatchable jobs.
 
-**`queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor?, scheduledSendId?, senderIdentityId?, campaignId?)`** — **exported**. Creates a `send_log` row + `jobs` row atomically (own `db.transaction()`). Sets `campaign_id` on the job. Callers pass `campaignId` from the campaign row created before the loop.
+**`queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor?, scheduledSendId?, senderIdentityId?, campaignId?, ledger?)`** — **exported**. Creates a `send_log` row + `jobs` row atomically (own `db.transaction()`). Sets `campaign_id` on the job. Optional `ledger = {sourceType, sourceId}` inserts a `campaign_send_ledger` claim **first** in the same transaction (ledger-first): if the contact is already committed the job is skipped. `queueJobForContact` (legacy) takes the same optional `ledger`. Manual send / `checkScheduledSends` pass no ledger.
 
 **`planDaySends()`** — called on startup + every midnight UTC:
-- **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window; creates a `type='daily_batch'` campaign row, then calls `queueCanonicalJobForContact` for each contact with `campaign_id` set; calls `incrementJobs` after the loop
-- **Legacy**: unchanged — generates random timestamps, creates `send_jobs` rows
+- Selects recipients via `SendLedger.eligibleContacts` for source `daily_batch`/`DAILY_BATCH_SOURCE_ID` (honours `target_mode`/groups, excludes ledgered + unsubscribed) — **not** `status='pending'`
+- **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window; creates a `type='daily_batch'` campaign row, then calls `queueCanonicalJobForContact` (with the daily-batch ledger source) for each contact; calls `incrementJobs` after the loop
+- **Legacy**: generates random timestamps, creates `send_jobs` rows (also with the ledger source)
 
 **`planRecurringCampaigns()`** — called on startup + every midnight UTC:
 - For each `active` recurring campaign where `lastRunDate != today`:
 - Computes today's count: `round(initialCount × (1 + increasePercent/100)^currentDay)`
-- **Canonical**: caps count by remaining capacity; creates a `type='recurring'` campaign row with `recurring_campaign_id` FK set; calls `queueCanonicalJobForContact` for each contact; calls `incrementJobs`
-- **Legacy**: unchanged — creates `send_jobs` rows
-- Updates `lastRunDate` and increments `currentDay`; marks `completed` when no pending contacts remain
+- Selects recipients via `SendLedger.eligibleContacts` (honours `target_mode`/groups, excludes ledgered + unsubscribed) — **not** `status='pending'`
+- **Canonical**: caps count by remaining capacity; creates a `type='recurring'` campaign row with `recurring_campaign_id` FK set; calls `queueCanonicalJobForContact` (with the recurring ledger source) for each contact; calls `incrementJobs`
+- **Legacy**: creates `send_jobs` rows (also with the ledger source)
+- Updates `lastRunDate` and increments `currentDay`; marks `completed` when no **eligible** contacts remain (pool exhausted for this campaign)
 
 **`checkScheduledSends()`** — called every minute by cron:
 1. Finds `scheduled_sends` where `status='pending' AND scheduledAt <= now`; marks them `sent`
@@ -954,7 +1065,7 @@ Nested calls (e.g. `queueJobForContact` called inside `checkScheduledSends`'s tr
 
 **2. Missing database indexes added (idempotent)**
 Three `CREATE INDEX IF NOT EXISTS` statements added at the end of `db.js`:
-- `idx_contacts_status` on `contacts(status)` — used by all scheduler queries that filter pending contacts
+- `idx_contacts_status` on `contacts(status)` — status filtering (suppression exclusion, UI counts; automated selection now dedups via `campaign_send_ledger`, not `status='pending'`)
 - `idx_scheduled_sends_status_sched` on `scheduled_sends(status, scheduledAt)` — covers the per-minute `checkScheduledSends` query
 - `idx_send_log_scheduledSendId` on `send_log(scheduledSendId)` — covers log lookups by scheduled send
 

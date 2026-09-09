@@ -7,6 +7,8 @@ import { identitySendable } from './services/JobRepository.js';
 import { compileForContact, assertTemplateButtonsValid } from './services/CampaignBodyCompiler.js';
 import { hasButtonPlaceholder } from './services/BodyCompiler.js';
 import { purgeOldEvents, retentionDays } from './services/EventRetention.js';
+import * as SendLedger from './services/SendLedger.js';
+import { DAILY_BATCH_SOURCE_ID } from './services/SendLedger.js';
 
 // Pre-validate a template before queueing a campaign's jobs. Returns true when
 // safe to proceed. On a problem it logs an actionable error and returns false so
@@ -53,8 +55,13 @@ function resolveTemplate(templateName, templateContent) {
 // ─── Legacy queue path ────────────────────────────────────────────────────────
 // Creates a send_jobs row + send_log row. Unchanged from Milestone 4.
 
-// Returns true if a job was created, false if the contact was suppressed (skipped).
-function queueJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null) {
+// Returns true if a job was created, false if skipped (suppressed, no sendable
+// identity, or already committed to this ledger source).
+// `ledger` (optional) = { sourceType, sourceId } — when provided, a ledger claim
+// is inserted FIRST inside the same transaction; if the contact was already
+// committed to that source (PK collision) no job is created. This keeps ledger
+// row and job strictly atomic. Manual/scheduled callers pass no ledger → unchanged.
+function queueJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null, ledger = null) {
   // Central suppression guard — last line of defense at creation for every legacy
   // caller (daily batch, recurring, scheduled sends).
   if (isContactSuppressed(contact.id)) return false;
@@ -73,7 +80,12 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
   const contentType = tmpl.content_type || 'html';
   const now         = new Date().toISOString();
 
+  let queued = false;
   db.transaction(() => {
+    // Ledger-first: claim the (source, contact) before creating any job. If the
+    // claim is a no-op the contact was already committed → do not queue.
+    if (ledger && !SendLedger.record(ledger.sourceType, ledger.sourceId, contact.id, now)) return;
+
     const logRow = db.prepare(`
       INSERT INTO send_log (date, contactId, name, email, template, status, subject, body, scheduledSendId, senderIdentityId)
       VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
@@ -102,8 +114,9 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
       .run(jobRow.lastInsertRowid, logRow.lastInsertRowid);
 
     db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(contact.id);
+    queued = true;
   })();
-  return true;
+  return queued;
 }
 
 // ─── Canonical queue path ─────────────────────────────────────────────────────
@@ -111,8 +124,12 @@ function queueJobForContact(contact, templateName, templateContent, scheduledFor
 // planner level (see getIdentityRemainingCapacity), so this function trusts that
 // the caller has already validated capacity.
 
-// Returns true if a job was created, false if skipped (suppressed or no identity).
-export function queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null, campaignId = null) {
+// Returns true if a job was created, false if skipped (suppressed, no identity,
+// or already committed to this ledger source).
+// `ledger` (optional) = { sourceType, sourceId } — see queueJobForContact. The
+// claim is inserted ledger-first inside the same transaction as the job, so the
+// two are atomic. Manual send passes no ledger → behaviour unchanged.
+export function queueCanonicalJobForContact(contact, templateName, templateContent, scheduledFor = null, scheduledSendId = null, senderIdentityId = null, campaignId = null, ledger = null) {
   // Central suppression guard — last line of defense at creation for every canonical
   // caller (manual send, daily batch, recurring, scheduled sends).
   if (isContactSuppressed(contact.id)) return false;
@@ -139,7 +156,12 @@ export function queueCanonicalJobForContact(contact, templateName, templateConte
     if (compiled) { body = compiled.body; bodyText = compiled.bodyText; }
   }
 
+  let queued = false;
   db.transaction(() => {
+    // Ledger-first: claim the (source, contact) before creating any job. If the
+    // claim is a no-op the contact was already committed → do not queue.
+    if (ledger && !SendLedger.record(ledger.sourceType, ledger.sourceId, contact.id, now)) return;
+
     const logRow = db.prepare(`
       INSERT INTO send_log (date, contactId, name, email, template, status, subject, body, scheduledSendId, senderIdentityId)
       VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
@@ -172,8 +194,9 @@ export function queueCanonicalJobForContact(contact, templateName, templateConte
     );
 
     db.prepare("UPDATE contacts SET status='queued' WHERE id=?").run(contact.id);
+    queued = true;
   })();
-  return true;
+  return queued;
 }
 
 // ─── Daily limit enforcement (canonical queue only) ───────────────────────────
@@ -222,11 +245,23 @@ function randomTimesInWindow(startTime, endTime, count) {
 
 // ─── Daily batch ─────────────────────────────────────────────────────────────
 
+// Resolve a source's target audience config: its mode and (when 'groups') the
+// set of targeted group ids. Empty group set stays empty — NEVER "all".
+function dailyBatchGroupIds() {
+  return db.prepare('SELECT group_id FROM daily_batch_groups').all().map((r) => r.group_id);
+}
+
 function planDaySends() {
   const cfg = db.prepare('SELECT * FROM schedule_config WHERE id=1').get();
   if (!cfg.enabled || cfg.batchSize <= 0) return;
 
   if (!campaignBodyOkOrSkip(resolveTemplate(cfg.template, null), 'Daily batch')) return;
+
+  // Daily-batch targeting (shared by both queue paths). Ledger source is the
+  // fixed daily-batch sentinel so dedup spans every daily run.
+  const targetMode = cfg.target_mode || 'all';
+  const groupIds   = targetMode === 'groups' ? dailyBatchGroupIds() : [];
+  const dbLedger   = { sourceType: 'daily_batch', sourceId: DAILY_BATCH_SOURCE_ID };
 
   if (useCanonicalQueue()) {
     const identityId = pickActiveIdentity();
@@ -240,12 +275,13 @@ function planDaySends() {
     }
 
     const times    = randomTimesInWindow(cfg.startTime, cfg.endTime, count);
-    const contacts = db.prepare(
-      "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
-    ).all(times.length);
+    const contacts = SendLedger.eligibleContacts({
+      sourceType: dbLedger.sourceType, sourceId: dbLedger.sourceId,
+      targetMode, groupIds, limit: times.length,
+    });
 
     if (contacts.length === 0) {
-      console.log('Daily batch (canonical): no pending contacts');
+      console.log('Daily batch (canonical): no eligible contacts');
       return;
     }
 
@@ -258,22 +294,24 @@ function planDaySends() {
 
     let created = 0;
     for (let i = 0; i < contacts.length; i++) {
-      if (queueCanonicalJobForContact(contacts[i], cfg.template, null, times[i], null, identityId, dispatch.id)) created++;
+      if (queueCanonicalJobForContact(contacts[i], cfg.template, null, times[i], null, identityId, dispatch.id, dbLedger)) created++;
     }
     if (created > 0) incrementJobs(dispatch.id, created);
 
     console.log(`Daily batch (canonical): queued ${created} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
   } else {
     const times    = randomTimesInWindow(cfg.startTime, cfg.endTime, cfg.batchSize);
-    const contacts = db.prepare(
-      "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
-    ).all(times.length);
+    const contacts = SendLedger.eligibleContacts({
+      sourceType: dbLedger.sourceType, sourceId: dbLedger.sourceId,
+      targetMode, groupIds, limit: times.length,
+    });
 
+    let created = 0;
     for (let i = 0; i < contacts.length; i++) {
-      queueJobForContact(contacts[i], cfg.template, null, times[i]);
+      if (queueJobForContact(contacts[i], cfg.template, null, times[i], null, null, dbLedger)) created++;
     }
 
-    console.log(`Daily batch: queued ${contacts.length} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
+    console.log(`Daily batch: queued ${created} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
   }
 }
 
@@ -298,6 +336,13 @@ function planRecurringCampaigns() {
 
     if (!campaignBodyOkOrSkip(resolveTemplate(campaign.templateName, templateContent), `Recurring "${campaign.name}"`)) continue;
 
+    // Per-campaign targeting + ledger source. Empty group set stays empty (never all).
+    const targetMode = campaign.target_mode || 'all';
+    const groupIds   = targetMode === 'groups'
+      ? db.prepare('SELECT group_id FROM recurring_campaign_groups WHERE recurring_campaign_id=?').all(campaign.id).map((r) => r.group_id)
+      : [];
+    const rcLedger   = { sourceType: 'recurring', sourceId: campaign.id };
+
     if (useCanonicalQueue()) {
       const identityId = pickActiveIdentity();
       if (!identityId) continue;
@@ -311,12 +356,13 @@ function planRecurringCampaigns() {
       }
 
       const times    = randomTimesInWindow(campaign.startTime, campaign.endTime, count);
-      const contacts = db.prepare(
-        "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
-      ).all(times.length);
+      const contacts = SendLedger.eligibleContacts({
+        sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
+        targetMode, groupIds, limit: times.length,
+      });
 
       if (contacts.length === 0) {
-        console.log(`Recurring "${campaign.name}": no pending contacts — completed`);
+        console.log(`Recurring "${campaign.name}": no eligible contacts — completed`);
         db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
         continue;
       }
@@ -330,7 +376,7 @@ function planRecurringCampaigns() {
 
       let created = 0;
       for (let i = 0; i < contacts.length; i++) {
-        if (queueCanonicalJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId, dispatch.id)) created++;
+        if (queueCanonicalJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId, dispatch.id, rcLedger)) created++;
       }
       if (created > 0) incrementJobs(dispatch.id, created);
 
@@ -340,24 +386,26 @@ function planRecurringCampaigns() {
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
     } else {
       const times    = randomTimesInWindow(campaign.startTime, campaign.endTime, requestedCount);
-      const contacts = db.prepare(
-        "SELECT * FROM contacts WHERE status='pending' ORDER BY id LIMIT ?"
-      ).all(times.length);
+      const contacts = SendLedger.eligibleContacts({
+        sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
+        targetMode, groupIds, limit: times.length,
+      });
 
       if (contacts.length === 0) {
-        console.log(`Recurring "${campaign.name}": no pending contacts — completed`);
+        console.log(`Recurring "${campaign.name}": no eligible contacts — completed`);
         db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
         continue;
       }
 
+      let created = 0;
       for (let i = 0; i < contacts.length; i++) {
-        queueJobForContact(contacts[i], campaign.templateName, templateContent, times[i]);
+        if (queueJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, null, rcLedger)) created++;
       }
 
       db.prepare('UPDATE recurring_campaigns SET lastRunDate=?, currentDay=? WHERE id=?')
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
-      console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}): queued ${contacts.length} jobs`);
+      console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}): queued ${created} jobs`);
     }
   }
 }

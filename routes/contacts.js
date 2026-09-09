@@ -2,13 +2,24 @@ import express from 'express';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import db from '../db.js';
+import * as Groups from '../services/GroupRepository.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+// GET /api/contacts            → all contacts
+// GET /api/contacts?groupId=N  → only contacts in group N
 router.get('/', (req, res) => {
-  const contacts = db.prepare('SELECT * FROM contacts ORDER BY id').all();
-  res.json(contacts);
+  const groupId = req.query.groupId != null ? Number(req.query.groupId) : null;
+  if (groupId != null && !Number.isNaN(groupId)) {
+    return res.json(db.prepare(`
+      SELECT c.* FROM contacts c
+      JOIN contact_group_members m ON m.contact_id = c.id
+      WHERE m.group_id = ?
+      ORDER BY c.id
+    `).all(groupId));
+  }
+  res.json(db.prepare('SELECT * FROM contacts ORDER BY id').all());
 });
 
 router.post('/', (req, res) => {
@@ -62,6 +73,12 @@ router.delete('/:id', (req, res) => {
 });
 
 // POST /api/contacts/import  — CSV upload
+// Optional multipart fields:
+//   groupId       → add every imported row to this existing group
+//   newGroupName  → create (or reuse) a group by name and add every row to it
+// When a group is targeted, BOTH newly-inserted and pre-existing contacts named
+// in the CSV are added to it (membership is idempotent). No group field keeps the
+// previous behaviour exactly.
 router.post('/import', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -76,24 +93,49 @@ router.post('/import', upload.single('file'), (req, res) => {
     return res.status(400).json({ error: 'Invalid CSV: ' + e.message });
   }
 
+  // Resolve the target group (if any) before importing.
+  let group = null;
+  const newGroupName = (req.body.newGroupName || '').trim();
+  const groupId      = req.body.groupId != null && req.body.groupId !== '' ? Number(req.body.groupId) : null;
+  if (newGroupName) {
+    group = Groups.findOrCreateByName(newGroupName);
+  } else if (groupId != null && !Number.isNaN(groupId)) {
+    group = Groups.get(groupId);
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+  }
+
   const ins = db.prepare(
     'INSERT OR IGNORE INTO contacts (firstName, lastName, email, status) VALUES (?, ?, ?, ?)'
   );
+  const findId = db.prepare('SELECT id FROM contacts WHERE email = ?');
   let imported = 0;
   let skipped = 0;
+  const contactIdsForGroup = [];
+
   const importMany = db.transaction((rows) => {
     for (const row of rows) {
       const fn = row.firstName || row.first_name || row.firstname || '';
       const ln = row.lastName  || row.last_name  || row.lastname  || '';
       const em = row.email || row.Email || row.EMAIL || '';
       if (!fn || !ln || !em) { skipped++; continue; }
-      const r = ins.run(fn.trim(), ln.trim(), em.trim().toLowerCase(), 'pending');
+      const email = em.trim().toLowerCase();
+      const r = ins.run(fn.trim(), ln.trim(), email, 'pending');
       if (r.changes > 0) imported++; else skipped++;
+      // Collect the contact id (new or pre-existing) so it can join the group.
+      if (group) {
+        const existing = findId.get(email);
+        if (existing) contactIdsForGroup.push(existing.id);
+      }
     }
   });
   importMany(rows);
 
-  res.json({ imported, skipped });
+  const result = { imported, skipped };
+  if (group) {
+    const addedToGroup = Groups.addMembers(group.id, contactIdsForGroup);
+    result.group = { id: group.id, name: group.name, addedToGroup };
+  }
+  res.json(result);
 });
 
 export default router;

@@ -12,6 +12,7 @@ import { seedDevData } from './seed.js';
 
 import authRouter               from './routes/auth.js';
 import contactsRouter           from './routes/contacts.js';
+import groupsRouter             from './routes/groups.js';
 import templatesRouter          from './routes/templates.js';
 import sendRouter               from './routes/send.js';
 import scheduleRouter           from './routes/schedule.js';
@@ -31,6 +32,7 @@ import engagementRouter         from './routes/engagement.js';
 import { cancelOutstandingJobsForContact } from './services/SuppressionService.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
+import { runBackfillOnce } from './services/SendLedger.js';
 import { startOfflineWatcher } from './services/HeartbeatService.js';
 import { startReadinessWatcher } from './services/TrackingHostReadiness.js';
 import { startUnsubscribeReadinessWatcher } from './services/UnsubscribeHostReadiness.js';
@@ -118,6 +120,7 @@ app.post('/unsubscribe', express.urlencoded({ extended: false }), (req, res) => 
 // All API routes below require a valid JWT
 app.use('/api', requireAuth);
 app.use('/api/contacts',             contactsRouter);
+app.use('/api/groups',               groupsRouter);
 app.use('/api/templates',            templatesRouter);
 app.use('/api/send',                 sendRouter);
 app.use('/api/schedule',             scheduleRouter);
@@ -137,6 +140,19 @@ app.listen(PORT, () => {
   console.log(`[startup] Database initialized`);
   console.log(`[startup] Queue mode: ${process.env.USE_CANONICAL_QUEUE === 'true' ? 'Canonical' : 'Legacy'}`);
   console.log(`[startup] Backend listening on http://localhost:${PORT}`);
+  // One-time Phase 3 ledger backfill — MUST run before the scheduler can plan any
+  // sends, so existing recurring campaigns / daily batch do not resend contacts
+  // they already handled once selection moved off status='pending'. Guarded +
+  // atomic (see SendLedger.runBackfillOnce): runs exactly once, never re-seeds
+  // after post-migration sends.
+  try {
+    const { ran, seeded } = runBackfillOnce();
+    if (ran) console.log(`[startup] Ledger backfill complete: seeded ${seeded} ledger row(s)`);
+    else     console.log('[startup] Ledger backfill already applied — skipping');
+  } catch (err) {
+    console.error('[startup] Ledger backfill FAILED — halting to avoid unsafe resends:', err.message);
+    process.exit(1);
+  }
   initScheduler();
   console.log('[startup] Scheduler initialized');
   startOfflineWatcher();

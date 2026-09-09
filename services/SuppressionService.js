@@ -35,6 +35,17 @@ export function isContactSuppressed(contactId) {
   return !!row && SUPPRESSED_STATUSES.has(row.status);
 }
 
+// SQL fragment (single source of truth) for excluding suppressed contacts inside
+// a batch-selection query, BEFORE its LIMIT. Automated selection no longer filters
+// by status='pending', so the exclusion that predicate gave for free must be
+// re-added here — otherwise unsubscribed contacts would occupy LIMIT slots and be
+// re-selected forever. Mirrors SUPPRESSED_STATUSES: only 'unsubscribed' is
+// excluded — never sent/queued/failed (those are the ledger's concern, not
+// suppression). `alias` is the contacts table alias used in the caller's query.
+export function suppressionExclusionSql(alias = 'c') {
+  return `${alias}.status <> 'unsubscribed'`;
+}
+
 export function isEmailSuppressed(email) {
   if (!email) return false;
   const row = db.prepare('SELECT status FROM contacts WHERE email = ?').get(String(email).toLowerCase());
