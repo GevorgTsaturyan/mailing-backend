@@ -3,3 +3,4 @@ node_modules
 data/mail.db
 data/mail.db-shm
 data/mail.db-wal
+data/campaigns.db
