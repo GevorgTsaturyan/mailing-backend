@@ -1,4 +1,7 @@
 import express from 'express';
+import { execFile as _execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import db from '../db.js';
 import { register } from '../services/NodeRegistrationService.js';
 import { recordHeartbeat } from '../services/HeartbeatService.js';
@@ -8,6 +11,9 @@ import { suppressedContactIdSet } from '../services/SuppressionService.js';
 import { applyReports } from '../services/ProvisioningService.js';
 import { isSignerHealthy } from '../services/NodeRepository.js';
 import { allowDispatch as unsubscribeHostAllowsDispatch } from '../services/UnsubscribeHostReadiness.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROVISION_SCRIPT = path.resolve(__dirname, '../scripts/provision-identity-hosts.sh');
 
 const router = express.Router();
 
@@ -202,6 +208,86 @@ router.post('/provisioning-report', (req, res) => {
 
   const { applied, rejected } = applyReports(server.id, reports);
   res.json({ ok: true, applied, rejected });
+});
+
+// ─── GET /api/nodes/provisioning-task ────────────────────────────────────────
+// Claims the oldest PENDING provisioning task for this server's identities.
+// Returns 204 with no body when no task is available.
+// Atomically transitions status PENDING → IN_PROGRESS.
+router.get('/provisioning-task', (req, res) => {
+  const { apiKey } = req.query;
+  const server = getServer(apiKey);
+  if (!server) return res.status(401).json({ error: 'Invalid apiKey' });
+  touch(server.id);
+
+  const claim = db.transaction(() => {
+    const task = db.prepare(`
+      SELECT pt.id, pt.identityId, si.domain, si.ip, si.dkimSelector AS selector
+      FROM provisioning_tasks pt
+      JOIN sender_identities si ON si.id = pt.identityId
+      WHERE pt.serverId = ? AND pt.status = 'PENDING'
+      ORDER BY pt.requestedAt ASC
+      LIMIT 1
+    `).get(server.id);
+    if (!task) return null;
+    db.prepare(`UPDATE provisioning_tasks SET status='IN_PROGRESS', claimedAt=? WHERE id=?`)
+      .run(new Date().toISOString(), task.id);
+    return task;
+  });
+
+  const task = claim();
+  if (!task) return res.status(204).end();
+  res.json(task);
+});
+
+// ─── POST /api/nodes/provisioning-task/:id/result ────────────────────────────
+// Node reports result of a claimed provisioning task.
+// Body: { apiKey, status:'DONE'|'FAILED', phases:[{phase,status,message}], error? }
+// On DONE: triggers provision-identity-hosts.sh on the controller for nginx/TLS.
+router.post('/provisioning-task/:id/result', (req, res) => {
+  const { apiKey, status, phases = [], error = null } = req.body;
+  const server = getServer(apiKey);
+  if (!server) return res.status(401).json({ error: 'Invalid apiKey' });
+  if (!['DONE', 'FAILED'].includes(status)) {
+    return res.status(400).json({ error: 'status must be DONE or FAILED' });
+  }
+
+  const taskId = Number(req.params.id);
+  const task = db.prepare(
+    'SELECT * FROM provisioning_tasks WHERE id=? AND serverId=?'
+  ).get(taskId, server.id);
+  if (!task) return res.status(404).json({ error: 'Task not found or not owned by this server' });
+
+  db.prepare(`
+    UPDATE provisioning_tasks SET status=?, completedAt=?, phases=?, error=? WHERE id=?
+  `).run(status, new Date().toISOString(), JSON.stringify(phases), error || null, taskId);
+
+  db.prepare(`UPDATE sender_identities SET provisioningStatus=? WHERE id=?`)
+    .run(status, task.identityId);
+
+  touch(server.id);
+
+  // On success, fire nginx+TLS provisioning on the controller (non-blocking).
+  // Uses the same script as POST /api/admin/provision-identity but triggered by
+  // the node's task completion rather than a manual UI action.
+  if (status === 'DONE') {
+    const identity = db.prepare('SELECT domain FROM sender_identities WHERE id=?').get(task.identityId);
+    if (identity?.domain) {
+      _execFile(
+        'sudo', [PROVISION_SCRIPT, identity.domain],
+        { timeout: 300_000, maxBuffer: 512 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) {
+            console.error(`[nodes/provision-task] nginx provisioning failed for ${identity.domain}:`, err.message);
+          } else {
+            console.log(`[nodes/provision-task] nginx provisioned for ${identity.domain}`);
+          }
+        }
+      );
+    }
+  }
+
+  res.json({ ok: true });
 });
 
 // ─── POST /api/nodes/delivery-events ─────────────────────────────────────────

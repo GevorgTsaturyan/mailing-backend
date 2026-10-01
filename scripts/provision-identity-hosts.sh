@@ -112,7 +112,8 @@ echo
 # Each entry: "subdomain_prefix:health_path"
 SUBDOMAINS=("unsubscribe:/unsubscribe-health" "click:/tracking-health")
 
-DNS_OK=true   # tracks whether all DNS records were verified
+DNS_OK=true    # tracks whether all DNS records were verified
+CERT_FAILED=false  # set true if certbot fails (DNS not propagated); script still exits 0
 FINAL_RELOAD=0
 
 for ENTRY in "${SUBDOMAINS[@]}"; do
@@ -179,14 +180,19 @@ for ENTRY in "${SUBDOMAINS[@]}"; do
     echo "  [cert]  Certificate already exists — skipping ($CERT_DIR)"
   else
     echo "  [cert]  Requesting Let's Encrypt certificate for $SUBDOMAIN..."
-    certbot --nginx \
+    if certbot --nginx \
       -d "$SUBDOMAIN" \
       --email "$CERTBOT_EMAIL" \
       --agree-tos \
       --redirect \
-      --non-interactive
-    echo "  [cert]  Certificate issued; nginx HTTPS block added by certbot"
-    FINAL_RELOAD=1
+      --non-interactive; then
+      echo "  [cert]  Certificate issued; nginx HTTPS block added by certbot"
+      FINAL_RELOAD=1
+    else
+      echo "  [cert]  WARN: certbot failed for $SUBDOMAIN (DNS not propagated yet?)"
+      echo "  [cert]  nginx HTTP config written; re-run once DNS resolves to complete TLS."
+      CERT_FAILED=true
+    fi
   fi
 
   echo
@@ -194,9 +200,13 @@ done
 
 # ── Final nginx reload (picks up any certbot-modified configs) ────────────────
 echo "── Final nginx reload ──────────────────────────────────────"
-nginx -t
-systemctl reload nginx
-echo "  [nginx] ✓ Reloaded"
+if nginx -t; then
+  systemctl reload nginx
+  echo "  [nginx] ✓ Reloaded"
+else
+  echo "  [nginx] WARN: nginx config test failed — skipping reload"
+  ALL_HEALTHY=false
+fi
 echo
 
 # ── Health probes ─────────────────────────────────────────────────────────────
@@ -219,7 +229,7 @@ echo
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo "============================================================"
-if $ALL_HEALTHY; then
+if $ALL_HEALTHY && ! $CERT_FAILED; then
   echo " ✓ All identity hosts for $DOMAIN are provisioned and healthy."
   echo
   echo " The controller readiness watchers will pick up the new"
@@ -227,7 +237,7 @@ if $ALL_HEALTHY; then
 else
   echo " Provisioning complete — some hosts are not yet reachable."
   echo
-  if ! $DNS_OK; then
+  if ! $DNS_OK || $CERT_FAILED; then
     echo " ACTION REQUIRED — add these DNS records in your DNS provider"
     echo " (Cloudflare or registrar DNS), then re-run this script:"
     echo

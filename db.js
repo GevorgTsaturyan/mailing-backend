@@ -232,6 +232,31 @@ try { db.exec("ALTER TABLE send_log ADD COLUMN reasonDetail     TEXT")    } catc
 try { db.exec("ALTER TABLE send_log ADD COLUMN deliveredAt      TEXT")    } catch {}
 try { db.exec("ALTER TABLE send_log ADD COLUMN lastEventAt      TEXT")    } catch {}
 
+// ─── Automated provisioning ───────────────────────────────────────────────────
+// provisioningStatus: tracks the UI-triggered provisioning workflow independently
+// from verificationStatus (which is node-proven).
+// Values: 'unprovisioned' | 'PENDING' | 'IN_PROGRESS' | 'DONE' | 'FAILED'
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN provisioningStatus TEXT NOT NULL DEFAULT 'unprovisioned'") } catch {}
+
+// provisioning_tasks: one row per UI-triggered provision request.
+// The mail-node polls GET /api/nodes/provisioning-task, claims a PENDING task,
+// runs DKIM keygen + Postfix + OpenDKIM config, then posts the result.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS provisioning_tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    identityId  INTEGER NOT NULL REFERENCES sender_identities(id),
+    serverId    INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'PENDING',
+    requestedAt TEXT NOT NULL,
+    claimedAt   TEXT,
+    completedAt TEXT,
+    phases      TEXT,
+    error       TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_provisioning_tasks_server_status
+    ON provisioning_tasks(serverId, status, requestedAt);
+`);
+
 // ─── OpenDKIM runtime health (from heartbeat) ─────────────────────────────────
 // 1 = signer healthy (service active + milter socket reachable), 0 = down,
 // NULL = unknown (older node / no heartbeat yet). Dispatch is withheld only when

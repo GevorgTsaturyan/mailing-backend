@@ -53,9 +53,10 @@ backend/
     smtp.js                 # GET/PUT /api/smtp + POST /api/smtp/test
     providers.js            # CRUD /api/providers
     servers.js              # CRUD /api/servers + POST /:id/regenerate-key
-    sender-identities.js    # CRUD /api/sender-identities + pause/resume
+    sender-identities.js    # CRUD /api/sender-identities + pause/resume + POST /:id/provision
     admin.js                # POST /api/admin/provision-identity → runs provision-identity-hosts.sh via execFile
     nodes.js                # Node API thin handlers: delegates register/heartbeat to services
+                            #   Also: GET /provisioning-task (poll+claim) + POST /provisioning-task/:id/result
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   scripts/
@@ -63,6 +64,8 @@ backend/
                                          #   Usage: sudo CERTBOT_EMAIL=x@y.com bash scripts/provision-identity-hosts.sh <domain>
                                          #   DNS records must be added first (Cloudflare/registrar); script detects & prints them
                                          #   Safe to re-run: skips nginx config write if file exists, skips certbot if cert dir exists
+                                         #   Certbot failure (DNS not yet propagated) does NOT exit the script — nginx config is written,
+                                         #   CERT_FAILED flag is set, script exits 0 with a summary. Re-run once DNS propagates.
     templates/
       nginx-identity-subdomain.conf      # HTTP nginx template used by provision-identity-hosts.sh; certbot adds the HTTPS block
   services/
@@ -104,6 +107,7 @@ backend/
   scheduler-targeting.test.js  # End-to-end automated targeting via the ledger (both queue modes)
   groups-targeting.test.js  # target_mode config + group deletion safety (409 / detach) (both queue modes)
   admin-provision.test.js   # POST /api/admin/provision-identity: auth, validation, injection prevention, execFile args
+  provisioning-task.test.js # Automated provisioning task flow: poll+claim, result DONE/FAILED, JWT provision trigger, idempotency
 ```
 
 > Run the suite in **both** queue modes: `npm test` (legacy) and `USE_CANONICAL_QUEUE=true npm test` (canonical).
@@ -306,6 +310,7 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | GET/POST/PUT/DELETE | `/api/sender-identities` | CRUD. GET accepts `?serverId=` filter. **POST is idempotent**: if `(serverId, fromAddr)` already exists the existing row is returned (no duplicate INSERT). |
 | POST | `/api/sender-identities/:id/pause` | Sets status=paused |
 | POST | `/api/sender-identities/:id/resume` | Sets status=active |
+| POST | `/api/sender-identities/:id/provision` | JWT required. Creates a `PENDING` provisioning task for this identity (the owning mail-node will claim it and run DKIM+Postfix+OpenDKIM). Idempotent: if a PENDING or IN_PROGRESS task already exists, returns it. Returns `{taskId, status, alreadyQueued?}` |
 
 ### Node API (apiKey authenticated, no JWT)
 | Method | Path | Notes |
@@ -315,6 +320,8 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | GET | `/api/nodes/jobs` | `?apiKey=&limit=10`. Returns due queued jobs for this server's identities. Marks them claimed. Resets daily counts at day rollover. |
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
 | POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Delegates to `DeliveryEventService.processEvents`. Updates `delivery_events` (INSERT OR IGNORE), applies FSM transitions on `jobs.delivery_status`, updates `send_jobs`+`send_log` (both pipelines), updates `campaign_stats` counters, and marks contacts failed/unsubscribed. Returns `{ok, processed, skipped}`. |
+| GET | `/api/nodes/provisioning-task` | `?apiKey=`. Returns the oldest `PENDING` provisioning task for this server's identities and atomically transitions it to `IN_PROGRESS`. Returns **204 No Content** when no task is pending. Response: `{id, identityId, domain, ip, selector}`. Node executes DKIM+Postfix+OpenDKIM locally, then POSTs the result. |
+| POST | `/api/nodes/provisioning-task/:id/result` | `{apiKey, status:'DONE'\|'FAILED', phases:[{phase,status,message}], error?}`. Node reports task completion. Updates `provisioning_tasks.status`, sets `sender_identities.provisioningStatus`. On `DONE`: non-blocking fire of `provision-identity-hosts.sh` for nginx/TLS (uses same sudo mechanism as admin endpoint). |
 
 ### Job Queue API (Milestone 4 — fully active; Milestone 5: side-effects added)
 | Method | Path | Auth | Notes |
@@ -443,8 +450,30 @@ sender_identities (
   domain TEXT, ip TEXT, fromName TEXT, fromAddr TEXT,
   dkimSelector TEXT DEFAULT 'mail', dailyLimit INTEGER DEFAULT 50,
   warmupStage INTEGER DEFAULT 1, dailySentCount INTEGER DEFAULT 0,
-  lastResetDate TEXT, status TEXT DEFAULT 'active', createdAt TEXT
+  lastResetDate TEXT, status TEXT DEFAULT 'active', createdAt TEXT,
+  -- Provisioning verification (node-proven, not directly settable via UI API)
+  verificationStatus   TEXT DEFAULT 'unverified',  -- unverified|READY|NOT_READY|DNS_UNAVAILABLE
+  lastVerifiedAt       TEXT,
+  verificationReasons  TEXT,
+  verifiedIpv4         TEXT,
+  verifiedHostname     TEXT,
+  verifiedDkimSelector TEXT,
+  -- Automated provisioning workflow (UI-triggered → node executes → controller confirms)
+  provisioningStatus   TEXT DEFAULT 'unprovisioned' -- unprovisioned|PENDING|IN_PROGRESS|DONE|FAILED
 )
+
+provisioning_tasks (
+  id          INTEGER PK,
+  identityId  INTEGER NOT NULL FK→sender_identities,
+  serverId    INTEGER NOT NULL,
+  status      TEXT DEFAULT 'PENDING',  -- PENDING|IN_PROGRESS|DONE|FAILED
+  requestedAt TEXT NOT NULL,
+  claimedAt   TEXT,
+  completedAt TEXT,
+  phases      TEXT,   -- JSON [{phase, status, message}] per execution step
+  error       TEXT    -- top-level error message on FAILED
+)
+-- Index: (serverId, status, requestedAt) for O(1) poll per server
 
 send_jobs (
   id INTEGER PK, senderIdentityId INTEGER FK→sender_identities,

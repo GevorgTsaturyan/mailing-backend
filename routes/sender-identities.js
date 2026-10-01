@@ -106,6 +106,32 @@ router.delete('/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// POST /api/sender-identities/:id/provision
+// Creates a provisioning task for the identity. Idempotent: if a PENDING or
+// IN_PROGRESS task already exists, returns it without creating a duplicate.
+// Requires JWT auth (inherited from app.use('/api', requireAuth)).
+router.post('/:id/provision', (req, res) => {
+  const si = db.prepare('SELECT * FROM sender_identities WHERE id=?').get(req.params.id);
+  if (!si) return res.status(404).json({ error: 'Not found' });
+
+  const existing = db.prepare(`
+    SELECT id, status FROM provisioning_tasks
+    WHERE identityId=? AND status IN ('PENDING','IN_PROGRESS')
+    ORDER BY requestedAt DESC LIMIT 1
+  `).get(si.id);
+  if (existing) {
+    return res.json({ taskId: existing.id, status: existing.status, alreadyQueued: true });
+  }
+
+  const now  = new Date().toISOString();
+  const info = db.prepare(
+    `INSERT INTO provisioning_tasks (identityId, serverId, status, requestedAt) VALUES (?,?,'PENDING',?)`
+  ).run(si.id, si.serverId, now);
+  db.prepare(`UPDATE sender_identities SET provisioningStatus='PENDING' WHERE id=?`).run(si.id);
+
+  res.json({ taskId: Number(info.lastInsertRowid), status: 'PENDING' });
+});
+
 router.post('/:id/pause', (req, res) => {
   db.prepare("UPDATE sender_identities SET status='paused' WHERE id=?").run(req.params.id);
   res.json({ ok: true });
