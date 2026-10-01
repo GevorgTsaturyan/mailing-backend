@@ -301,7 +301,7 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | GET/POST/PUT/DELETE | `/api/providers` | CRUD for provider records |
 | GET/POST/PUT/DELETE | `/api/servers` | CRUD for server records + `GET /:id` with identities |
 | POST | `/api/servers/:id/regenerate-key` | Generates new apiKey, returns it |
-| GET/POST/PUT/DELETE | `/api/sender-identities` | CRUD. GET accepts `?serverId=` filter |
+| GET/POST/PUT/DELETE | `/api/sender-identities` | CRUD. GET accepts `?serverId=` filter. **POST is idempotent**: if `(serverId, fromAddr)` already exists the existing row is returned (no duplicate INSERT). |
 | POST | `/api/sender-identities/:id/pause` | Sets status=paused |
 | POST | `/api/sender-identities/:id/resume` | Sets status=active |
 

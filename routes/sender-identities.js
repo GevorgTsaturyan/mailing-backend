@@ -32,6 +32,11 @@ router.post('/', (req, res) => {
   if (!db.prepare('SELECT id FROM servers WHERE id = ?').get(serverId)) {
     return res.status(404).json({ error: 'Server not found' });
   }
+  const existing = db.prepare(
+    'SELECT * FROM sender_identities WHERE serverId = ? AND fromAddr = ?'
+  ).get(serverId, fromAddr.trim());
+  if (existing) return res.json(existing);
+
   const info = db.prepare(`
     INSERT INTO sender_identities (serverId, domain, ip, fromName, fromAddr, dkimSelector, dailyLimit, warmupStage, createdAt)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
