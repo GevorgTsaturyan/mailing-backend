@@ -1,25 +1,34 @@
 // ─── ProvisioningRetryService ─────────────────────────────────────────────────
-// Background service that automatically completes provisioning for identities
-// that have finished local mail-node config (provisioningStatus = 'DONE') but
-// have not yet achieved verificationStatus = 'READY'.
+// Background service that automatically completes AND heals the controller-side
+// provisioning for every identity whose mail-node config is done
+// (provisioningStatus = 'DONE').
 //
-// Two retry strategies run every RETRY_INTERVAL_MS (5 min):
+// It runs every RETRY_INTERVAL_MS (5 min) and handles two distinct situations:
 //
-// 1. Controller-side pipeline (no mail-node involvement):
-//    Re-runs runControllerProvisioning() — CF DNS → DNS-resolution gate →
-//    nginx/TLS. Because the gate is inside the shared pipeline, certbot is only
-//    ever attempted once DNS actually resolves, so it is never hammered while
-//    unsubscribe/click are still NXDOMAIN. This is the retry that eventually
-//    completes nginx/TLS after Cloudflare DNS propagates.
+// A. In-flight identities (verificationStatus != 'READY'):
+//    - Re-runs runControllerProvisioning() when the recorded pipeline phases show
+//      Cloudflare / DNS-gate / nginx-TLS work still to do. The DNS-resolution gate
+//      inside the pipeline guarantees certbot is only attempted once DNS actually
+//      resolves, so it is never hammered while unsubscribe/click are NXDOMAIN.
+//    - Schedules a mail-node 'reverify' task (cooldown-guarded) so READY can be
+//      reached once DNS/DKIM/FCrDNS propagate and (manual) PTR is set.
 //
-// 2. Mail-node reverification:
-//    Creates a 'reverify' provisioning_task so the mail-node picks it up on its
-//    next 30-second poll and calls verifyAndReport().  Only one such task is
-//    queued at a time per identity; cooldown prevents rapid hammering.
+// B. Already-READY identities (Fix A — heal the controller side):
+//    The mail-node can report READY (DKIM/SPF/FCrDNS all fine) while the
+//    CONTROLLER-side tracking/unsubscribe hosts are broken or never finished —
+//    e.g. click.<domain> serving the wrong/default TLS cert. Previously READY
+//    identities were excluded from retry entirely, so that state was permanent.
+//    Now we STRICTLY probe https://click.<domain>/tracking-health and
+//    https://unsubscribe.<domain>/unsubscribe-health; if either is not serving
+//    correctly, we re-run the (idempotent) controller pipeline to repair it. We
+//    NEVER schedule a mail-node reverify for an already-READY identity, and we
+//    never touch PTR (manual).
 
 import db from '../db.js';
 import { isConfigured as cfConfigured } from './CloudflareService.js';
 import { runControllerProvisioning } from './ControllerProvisioningService.js';
+import { checkControllerHostsHealthy } from './ControllerHostHealth.js';
+import { mergePhases } from './ProvisioningPhaseStore.js';
 
 const RETRY_INTERVAL_MS  = 5 * 60 * 1000;  // 5 minutes between retry cycles
 const REVERIFY_COOLDOWN  = 5 * 60 * 1000;  // minimum gap between reverify tasks
@@ -64,12 +73,50 @@ export function controllerNeedsRetry(phases) {
 
 // ─── Per-identity retry ───────────────────────────────────────────────────────
 
-async function retryIdentity(identity, provision) {
-  const phases = parsePhases(identity);
+async function retryIdentity(identity, provision, hostsHealthy) {
+  const phases  = parsePhases(identity);
+  const isReady = identity.verificationStatus === 'READY';
 
-  // Re-run the shared controller pipeline if anything upstream of READY is
-  // incomplete. The DNS-resolution gate inside the pipeline guarantees certbot
-  // is deferred (not hammered) while DNS is still NXDOMAIN.
+  if (isReady) {
+    // ── Case B: mail-node is satisfied — only heal the CONTROLLER side ────────
+    // Strict public probe (no hairpin fallback) so a wrong/default TLS cert is
+    // detected rather than masked. Avoids churn: a healthy identity does not run
+    // the pipeline.
+    let health;
+    try {
+      health = await hostsHealthy(identity.domain);
+    } catch (err) {
+      warn(`controller host health probe failed for ${identity.domain}: ${err.message}`);
+      health = { ok: false, hosts: {} };
+    }
+
+    // Record ground-truth controller health so the UI can reflect it even for
+    // legacy identities that have no pipeline phase blob.
+    mergePhases(identity.id, {
+      controllerHealth: {
+        status:    health.ok ? 'OK' : 'FAILED',
+        hosts:     health.hosts || {},
+        checkedAt: new Date().toISOString(),
+      },
+    });
+
+    if (!health.ok) {
+      log(`healing controller hosts for READY ${identity.domain} ` +
+          `(click=${health.hosts?.click?.ok} unsubscribe=${health.hosts?.unsubscribe?.ok})`);
+      try {
+        await provision(identity, { dkimPublicKey: identity.dkimPublicKey || null });
+      } catch (err) {
+        warn(`controller healing failed for ${identity.domain}: ${err.message}`);
+      }
+    }
+
+    // Never schedule a mail-node reverify for an already-READY identity.
+    return;
+  }
+
+  // ── Case A: in-flight — drive the pipeline forward from recorded phases ─────
+  // The DNS-resolution gate inside the pipeline guarantees certbot is deferred
+  // (not hammered) while DNS is still NXDOMAIN.
   if (controllerNeedsRetry(phases)) {
     log(`controller pipeline retry for ${identity.domain}`);
     try {
@@ -110,21 +157,26 @@ function scheduleReverifyTask(identity) {
 // ─── Main retry loop ──────────────────────────────────────────────────────────
 
 async function runRetries(opts = {}) {
-  // provisioner is injectable for tests; production uses the real pipeline.
-  const provision = opts.provisioner || runControllerProvisioning;
+  // Injectable for tests; production uses the real pipeline + strict health probe.
+  const provision     = opts.provisioner  || runControllerProvisioning;
+  const hostsHealthy  = opts.hostsHealthy  || ((domain) => checkControllerHostsHealthy({ domain }));
 
+  // All DONE identities are considered. READY ones are not excluded any more —
+  // their controller-side hosts still need to be kept healthy (Fix A). The
+  // per-identity logic below decides whether any work is actually required, so
+  // healthy identities cause no provisioning churn.
   const candidates = db.prepare(`
     SELECT id, domain, ip, dkimSelector, serverId, provisioningPhases,
-           dkimPublicKey, nextReverifyAt
+           dkimPublicKey, nextReverifyAt, verificationStatus
     FROM sender_identities
-    WHERE provisioningStatus = 'DONE' AND verificationStatus != 'READY'
+    WHERE provisioningStatus = 'DONE'
   `).all();
 
   if (candidates.length === 0) return;
-  log(`checking ${candidates.length} DONE-but-not-READY identity(ies)`);
+  log(`checking ${candidates.length} DONE identity(ies)`);
 
   for (const identity of candidates) {
-    try { await retryIdentity(identity, provision); }
+    try { await retryIdentity(identity, provision, hostsHealthy); }
     catch (err) { warn(`retry cycle error for ${identity.domain}: ${err.message}`); }
   }
 }

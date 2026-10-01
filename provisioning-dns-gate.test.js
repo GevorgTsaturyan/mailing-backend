@@ -209,3 +209,21 @@ test('DnsResolutionService: without expectedIp, any A record counts as resolvabl
   dnsMod.__resetResolver();
   assert.equal(r.ok, true);
 });
+
+// ── Fix B: public resolver vs. local negative cache ────────────────────────────
+
+test('Fix B: when the (public) resolver sees the record, the gate considers it available', async () => {
+  // The dedicated public resolver returns the correct IP even though a LOCAL stub
+  // resolver would still be serving a cached NXDOMAIN. The gate must pass.
+  dnsMod.__setResolver(async () => ['45.32.235.159']);
+  const r = await dnsMod.checkControllerHostsResolve({ domain: 'ardovia.co', expectedIp: '45.32.235.159' });
+  dnsMod.__resetResolver();
+  assert.equal(r.ok, true, 'gate must trust the public-resolver answer, not a stale local NXDOMAIN');
+});
+
+test('Fix B: when even the public resolver cannot resolve, the gate stays NOT ok (defer certbot)', async () => {
+  dnsMod.__setResolver(async () => { const e = new Error('nx'); e.code = 'ENOTFOUND'; throw e; });
+  const r = await dnsMod.checkControllerHostsResolve({ domain: 'notyet.example', expectedIp: '45.32.235.159' });
+  dnsMod.__resetResolver();
+  assert.equal(r.ok, false, 'if public DNS also has no record, do not run nginx/certbot');
+});
