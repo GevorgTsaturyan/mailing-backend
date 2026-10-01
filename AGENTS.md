@@ -58,7 +58,7 @@ backend/
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   services/
-    unsubscribeToken.js     # HMAC-signed unsubscribe tokens (no PII): signToken/verifyToken/buildUnsubscribeUrl — sole token authority
+    unsubscribeToken.js     # HMAC-signed unsubscribe tokens (no PII): signToken/verifyToken/buildUnsubscribeUrl(contactId,{identityId?,campaignId?,domain?}) — domain-aware: uses https://unsubscribe.<domain> when domain supplied, falls back to UNSUBSCRIBE_BASE_URL
     UnsubscribeHostReadiness.js  # Fail-closed dispatch gate: contact-bound jobs are withheld until https://<unsubscribe-host>/unsubscribe-health verifies (probe + hairpin fallback; mirrors the signer-health gate)
     SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact/suppressionExclusionSql
     GroupRepository.js      # DB layer for contact groups: CRUD, membership, contactIdsInGroups (union), usages (deletion guard)
@@ -181,10 +181,17 @@ All routes except `/api/auth/*`, `/api/nodes/*`, `/u/:token`, and `/unsubscribe`
 **Unsubscribe (public, token-based — see UNSUBSCRIBE.md):**
 `GET /u/:token` renders a confirmation page (never mutates); `POST /u/:token` performs the
 unsubscribe (confirmation form **and** RFC 8058 one-click `List-Unsubscribe=One-Click`), idempotent.
-Token = HMAC-SHA256-signed contact id (no email/PII in URL). Recipient-facing host is
-`unsubscribe.serawin.net` (env `UNSUBSCRIBE_BASE_URL`); secret is `UNSUBSCRIBE_SECRET` (falls
-back to `JWT_SECRET`). The controller attaches `unsubscribeUrl` to every dispatched job; the
-mail-node emits it as both the `List-Unsubscribe` header and the visible body link. Legacy
+Token = HMAC-SHA256-signed contact id (no email/PII in URL). Tokens are domain-independent —
+the same token verifies on any unsubscribe host sharing the signing secret.
+Recipient-facing host is **identity-domain-aware**: `buildUnsubscribeUrl` accepts an optional
+`domain` param; when provided it uses `https://unsubscribe.<domain>` (e.g.
+`unsubscribe.calerion.org` for calerion.org sends, `unsubscribe.serawin.net` for serawin.net).
+Both dispatch paths pass the identity's `domain` field from the `sender_identities` JOIN:
+canonical pipeline (`GET /api/jobs/poll` → `routes/jobs.js`), legacy pipeline (`GET /api/nodes/jobs`
+→ `routes/nodes.js`). Falls back to `UNSUBSCRIBE_BASE_URL` env var when no domain is supplied.
+Secret is `UNSUBSCRIBE_SECRET` (falls back to `JWT_SECRET`). The controller attaches
+`unsubscribeUrl` to every dispatched job; the mail-node emits it as both the `List-Unsubscribe`
+header and the visible body link. Legacy
 `/unsubscribe?email=` is kept but GET is now non-mutating.
 `GET /unsubscribe-health` (public) is the probe target for the **unsubscribe-host readiness
 gate** (`UnsubscribeHostReadiness.js`, fail-closed): contact-bound jobs are withheld at all

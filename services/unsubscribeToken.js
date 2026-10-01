@@ -68,14 +68,23 @@ export function verifyToken(token) {
   }
 }
 
-// buildUnsubscribeUrl(contactId, { identityId?, campaignId? }) → full HTTPS URL,
+// buildUnsubscribeUrl(contactId, { identityId?, campaignId?, domain? }) → full HTTPS URL,
 // or null when there is no contact to reference (e.g. a raw job with no contact_id).
 // identityId / campaignId are embedded for future analytics; suppression targets
 // the contact only.
-export function buildUnsubscribeUrl(contactId, { identityId = null, campaignId = null } = {}) {
+//
+// `domain` is the sending identity's domain (e.g. 'calerion.org').  When provided,
+// the unsubscribe base becomes `https://unsubscribe.<domain>` so the List-Unsubscribe
+// host aligns with the From domain.  When absent, falls back to the global
+// UNSUBSCRIBE_BASE_URL env var (backward-compatible default).
+//
+// The HMAC token does NOT encode the domain — the same signed token is valid on any
+// unsubscribe host that shares the signing secret, so existing tokens remain valid.
+export function buildUnsubscribeUrl(contactId, { identityId = null, campaignId = null, domain = null } = {}) {
   if (contactId == null) return null;
   const payload = { c: contactId, v: 1 };
   if (identityId != null) payload.i  = identityId;
   if (campaignId != null) payload.ca = campaignId;
-  return `${baseUrl()}/u/${signToken(payload)}`;
+  const base = domain ? `https://unsubscribe.${domain}` : baseUrl();
+  return `${base}/u/${signToken(payload)}`;
 }

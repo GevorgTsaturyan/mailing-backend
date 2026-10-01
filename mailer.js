@@ -69,8 +69,11 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
   // Use the same token-based unsubscribe mechanism as the node pipeline: resolve
   // the contact by email → signed URL with no PII. (This direct-send path is
   // legacy/unused, but must never regenerate the old email-in-URL / mailto form.)
+  // Extract the sending domain from cfg.fromAddr so the unsubscribe host matches the
+  // From domain, consistent with the node dispatch paths.
   const contact = db.prepare('SELECT id FROM contacts WHERE email = ?').get(String(to).toLowerCase());
-  const unsubscribeUrl = contact ? buildUnsubscribeUrl(contact.id) : null;
+  const fromDomain = cfg.fromAddr ? cfg.fromAddr.split('@')[1] ?? null : null;
+  const unsubscribeUrl = contact ? buildUnsubscribeUrl(contact.id, { domain: fromDomain }) : null;
   const mergedVars = {
     bonusAmount: '100',
     promoCode: 'WELCOME100',

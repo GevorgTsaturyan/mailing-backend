@@ -56,9 +56,12 @@ router.get('/poll', (req, res) => {
   const job = poll(server.id);
   if (!job) return res.status(204).end();
   // Signed unsubscribe URL for the header + visible body link (same token).
+  // Pass job.domain (from the sender_identities JOIN) so the unsubscribe host
+  // matches the From domain (e.g. unsubscribe.calerion.org for calerion.org sends).
   job.unsubscribeUrl = buildUnsubscribeUrl(job.contact_id, {
     identityId: job.identity_id,
     campaignId: job.campaign_id,
+    domain:     job.domain,
   });
   // When the controller compiled a plain-text alternative (HTML jobs with tracked
   // buttons), surface it as `txt` so the node's plain-text MIME part keeps the CTA

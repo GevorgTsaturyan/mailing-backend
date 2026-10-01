@@ -62,6 +62,55 @@ test('token: URL carries no plaintext email (no @ in token)', () => {
   assert.doesNotMatch(url, /@/, 'unsubscribe URL must not embed an email address');
 });
 
+// ── domain-aware unsubscribe URL tests ───────────────────────────────────────
+
+test('domain: calerion.org identity → unsubscribe.calerion.org URL', () => {
+  const url = buildUnsubscribeUrl(42, { domain: 'calerion.org' });
+  assert.match(url, /^https:\/\/unsubscribe\.calerion\.org\/u\//,
+    'calerion identity must use calerion unsubscribe host');
+  assert.doesNotMatch(url, /serawin/, 'must not leak serawin host for calerion identity');
+});
+
+test('domain: serawin.net identity → unsubscribe.serawin.net URL', () => {
+  const url = buildUnsubscribeUrl(42, { domain: 'serawin.net' });
+  assert.match(url, /^https:\/\/unsubscribe\.serawin\.net\/u\//,
+    'serawin identity must use serawin unsubscribe host');
+});
+
+test('domain: no domain falls back to UNSUBSCRIBE_BASE_URL env (backward compat)', () => {
+  const url = buildUnsubscribeUrl(42);
+  assert.match(url, /^https:\/\/unsubscribe\.serawin\.net\/u\//,
+    'fallback must use the global UNSUBSCRIBE_BASE_URL');
+});
+
+test('domain: token from calerion URL verifies against the same signing secret (domain-independent token)', () => {
+  const url   = buildUnsubscribeUrl(42, { domain: 'calerion.org' });
+  const token = url.split('/u/')[1];
+  const payload = verifyToken(token);
+  assert.ok(payload, 'token must verify regardless of which host it was built for');
+  assert.equal(payload.c, 42);
+});
+
+test('domain: calerion URL contains no PII (no @ in token)', () => {
+  const url = buildUnsubscribeUrl(42, { domain: 'calerion.org' });
+  assert.doesNotMatch(url, /@/, 'calerion unsubscribe URL must not embed an email address');
+});
+
+test('domain: arbitrary new domain (example.com) → unsubscribe.example.com — proves implementation is generic', () => {
+  const url = buildUnsubscribeUrl(42, { domain: 'example.com' });
+  assert.match(url, /^https:\/\/unsubscribe\.example\.com\/u\//,
+    'any future domain must produce the correct unsubscribe host without code changes');
+  assert.doesNotMatch(url, /serawin|calerion/, 'must not bleed to any currently-known domain');
+});
+
+test('domain: arbitrary domain token still verifies (domain is not part of the token)', () => {
+  const url     = buildUnsubscribeUrl(99, { domain: 'example.com' });
+  const token   = url.split('/u/')[1];
+  const payload = verifyToken(token);
+  assert.ok(payload, 'token for an arbitrary domain must verify with the shared secret');
+  assert.equal(payload.c, 99);
+});
+
 // ── Test 1 — GET does not unsubscribe ─────────────────────────────────────────
 
 test('GET /u/:token renders a confirmation page and does NOT unsubscribe', async () => {

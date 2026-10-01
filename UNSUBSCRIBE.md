@@ -59,8 +59,19 @@ until it has verified the host end-to-end** (`services/UnsubscribeHostReadiness.
 
 ## Email headers emitted by the mail-node
 
+Headers use the sending identity's domain automatically — no per-domain code required:
+
 ```
+# serawin.net identity:
 List-Unsubscribe: <https://unsubscribe.serawin.net/u/<token>>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+
+# calerion.org identity:
+List-Unsubscribe: <https://unsubscribe.calerion.org/u/<token>>
+List-Unsubscribe-Post: List-Unsubscribe=One-Click
+
+# any future identity (e.g. example.com) — automatic, no code changes:
+List-Unsubscribe: <https://unsubscribe.example.com/u/<token>>
 List-Unsubscribe-Post: List-Unsubscribe=One-Click
 ```
 
@@ -68,36 +79,50 @@ No `mailto:` form (the mail-node is send-only, so it would be unroutable). No `X
 
 ## Required manual infrastructure (NOT auto-provisioned)
 
-`unsubscribe.serawin.net` does not exist yet. Two things must be set up on the host that
-serves the recipient-facing URL (the controller / sending-domain infra):
+The unsubscribe host (`unsubscribe.<domain>`) is generated dynamically per sending identity.
+**Adding a new sender identity (e.g. `support@example.com`) automatically generates
+`https://unsubscribe.example.com/u/...` — no backend code changes are needed.**
+However, DNS and TLS infrastructure must be provisioned for every new sending domain
+before the identity is activated. Repeat the steps below for each new `<domain>`:
 
-### 1. DNS
+`unsubscribe.<domain>` must be set up on the host that serves the recipient-facing URL
+(the controller / sending-domain infra):
 
-Add an **A record** pointing the subdomain at the public IP of the server that terminates
-the unsubscribe HTTPS traffic (the controller or its reverse proxy). Use your real IP:
+### 1. DNS (per sending domain)
+
+Add an **A record** for `unsubscribe.<domain>` pointing at the public IP of the server
+that terminates the unsubscribe HTTPS traffic (the controller or its reverse proxy):
 
 ```
+# Example for serawin.net:
 unsubscribe.serawin.net.   A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
+
+# Example for calerion.org:
+unsubscribe.calerion.org.  A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
+
+# Example for a future identity (example.com):
+unsubscribe.example.com.   A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
 ```
 
-(If the controller is reached via an existing proxy/CDN, use a CNAME to that host instead.)
+(All domains point to the same controller IP — the backend handles all tokens regardless
+of which `unsubscribe.<domain>` host the request arrives on.)
 
-### 2. TLS + Nginx reverse proxy
+### 2. TLS + Nginx reverse proxy (per sending domain)
 
-Obtain a certificate (e.g. `certbot --nginx -d unsubscribe.serawin.net`) and proxy all
-paths to the backend (default port **3001**), preserving the path so `/u/<token>` reaches
-the Express route unchanged:
+Obtain a certificate and add a server block for each domain. The nginx config is identical
+across domains — only `server_name` and the cert paths change:
 
 ```nginx
+# Repeat this block for every unsubscribe.<domain>
 server {
     listen 443 ssl;
-    server_name unsubscribe.serawin.net;
+    server_name unsubscribe.<domain>;   # e.g. unsubscribe.serawin.net
 
-    ssl_certificate     /etc/letsencrypt/live/unsubscribe.serawin.net/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/unsubscribe.serawin.net/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/unsubscribe.<domain>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/unsubscribe.<domain>/privkey.pem;
 
     location / {
-        proxy_pass         http://127.0.0.1:3001;   # controller backend
+        proxy_pass         http://127.0.0.1:3001;   # controller backend (shared)
         proxy_set_header   Host              $host;
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header   X-Forwarded-Proto $scheme;
@@ -105,15 +130,26 @@ server {
 }
 ```
 
+Obtain certs: `certbot --nginx -d unsubscribe.<domain>` (once per domain).
+
 ### 3. Backend env
 
+The backend env does **not** need to change per identity. `UNSUBSCRIBE_BASE_URL` is only
+used as a fallback when the identity domain is unavailable (backward compat). The URL is
+constructed dynamically from the identity's `domain` field at dispatch time.
+
 ```
-UNSUBSCRIBE_BASE_URL=https://unsubscribe.serawin.net
-UNSUBSCRIBE_SECRET=<openssl rand -hex 64>     # optional; falls back to JWT_SECRET
+UNSUBSCRIBE_BASE_URL=https://unsubscribe.serawin.net  # fallback/primary host only
+UNSUBSCRIBE_SECRET=<openssl rand -hex 64>             # optional; falls back to JWT_SECRET
 ```
 
+> The token signing secret is **shared** across all domains. A token generated for
+> `unsubscribe.calerion.org` verifies identically on `unsubscribe.example.com` — the domain
+> is only the URL prefix, not part of the HMAC payload. The single secret in `UNSUBSCRIBE_SECRET`
+> covers every identity domain you add.
+
 > `mailovian.net` remains internal (controller/backend). It must **not** appear in any
-> recipient-facing unsubscribe URL — those use `unsubscribe.serawin.net` only.
+> recipient-facing unsubscribe URL.
 
 ## Legacy links
 

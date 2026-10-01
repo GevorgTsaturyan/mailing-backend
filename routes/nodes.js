@@ -113,8 +113,10 @@ router.get('/jobs', (req, res) => {
   // Attach the signed unsubscribe URL so the node emits the same token in the
   // List-Unsubscribe header and the visible body link. The controller is the sole
   // token authority; the node never needs the signing secret.
+  // j.domain comes from the si.domain column in the SELECT JOIN above, so the
+  // unsubscribe host aligns with the From domain per identity.
   for (const j of jobs) {
-    j.unsubscribeUrl = buildUnsubscribeUrl(j.contactId, { identityId: j.senderIdentityId });
+    j.unsubscribeUrl = buildUnsubscribeUrl(j.contactId, { identityId: j.senderIdentityId, domain: j.domain });
   }
 
   res.json({ jobs });
