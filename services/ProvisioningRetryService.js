@@ -145,6 +145,9 @@ async function runRetries() {
   }
 }
 
+// Exported for testing. In production, always accessed via startProvisioningRetryService.
+export { runRetries };
+
 export function startProvisioningRetryService() {
   // 15-second delay after startup before first run (let the server fully initialize)
   setTimeout(() => {

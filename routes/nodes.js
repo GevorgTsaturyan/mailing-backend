@@ -354,11 +354,12 @@ router.post('/provisioning-task/:id/result', (req, res) => {
             });
           }
 
-          // PTR (reverse DNS) is a manual step — set in the OVH control panel.
+          // PTR (reverse DNS) is a manual step — set in your hosting provider's
+          // control panel under Reverse DNS / PTR records for the sending IP.
           mergePhases(identity.id, {
             ptr: {
               status:  'MANUAL',
-              message: `Set PTR ${identity.ip} → mail.${identity.domain} in OVH control panel (IP Management → Reverse DNS)`,
+              message: `Set PTR record: ${identity.ip} → mail.${identity.domain} (in your hosting provider's control panel under Reverse DNS)`,
             },
           });
 

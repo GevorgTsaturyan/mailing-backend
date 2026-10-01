@@ -86,6 +86,13 @@ const mkIdentity = (serverId, domain) => Number(db.prepare(`
 const idA = mkIdentity(serverA, 'task-test-a.example');
 const idB = mkIdentity(serverB, 'task-test-b.example');
 
+// serverC: fully isolated server for the new task-type / DKIM-key / phases tests
+const API_KEY_C = 'PTASK-KEY-C';
+const serverC = Number(
+  db.prepare("INSERT INTO servers (label, apiKey, status, createdAt) VALUES ('srv-c', ?, 'online', ?)")
+    .run(API_KEY_C, now).lastInsertRowid
+);
+
 // ── POST /api/sender-identities/:id/provision ─────────────────────────────────
 
 test('provision: 401 without JWT', async () => {
@@ -219,4 +226,120 @@ test('result: FAILED transitions task + identity to FAILED', async () => {
 
   const si = db.prepare('SELECT provisioningStatus FROM sender_identities WHERE id=?').get(idB);
   assert.equal(si.provisioningStatus, 'FAILED');
+});
+
+// ── taskType propagation ──────────────────────────────────────────────────────
+
+test('taskType: provision endpoint stores taskType=provision in DB', async () => {
+  const id = mkIdentity(serverC, 'tasktype-test.example');
+  await req('POST', `/api/sender-identities/${id}/provision`, {}, AUTH);
+  const task = db.prepare('SELECT taskType FROM provisioning_tasks WHERE identityId=?').get(id);
+  assert.equal(task.taskType, 'provision');
+  // Drain the IN_PROGRESS task so serverC stays clean
+  const t = db.prepare("SELECT id FROM provisioning_tasks WHERE identityId=? AND status='PENDING'").get(id);
+  if (t) db.prepare("UPDATE provisioning_tasks SET status='DONE' WHERE id=?").run(t.id);
+});
+
+test('taskType: claim response includes taskType field', async () => {
+  const id = mkIdentity(serverC, 'tasktype-claim-test.example');
+  await req('POST', `/api/sender-identities/${id}/provision`, {}, AUTH);
+  const { status, body } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_C}`);
+  assert.equal(status, 200);
+  assert.ok('taskType' in body, 'taskType must be present in claim response');
+  assert.equal(body.taskType, 'provision');
+  // Report result to clean up
+  await req('POST', `/api/nodes/provisioning-task/${body.id}/result`, {
+    apiKey: API_KEY_C, status: 'DONE', phases: [],
+  });
+});
+
+test('taskType: reverify task can be inserted, claimed, and results reported', async () => {
+  const id = mkIdentity(serverC, 'reverify-flow-test.example');
+
+  // Insert a reverify task directly (as retry service would)
+  db.prepare(
+    "INSERT INTO provisioning_tasks (identityId, serverId, status, taskType, requestedAt) VALUES (?,?,'PENDING','reverify',?)"
+  ).run(id, serverC, now);
+
+  // Claim it
+  const { body: claimed } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_C}`);
+  assert.equal(claimed.taskType, 'reverify');
+  assert.equal(claimed.identityId, id);
+
+  // Report DONE
+  const { status: rs, body: rb } = await req('POST', `/api/nodes/provisioning-task/${claimed.id}/result`, {
+    apiKey: API_KEY_C, status: 'DONE',
+    phases: [{ phase: 'verify', status: 'OK', message: 'Sent' }],
+  });
+  assert.equal(rs, 200);
+  assert.equal(rb.ok, true);
+
+  const task = db.prepare('SELECT status FROM provisioning_tasks WHERE id=?').get(claimed.id);
+  assert.equal(task.status, 'DONE');
+});
+
+// ── provisioningPhases initialisation ────────────────────────────────────────
+
+test('provision: initialises provisioningPhases blob with all-PENDING status', async () => {
+  const id = mkIdentity(serverC, 'phases-init-test.example');
+  await req('POST', `/api/sender-identities/${id}/provision`, {}, AUTH);
+
+  const si = db.prepare('SELECT provisioningPhases FROM sender_identities WHERE id=?').get(id);
+  assert.ok(si.provisioningPhases, 'provisioningPhases must be set');
+  const phases = JSON.parse(si.provisioningPhases);
+  assert.equal(phases.mailNode?.status,     'PENDING');
+  assert.equal(phases.cloudflare?.status,   'PENDING');
+  assert.equal(phases.nginx?.status,        'PENDING');
+  assert.equal(phases.ptr?.status,          'PENDING');
+  assert.equal(phases.verification?.status, 'PENDING');
+  // Drain so serverC stays clean
+  const t = db.prepare("SELECT id FROM provisioning_tasks WHERE identityId=? AND status='PENDING'").get(id);
+  if (t) db.prepare("UPDATE provisioning_tasks SET status='DONE' WHERE id=?").run(t.id);
+});
+
+// ── DKIM public key storage ───────────────────────────────────────────────────
+
+test('result: DONE with dkim_key phase stores dkimPublicKey on identity', async () => {
+  const id = mkIdentity(serverC, 'dkim-pubkey-test.example');
+
+  await req('POST', `/api/sender-identities/${id}/provision`, {}, AUTH);
+  const { body: claimed } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_C}`);
+  assert.equal(claimed.identityId, id, 'sanity: claimed task must belong to this identity');
+
+  const pubKey = 'MIGfMA0GCSqGSIb3DQEBTestKey';
+  await req('POST', `/api/nodes/provisioning-task/${claimed.id}/result`, {
+    apiKey: API_KEY_C,
+    status: 'DONE',
+    phases: [
+      { phase: 'dkim_key', status: 'OK', message: 'Generated', dkimPublicKey: pubKey },
+      { phase: 'verify',   status: 'OK', message: 'Sent' },
+    ],
+  });
+
+  const si = db.prepare('SELECT dkimPublicKey FROM sender_identities WHERE id=?').get(id);
+  assert.equal(si.dkimPublicKey, pubKey, 'dkimPublicKey must be stored from dkim_key phase result');
+});
+
+// ── Manual PTR in pipeline ────────────────────────────────────────────────────
+
+test('result: DONE sets ptr phase to MANUAL with generic (non-OVH) message', async () => {
+  const id = mkIdentity(serverC, 'ptr-msg-test.example');
+
+  await req('POST', `/api/sender-identities/${id}/provision`, {}, AUTH);
+  const { body: claimed } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_C}`);
+  assert.equal(claimed.identityId, id, 'sanity: claimed task must belong to this identity');
+
+  await req('POST', `/api/nodes/provisioning-task/${claimed.id}/result`, {
+    apiKey: API_KEY_C, status: 'DONE', phases: [],
+  });
+
+  // ptr phase is set inside the async post-DONE IIFE — give it a moment
+  await new Promise(r => setTimeout(r, 150));
+
+  const si = db.prepare('SELECT provisioningPhases FROM sender_identities WHERE id=?').get(id);
+  const phases = si.provisioningPhases ? JSON.parse(si.provisioningPhases) : {};
+  assert.equal(phases.ptr?.status, 'MANUAL', 'ptr phase must be MANUAL after provisioning');
+  const msg = phases.ptr?.message || '';
+  assert.ok(!msg.toLowerCase().includes('ovh'), 'PTR message must not mention OVH specifically');
+  assert.ok(msg.includes('ptr-msg-test.example') || msg.includes('1.2.3.4'), 'PTR message must include domain or IP');
 });
