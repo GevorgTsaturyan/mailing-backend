@@ -54,6 +54,7 @@ backend/
     providers.js            # CRUD /api/providers
     servers.js              # CRUD /api/servers + POST /:id/regenerate-key
     sender-identities.js    # CRUD /api/sender-identities + pause/resume
+    admin.js                # POST /api/admin/provision-identity → runs provision-identity-hosts.sh via execFile
     nodes.js                # Node API thin handlers: delegates register/heartbeat to services
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
@@ -102,6 +103,7 @@ backend/
   ledger.test.js            # SendLedger unit tests: claims, eligibility, guarded backfill
   scheduler-targeting.test.js  # End-to-end automated targeting via the ledger (both queue modes)
   groups-targeting.test.js  # target_mode config + group deletion safety (409 / detach) (both queue modes)
+  admin-provision.test.js   # POST /api/admin/provision-identity: auth, validation, injection prevention, execFile args
 ```
 
 > Run the suite in **both** queue modes: `npm test` (legacy) and `USE_CANONICAL_QUEUE=true npm test` (canonical).
@@ -322,6 +324,18 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | POST | `/api/jobs/:id/start` | apiKey | `{apiKey}`. Atomically claims the job: PENDING → PROCESSING. Returns 409 if another node already claimed it. |
 | POST | `/api/jobs/:id/complete` | apiKey | `{apiKey, queue_id?}`. Marks PROCESSING → SENT. **Milestone 5**: also calls `CampaignResultService.onJobCompleted` — updates `send_log` status, marks contact `sent`, increments `dailySentCount`. Only the owning node may call this. |
 | POST | `/api/jobs/:id/fail` | apiKey | `{apiKey, error_message?}`. Marks PROCESSING → FAILED. **Milestone 5**: also calls `CampaignResultService.onJobFailed` — marks `send_log` failed, marks contact `failed`. Only the owning node may call this. |
+
+### Admin (JWT required)
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| POST | `/api/admin/provision-identity` | `{domain}` | `{ok:true, domain, output}` or `{error, output}` |
+
+`POST /api/admin/provision-identity` triggers `scripts/provision-identity-hosts.sh <domain>` on
+the controller VPS (via `execFile('sudo', [scriptPath, domain])` — never a shell string). Requires
+a one-time sudoers entry on the controller: `www-data ALL=(root) NOPASSWD: /path/to/scripts/provision-identity-hosts.sh`.
+Domain is validated against `^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9](\.[...]+)+$` before use.
+Returns 400 for missing/invalid domain, 500 if the script exits non-zero, 200 with `ok:true` and
+script stdout+stderr on success. Tests: `admin-provision.test.js`.
 
 ### Public
 | Method | Path | Notes |

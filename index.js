@@ -23,6 +23,7 @@ import smtpRouter               from './routes/smtp.js';
 import providersRouter          from './routes/providers.js';
 import serversRouter            from './routes/servers.js';
 import senderIdentitiesRouter   from './routes/sender-identities.js';
+import adminRouter               from './routes/admin.js';
 import nodesRouter              from './routes/nodes.js';
 import jobsRouter               from './routes/jobs.js';
 import unsubscribeRouter        from './routes/unsubscribe.js';
@@ -131,6 +132,7 @@ app.use('/api/smtp',                 smtpRouter);
 app.use('/api/providers',            providersRouter);
 app.use('/api/servers',              serversRouter);
 app.use('/api/sender-identities',    senderIdentitiesRouter);
+app.use('/api/admin',                adminRouter);
 app.use('/api/buttons',              buttonsRouter);
 app.use('/api/engagement',           engagementRouter);
 
