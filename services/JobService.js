@@ -78,12 +78,16 @@ export function startJob(id, serverId) {
     return { error: 'DKIM signer (OpenDKIM) is unavailable on this node', status: 409 };
   }
 
-  // Unsubscribe-host gate — a contact-bound job advertises the List-Unsubscribe
-  // URL; refuse to claim it while the unsubscribe host is unverified (mail must
-  // never ship a dead unsubscribe endpoint). 409 → job stays PENDING and is
-  // re-polled once the host verifies. Raw jobs (no contact) are not gated.
-  if (job.contact_id != null && !unsubscribeHostAllowsDispatch()) {
-    return { error: 'unsubscribe host is not ready — campaign dispatch withheld', status: 409 };
+  // Unsubscribe-host gate (per-domain) — a contact-bound job advertises the
+  // List-Unsubscribe URL for the sending identity's domain; refuse to claim it
+  // while that domain's unsubscribe host is unverified (mail must never ship a
+  // dead unsubscribe endpoint). 409 → job stays PENDING and is re-polled once the
+  // host verifies. Raw jobs (no contact) carry no List-Unsubscribe and are not gated.
+  if (job.contact_id != null) {
+    const domain = JobRepository.getIdentityDomain(job.identity_id);
+    if (!unsubscribeHostAllowsDispatch(domain)) {
+      return { error: 'unsubscribe host is not ready — campaign dispatch withheld', status: 409 };
+    }
   }
 
   // ── Claim-time suppression gate (the authoritative last DB gate before send) ──

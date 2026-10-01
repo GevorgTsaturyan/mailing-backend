@@ -77,79 +77,81 @@ List-Unsubscribe-Post: List-Unsubscribe=One-Click
 
 No `mailto:` form (the mail-node is send-only, so it would be unroutable). No `X-Mailer`.
 
-## Required manual infrastructure (NOT auto-provisioned)
+## Required infrastructure per sending domain
 
 The unsubscribe host (`unsubscribe.<domain>`) is generated dynamically per sending identity.
-**Adding a new sender identity (e.g. `support@example.com`) automatically generates
-`https://unsubscribe.example.com/u/...` — no backend code changes are needed.**
-However, DNS and TLS infrastructure must be provisioned for every new sending domain
-before the identity is activated. Repeat the steps below for each new `<domain>`:
+**Adding a new sender identity (e.g. `support@newdomain.org`) automatically generates
+`https://unsubscribe.newdomain.org/u/...` — no backend code changes are needed.**
+However, DNS and nginx/TLS infrastructure must be provisioned on the controller VPS for
+every new sending domain before the identity is used for campaign sends.
 
-`unsubscribe.<domain>` must be set up on the host that serves the recipient-facing URL
-(the controller / sending-domain infra):
+### Automated provisioning (recommended)
 
-### 1. DNS (per sending domain)
+A single idempotent script provisions both `unsubscribe.<domain>` AND `click.<domain>`
+at once (they always go together):
 
-Add an **A record** for `unsubscribe.<domain>` pointing at the public IP of the server
-that terminates the unsubscribe HTTPS traffic (the controller or its reverse proxy):
-
-```
-# Example for serawin.net:
-unsubscribe.serawin.net.   A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
-
-# Example for calerion.org:
-unsubscribe.calerion.org.  A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
-
-# Example for a future identity (example.com):
-unsubscribe.example.com.   A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
+```bash
+# On the controller VPS, as root:
+sudo CERTBOT_EMAIL=you@example.com bash scripts/provision-identity-hosts.sh newdomain.org
 ```
 
-(All domains point to the same controller IP — the backend handles all tokens regardless
-of which `unsubscribe.<domain>` host the request arrives on.)
+The script:
+1. Detects the server's public IP and resolves the subdomains — prints required DNS records
+   if they are missing.
+2. Writes an nginx HTTP server block for each subdomain (skips if already exists).
+3. Runs `certbot --nginx -d <subdomain>` to obtain TLS certs and add the HTTPS block
+   (skips if the cert directory already exists).
+4. Runs `nginx -t` before every reload.
+5. Probes `https://unsubscribe.<domain>/unsubscribe-health` and
+   `https://click.<domain>/tracking-health` and reports their status.
 
-### 2. TLS + Nginx reverse proxy (per sending domain)
+**Safe to re-run**: all steps are guarded with existence checks. Re-running on an already-
+provisioned domain is a no-op (nginx config already exists, cert dir already exists).
 
-Obtain a certificate and add a server block for each domain. The nginx config is identical
-across domains — only `server_name` and the cert paths change:
+### 1. DNS (required before certbot will work — not automated)
 
-```nginx
-# Repeat this block for every unsubscribe.<domain>
-server {
-    listen 443 ssl;
-    server_name unsubscribe.<domain>;   # e.g. unsubscribe.serawin.net
+DNS is managed externally (Cloudflare or registrar). Add **A records** before running
+the provisioning script, or run the script first and re-run it after DNS propagates:
 
-    ssl_certificate     /etc/letsencrypt/live/unsubscribe.<domain>/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/unsubscribe.<domain>/privkey.pem;
+```
+# In your DNS provider (Cloudflare, etc.) for each new identity domain:
+unsubscribe.<domain>.  IN  A  <PUBLIC_IP_OF_CONTROLLER>
+click.<domain>.        IN  A  <PUBLIC_IP_OF_CONTROLLER>
 
-    location / {
-        proxy_pass         http://127.0.0.1:3001;   # controller backend (shared)
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-}
+# All domains point to the same controller IP. Examples:
+unsubscribe.newdomain.org.  IN  A  <CONTROLLER_IP>
+click.newdomain.org.        IN  A  <CONTROLLER_IP>
 ```
 
-Obtain certs: `certbot --nginx -d unsubscribe.<domain>` (once per domain).
+The provisioning script prints the exact records to add if they are missing.
 
-### 3. Backend env
+### 2. TLS + Nginx (automated by the script)
+
+`scripts/provision-identity-hosts.sh` handles this using the template at
+`scripts/templates/nginx-identity-subdomain.conf`. The pattern matches what is
+documented in TRACKING.md §2 — both subdomains use the same proxy convention.
+
+### 3. Backend env (no change required)
 
 The backend env does **not** need to change per identity. `UNSUBSCRIBE_BASE_URL` is only
 used as a fallback when the identity domain is unavailable (backward compat). The URL is
 constructed dynamically from the identity's `domain` field at dispatch time.
 
 ```
-UNSUBSCRIBE_BASE_URL=https://unsubscribe.serawin.net  # fallback/primary host only
-UNSUBSCRIBE_SECRET=<openssl rand -hex 64>             # optional; falls back to JWT_SECRET
+UNSUBSCRIBE_SECRET=<openssl rand -hex 64>  # optional; falls back to JWT_SECRET
 ```
 
 > The token signing secret is **shared** across all domains. A token generated for
-> `unsubscribe.calerion.org` verifies identically on `unsubscribe.example.com` — the domain
-> is only the URL prefix, not part of the HMAC payload. The single secret in `UNSUBSCRIBE_SECRET`
-> covers every identity domain you add.
+> `unsubscribe.calerion.org` verifies identically on `unsubscribe.newdomain.org` — the
+> domain is only the URL prefix, not part of the HMAC payload. The single secret in
+> `UNSUBSCRIBE_SECRET` covers every identity domain you add.
 
-> `mailovian.net` remains internal (controller/backend). It must **not** appear in any
-> recipient-facing unsubscribe URL.
+### Per-domain readiness gate
+
+`UnsubscribeHostReadiness` maintains a **per-domain** cache (one entry per active sending
+identity). Each domain's readiness is probed independently — `serawin.net` campaign jobs
+are never affected by the readiness of `newdomain.org`, and vice versa. The background
+watcher probes every active domain on a 5-minute cycle and logs per-domain warnings.
 
 ## Legacy links
 

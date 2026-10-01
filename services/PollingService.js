@@ -1,6 +1,6 @@
 import * as JobRepository from './JobRepository.js';
 import { isSignerHealthy } from './NodeRepository.js';
-import { allowDispatch as unsubscribeHostAllowsDispatch } from './UnsubscribeHostReadiness.js';
+import { getReadyDomains } from './UnsubscribeHostReadiness.js';
 
 // Returns the next PENDING job OWNED BY the given server, or null if that server
 // has no eligible jobs. Read-only look-ahead — state does not change here. The
@@ -11,11 +11,12 @@ export function poll(serverId) {
   // (they'd only tempfail locally). Temporary and auto-recovering. The Postfix
   // milter fail-closed remains the final guarantee against unsigned mail.
   if (!isSignerHealthy(serverId)) return null;
-  // Unsubscribe-host gate: campaign (contact-bound) jobs advertise the
-  // List-Unsubscribe URL — withhold them while that host is unverified, so mail
-  // never ships a dead unsubscribe endpoint. Raw jobs (no contact, no
-  // List-Unsubscribe) remain dispatchable. Jobs stay PENDING; dispatch resumes
-  // automatically once the host verifies.
-  const campaignJobs = unsubscribeHostAllowsDispatch();
-  return JobRepository.findNextPending(serverId, { campaignJobs });
+
+  // Unsubscribe-host gate (per-domain): contact-bound jobs are withheld for any
+  // domain whose unsubscribe host is not yet verified. getReadyDomains() returns:
+  //   null    — gating disabled (UNSUBSCRIBE_REQUIRE_READY=false); all jobs allowed
+  //   Set<domain> — only jobs for these domains (or raw jobs) are returned
+  // Raw jobs (no contact_id) carry no List-Unsubscribe URL and are never gated.
+  const readyDomains = getReadyDomains();
+  return JobRepository.findNextPending(serverId, { readyDomains });
 }

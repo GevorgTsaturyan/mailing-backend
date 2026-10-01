@@ -21,6 +21,14 @@ export function findById(id) {
   return db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) ?? null;
 }
 
+// Returns the sending domain for the given identity id, or null if not found.
+// Used by JobService.startJob to check per-domain unsubscribe readiness without
+// adding a db import to the service layer.
+export function getIdentityDomain(identityId) {
+  if (identityId == null) return null;
+  return db.prepare('SELECT domain FROM sender_identities WHERE id = ?').get(identityId)?.domain ?? null;
+}
+
 // Returns the single highest-priority PENDING job OWNED BY the polling server.
 //
 // Ownership boundary (multi-node safety): a job belongs to a mail node iff its
@@ -33,13 +41,14 @@ export function findById(id) {
 // LEFT JOINs contacts for firstName/lastName template variables.
 // Respects scheduled_for (future → withheld; NULL → immediately dispatchable).
 //
-// campaignJobs=false additionally restricts to jobs with NO contact (raw jobs).
-// Used by the unsubscribe-host readiness gate: contact-bound jobs advertise the
-// unsubscribe URL and are withheld while the host is unverified; raw jobs never
-// carry List-Unsubscribe and stay dispatchable.
-export function findNextPending(serverId, { campaignJobs = true } = {}) {
+// readyDomains controls per-domain unsubscribe-host gating:
+//   null         — gating disabled (UNSUBSCRIBE_REQUIRE_READY=false); all jobs eligible
+//   Set<domain>  — contact-bound jobs are only returned when their sending domain
+//                  is in the set; raw jobs (no contact_id) are always returned
+//   empty Set    — only raw jobs are returned (no domain has a verified host yet)
+export function findNextPending(serverId, { readyDomains = null } = {}) {
   const now = new Date().toISOString();
-  return db.prepare(`
+  const base = `
     SELECT j.*, si.fromAddr, si.fromName, si.domain, si.dkimSelector, si.ip,
            c.firstName, c.lastName
     FROM   jobs j
@@ -49,10 +58,26 @@ export function findNextPending(serverId, { campaignJobs = true } = {}) {
     LEFT   JOIN contacts c ON c.id = j.contact_id
     WHERE  j.status = 'PENDING'
       AND  (j.scheduled_for IS NULL OR j.scheduled_for <= ?)
-      AND  (? OR j.contact_id IS NULL)
-    ORDER  BY j.priority DESC, j.created_at ASC
-    LIMIT  1
-  `).get(serverId, now, campaignJobs ? 1 : 0) ?? null;
+  `;
+
+  if (readyDomains === null) {
+    // Gating disabled — all jobs (raw and campaign) are eligible.
+    return db.prepare(`${base} ORDER BY j.priority DESC, j.created_at ASC LIMIT 1`)
+      .get(serverId, now) ?? null;
+  }
+
+  if (readyDomains.size === 0) {
+    // No domain is ready — only raw jobs (no contact_id) are eligible.
+    return db.prepare(`${base} AND j.contact_id IS NULL ORDER BY j.priority DESC, j.created_at ASC LIMIT 1`)
+      .get(serverId, now) ?? null;
+  }
+
+  // Some domains are ready — raw jobs + campaign jobs for ready domains only.
+  const domains       = [...readyDomains];
+  const placeholders  = domains.map(() => '?').join(',');
+  return db.prepare(
+    `${base} AND (j.contact_id IS NULL OR si.domain IN (${placeholders})) ORDER BY j.priority DESC, j.created_at ASC LIMIT 1`
+  ).get(serverId, now, ...domains) ?? null;
 }
 
 // True iff the identity exists, is active, provisioning-verified (READY), and is

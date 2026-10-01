@@ -104,58 +104,51 @@ Unique Openers / Opens (excl. prefetch) with an explicit accuracy caveat.
 
 Tracking terminates at the **controller**, exactly like `unsubscribe.<domain>`.
 Mail-node containers and their installer need **no changes**. For each sending
-domain add — this is the reusable controller-host provisioning step.
+domain this is the reusable controller-host provisioning step.
 
 > **REQUIRED before open tracking emits pixels.** Because open tracking is ON by
-> default, every sending domain MUST have its `click.<domain>` host provisioned
-> (steps 1–3 below). Until it is, the readiness gate suppresses that domain's pixel
-> (emails still send, just untracked). The controller continuously verifies
-> readiness by probing `https://click.<domain>/tracking-health` (validates DNS →
-> TLS → nginx → endpoint in one request); check status on the Campaigns page or via
-> `GET /api/engagement/tracking-readiness`. **Do not skip this step for a new
-> domain/node — otherwise opens are silently unmeasured for that domain.**
+> default, every sending domain MUST have its `click.<domain>` host provisioned.
+> Until it is, the readiness gate suppresses that domain's pixel (emails still
+> send, just untracked). The controller continuously verifies readiness by probing
+> `https://click.<domain>/tracking-health` (validates DNS → TLS → nginx → endpoint
+> in one request); check status on the Campaigns page or via
+> `GET /api/engagement/tracking-readiness`.
 >
 > **Hairpin-NAT robustness:** if the public probe fails (many hosts cannot reach
 > their own public IP from inside), the watcher falls back to probing the local
 > controller (`http://127.0.0.1:<port>/tracking-health`) with the correct `Host`
-> header, so a hairpin false-negative never silently suppresses pixels. The
-> readiness probe never runs in the recipient-facing `/c`/`/o` paths, and the
-> periodic watcher skips probing entirely while open tracking is globally off and
-> no campaign overrides it on (admin "Re-check" always probes).
+> header.
 
-### 1. DNS
+### Automated provisioning (recommended)
 
-```
-click.<domain>.   A   <PUBLIC_IP_OF_CONTROLLER_OR_PROXY>
-```
-(Use a CNAME to an existing proxy/CDN host if applicable.)
+The same script that provisions `unsubscribe.<domain>` also provisions `click.<domain>`
+in one pass:
 
-### 2. TLS + Nginx reverse proxy
-
-`certbot --nginx -d click.<domain>`, then proxy all paths to the backend
-(port **3001**), preserving `X-Forwarded-For` (used for the salted IP hash and
-CIDR classification):
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name click.<domain>;
-
-    ssl_certificate     /etc/letsencrypt/live/click.<domain>/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/click.<domain>/privkey.pem;
-
-    location / {
-        proxy_pass         http://127.0.0.1:3001;   # controller backend
-        proxy_set_header   Host              $host;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-}
+```bash
+# On the controller VPS, as root:
+sudo CERTBOT_EMAIL=you@example.com bash scripts/provision-identity-hosts.sh newdomain.org
 ```
 
-Serves both `/c/<token>` (redirect) and `/o/<token>.gif` (pixel) on the same host.
+This writes the nginx HTTP block, runs certbot (adds HTTPS), reloads nginx, and probes
+both health endpoints. Safe to re-run: all steps are guarded with existence checks.
 
-### 3. Backend env
+### 1. DNS (not automated — managed in Cloudflare or registrar)
+
+```
+click.<domain>.        IN  A  <PUBLIC_IP_OF_CONTROLLER>
+unsubscribe.<domain>.  IN  A  <PUBLIC_IP_OF_CONTROLLER>
+```
+
+Add DNS before running the script, or run the script first and re-run after propagation.
+The script prints the required records if they are missing.
+
+### 2. TLS + Nginx (automated by the script)
+
+`scripts/provision-identity-hosts.sh` uses the template at
+`scripts/templates/nginx-identity-subdomain.conf` and runs `certbot --nginx`, which
+adds the HTTPS block. Serves both `/c/<token>` and `/o/<token>.gif` on the same host.
+
+### 3. Backend env (no change required per identity)
 
 ```
 TRACKING_SUBDOMAIN=click
@@ -169,8 +162,8 @@ Optional tuning (defaults are sensible): `TRACKING_DEDUP_WINDOW_SECONDS` (2),
 `TRACKING_READINESS_TTL_MS` (600000), `TRACKING_READINESS_REFRESH_MS` (300000),
 `TRACKING_READINESS_TIMEOUT_MS` (4000), `TRUST_PROXY` (loopback).
 
-> The internal controller host (e.g. `mailovian.net`) must never appear in a
-> recipient-facing tracking URL — those use `click.<sending-domain>` only.
+> The internal controller host must never appear in a recipient-facing tracking
+> URL — those use `click.<sending-domain>` only.
 
 ## Multi-node
 

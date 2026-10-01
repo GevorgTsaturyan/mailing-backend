@@ -57,9 +57,19 @@ backend/
     nodes.js                # Node API thin handlers: delegates register/heartbeat to services
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
+  scripts/
+    provision-identity-hosts.sh          # Idempotent: provisions nginx + Let's Encrypt for unsubscribe.<domain> AND click.<domain>
+                                         #   Usage: sudo CERTBOT_EMAIL=x@y.com bash scripts/provision-identity-hosts.sh <domain>
+                                         #   DNS records must be added first (Cloudflare/registrar); script detects & prints them
+                                         #   Safe to re-run: skips nginx config write if file exists, skips certbot if cert dir exists
+    templates/
+      nginx-identity-subdomain.conf      # HTTP nginx template used by provision-identity-hosts.sh; certbot adds the HTTPS block
   services/
     unsubscribeToken.js     # HMAC-signed unsubscribe tokens (no PII): signToken/verifyToken/buildUnsubscribeUrl(contactId,{identityId?,campaignId?,domain?}) — domain-aware: uses https://unsubscribe.<domain> when domain supplied, falls back to UNSUBSCRIBE_BASE_URL
-    UnsubscribeHostReadiness.js  # Fail-closed dispatch gate: contact-bound jobs are withheld until https://<unsubscribe-host>/unsubscribe-health verifies (probe + hairpin fallback; mirrors the signer-health gate)
+    UnsubscribeHostReadiness.js  # Per-domain fail-closed dispatch gate (mirrors TrackingHostReadiness.js): per-domain Map cache,
+                                 #   activeDomains() queries all active sender_identities, isReady(domain)/allowDispatch(domain) are
+                                 #   domain-aware. getReadyDomains() returns Set<domain> for PollingService SQL filter. Probe:
+                                 #   https://unsubscribe.<domain>/unsubscribe-health with hairpin-NAT fallback.
     SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact/suppressionExclusionSql
     GroupRepository.js      # DB layer for contact groups: CRUD, membership, contactIdsInGroups (union), usages (deletion guard)
     SendLedger.js           # Per-campaign de-dup ledger: record, eligibleContacts (target_mode/groups + suppression), runBackfillOnce; DAILY_BATCH_SOURCE_ID
@@ -83,7 +93,7 @@ backend/
     welcome.txt             # Default plain-text version
   .env                      # Secrets — gitignored, create manually on each server
   .env.example              # Template for .env
-  UNSUBSCRIBE.md            # Unsubscribe architecture + required DNS/Nginx for unsubscribe.serawin.net
+  UNSUBSCRIBE.md            # Unsubscribe architecture + automated provisioning via scripts/provision-identity-hosts.sh
   unsubscribe.test.js       # Tests for the token-based unsubscribe endpoints (node --test)
   suppression.test.js       # Defense-in-depth suppression enforcement tests (node --test)
   ownership.test.js         # Multi-node identity/job ownership isolation tests (node --test)
@@ -194,12 +204,14 @@ Secret is `UNSUBSCRIBE_SECRET` (falls back to `JWT_SECRET`). The controller atta
 header and the visible body link. Legacy
 `/unsubscribe?email=` is kept but GET is now non-mutating.
 `GET /unsubscribe-health` (public) is the probe target for the **unsubscribe-host readiness
-gate** (`UnsubscribeHostReadiness.js`, fail-closed): contact-bound jobs are withheld at all
-three dispatch points (`PollingService.poll`, `JobService.startJob` → 409, legacy
-`GET /api/nodes/jobs` → empty batch) until the host verifies — mail never ships a dead
-`List-Unsubscribe` endpoint. Withheld jobs stay PENDING/queued and dispatch resumes
-automatically. Raw jobs (no contact, no unsubscribe URL) are not gated. Dev/test escape
-hatch: `UNSUBSCRIBE_REQUIRE_READY=false`. Tests: `unsubscribe-readiness.test.js`.
+gate** (`UnsubscribeHostReadiness.js`, fail-closed, **per-domain**): contact-bound jobs are
+withheld per sending-identity domain at all three dispatch points (`PollingService.poll` via
+`getReadyDomains()` SQL filter, `JobService.startJob` → 409 per domain, legacy
+`GET /api/nodes/jobs` per-identity loop) until that domain's `unsubscribe.<domain>` host
+verifies — mail never ships a dead `List-Unsubscribe` endpoint. Domain A's readiness never
+affects Domain B. Withheld jobs stay PENDING/queued and dispatch resumes automatically.
+Raw jobs (no contact, no unsubscribe URL) are never gated. Dev/test escape hatch:
+`UNSUBSCRIBE_REQUIRE_READY=false`. Tests: `unsubscribe-readiness.test.js`.
 
 ### Auth
 | Method | Path | Body | Response |

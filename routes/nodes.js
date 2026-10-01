@@ -50,12 +50,6 @@ router.get('/jobs', (req, res) => {
   // signer is reported down. Postfix tempfail is still the final guarantee.
   if (!isSignerHealthy(server.id)) return res.json({ jobs: [] });
 
-  // Unsubscribe-host gate (legacy pipeline): every send_jobs row is contact-bound
-  // and advertises the List-Unsubscribe URL — withhold the whole batch while the
-  // unsubscribe host is unverified. Jobs stay queued; dispatch resumes once the
-  // host verifies (see services/UnsubscribeHostReadiness.js).
-  if (!unsubscribeHostAllowsDispatch()) return res.json({ jobs: [] });
-
   const today = new Date().toISOString().slice(0, 10);
 
   db.prepare(`
@@ -75,6 +69,12 @@ router.get('/jobs', (req, res) => {
   for (const identity of identities) {
     const remaining = identity.dailyLimit - identity.dailySentCount;
     if (remaining <= 0) continue;
+
+    // Unsubscribe-host gate (per-domain, legacy pipeline): all send_jobs rows are
+    // contact-bound and advertise the List-Unsubscribe URL. Skip identities whose
+    // domain's unsubscribe host is not yet verified — those jobs stay queued and
+    // dispatch resumes automatically once the host verifies.
+    if (!unsubscribeHostAllowsDispatch(identity.domain)) continue;
 
     const batch = db.prepare(`
       SELECT j.*, si.domain, si.ip, si.fromAddr, si.fromName, si.dkimSelector
