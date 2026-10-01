@@ -238,15 +238,33 @@ try { db.exec("ALTER TABLE send_log ADD COLUMN lastEventAt      TEXT")    } catc
 // Values: 'unprovisioned' | 'PENDING' | 'IN_PROGRESS' | 'DONE' | 'FAILED'
 try { db.exec("ALTER TABLE sender_identities ADD COLUMN provisioningStatus TEXT NOT NULL DEFAULT 'unprovisioned'") } catch {}
 
+// provisioningPhases: JSON blob with granular per-step status for the UI pipeline.
+// Structure: { mailNode, cloudflare, nginx, ptr, verification, updatedAt }
+// Each sub-object has { status, phases:{...}, message? }.
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN provisioningPhases TEXT") } catch {}
+
+// nextReverifyAt: ISO timestamp — the retry service skips identities until after
+// this time to avoid hammering DNS before propagation has a chance to complete.
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN nextReverifyAt TEXT") } catch {}
+
+// dkimPublicKey: the RSA public key returned by the mail-node after keygen.
+// Stored so the retry service can create the CF DKIM TXT record on re-run even
+// if the initial attempt happened before CF_API_TOKEN was configured.
+// Only the PUBLIC key is stored here — the private key never leaves the mail-node.
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN dkimPublicKey TEXT") } catch {}
+
 // provisioning_tasks: one row per UI-triggered provision request.
 // The mail-node polls GET /api/nodes/provisioning-task, claims a PENDING task,
 // runs DKIM keygen + Postfix + OpenDKIM config, then posts the result.
+// taskType: 'provision' (full local config + verify) | 'reverify' (verify only,
+//   skip local config — used by ProvisioningRetryService after DNS propagates)
 db.exec(`
   CREATE TABLE IF NOT EXISTS provisioning_tasks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     identityId  INTEGER NOT NULL REFERENCES sender_identities(id),
     serverId    INTEGER NOT NULL,
     status      TEXT NOT NULL DEFAULT 'PENDING',
+    taskType    TEXT NOT NULL DEFAULT 'provision',
     requestedAt TEXT NOT NULL,
     claimedAt   TEXT,
     completedAt TEXT,

@@ -1,5 +1,6 @@
 import express from 'express';
 import db from '../db.js';
+import { setPhases } from '../services/ProvisioningPhaseStore.js';
 
 const router = express.Router();
 
@@ -125,9 +126,19 @@ router.post('/:id/provision', (req, res) => {
 
   const now  = new Date().toISOString();
   const info = db.prepare(
-    `INSERT INTO provisioning_tasks (identityId, serverId, status, requestedAt) VALUES (?,?,'PENDING',?)`
+    `INSERT INTO provisioning_tasks (identityId, serverId, status, taskType, requestedAt) VALUES (?,?,'PENDING','provision',?)`
   ).run(si.id, si.serverId, now);
   db.prepare(`UPDATE sender_identities SET provisioningStatus='PENDING' WHERE id=?`).run(si.id);
+
+  // Initialise the pipeline phases blob so the UI has something to render
+  // immediately — each group starts as PENDING.
+  setPhases(si.id, {
+    mailNode:     { status: 'PENDING', phases: {} },
+    cloudflare:   { status: 'PENDING', phases: {} },
+    nginx:        { status: 'PENDING', phases: {} },
+    ptr:          { status: 'PENDING', message: null },
+    verification: { status: 'PENDING', reasons: [] },
+  });
 
   res.json({ taskId: Number(info.lastInsertRowid), status: 'PENDING' });
 });

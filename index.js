@@ -37,6 +37,7 @@ import { runBackfillOnce } from './services/SendLedger.js';
 import { startOfflineWatcher } from './services/HeartbeatService.js';
 import { startReadinessWatcher } from './services/TrackingHostReadiness.js';
 import { startUnsubscribeReadinessWatcher } from './services/UnsubscribeHostReadiness.js';
+import { startProvisioningRetryService } from './services/ProvisioningRetryService.js';
 
 const app = express();
 const PORT = 3001;
@@ -162,4 +163,6 @@ app.listen(PORT, () => {
   console.log('[startup] Tracking-host readiness watcher started');
   startUnsubscribeReadinessWatcher();
   console.log('[startup] Unsubscribe-host readiness watcher started (campaign dispatch gated until verified)');
+  startProvisioningRetryService();
+  console.log('[startup] Provisioning retry service started');
 });
