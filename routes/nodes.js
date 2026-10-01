@@ -1,5 +1,4 @@
 import express from 'express';
-import { execFile as _execFile } from 'node:child_process';
 import db from '../db.js';
 import { register } from '../services/NodeRegistrationService.js';
 import { recordHeartbeat } from '../services/HeartbeatService.js';
@@ -9,11 +8,8 @@ import { suppressedContactIdSet } from '../services/SuppressionService.js';
 import { applyReports } from '../services/ProvisioningService.js';
 import { isSignerHealthy } from '../services/NodeRepository.js';
 import { allowDispatch as unsubscribeHostAllowsDispatch } from '../services/UnsubscribeHostReadiness.js';
-import { provisionDns, isConfigured as cfConfigured } from '../services/CloudflareService.js';
-import { mergePhases, parseNginxOutput } from '../services/ProvisioningPhaseStore.js';
-import { PROVISION_SCRIPT } from './admin.js';
-
-const CONTROLLER_PUBLIC_IP = process.env.CONTROLLER_PUBLIC_IP || '';
+import { mergePhases } from '../services/ProvisioningPhaseStore.js';
+import { runControllerProvisioning } from '../services/ControllerProvisioningService.js';
 
 const router = express.Router();
 
@@ -263,8 +259,10 @@ router.get('/provisioning-task', (req, res) => {
 // Node reports result of a claimed provisioning task.
 // Body: { apiKey, status:'DONE'|'FAILED', phases:[{phase,status,message,...}], error? }
 //
-// For 'provision' tasks on DONE: fires CF DNS + nginx/TLS (all async,
-//   non-blocking — response is sent immediately).
+// For 'provision' tasks on DONE: fires the controller pipeline (CF DNS → DNS
+//   resolution gate → nginx/TLS) via runControllerProvisioning (async,
+//   non-blocking — response is sent immediately). Certbot runs only after the
+//   DNS gate passes, so there is no NXDOMAIN race.
 // For 'reverify' tasks on DONE: no post-processing needed; verifyAndReport has
 //   already updated verificationStatus via POST /provisioning-report.
 router.post('/provisioning-task/:id/result', (req, res) => {
@@ -290,11 +288,11 @@ router.post('/provisioning-task/:id/result', (req, res) => {
 
   touch(server.id);
 
-  // On 'provision' task DONE: extract DKIM public key, run CF DNS + nginx.
-  // All post-processing is non-blocking — response returns immediately.
+  // On 'provision' task DONE: extract DKIM public key, then run the controller
+  // pipeline (CF DNS → DNS resolution gate → nginx/TLS) non-blocking.
   if (status === 'DONE' && task.taskType !== 'reverify') {
     const identity = db.prepare(
-      'SELECT id, domain, ip, dkimSelector FROM sender_identities WHERE id=?'
+      'SELECT id, domain, ip, dkimSelector, dkimPublicKey FROM sender_identities WHERE id=?'
     ).get(task.identityId);
 
     if (identity?.domain) {
@@ -319,70 +317,14 @@ router.post('/provisioning-task/:id/result', (req, res) => {
         mailNode: { status: 'DONE', phases: mailNodePhaseMap },
       });
 
-      // Fire CF DNS + nginx all non-blocking, then update phases.
-      (async () => {
-        try {
-          // Cloudflare DNS
-          if (cfConfigured()) {
-            try {
-              const cfResult = await provisionDns({
-                domain:        identity.domain,
-                ip:            identity.ip,
-                selector:      identity.dkimSelector,
-                dkimPublicKey,
-                controllerIp:  CONTROLLER_PUBLIC_IP,
-              });
-              mergePhases(identity.id, {
-                cloudflare: {
-                  status: cfResult.ok ? 'OK' : (cfResult.skipped ? 'NOT_RUN' : 'PARTIAL'),
-                  phases: cfResult.phases,
-                },
-              });
-            } catch (err) {
-              console.error(`[nodes/task-result] CF DNS failed for ${identity.domain}:`, err.message);
-              mergePhases(identity.id, {
-                cloudflare: { status: 'FAILED', error: err.message, phases: {} },
-              });
-            }
-          } else {
-            mergePhases(identity.id, {
-              cloudflare: {
-                status:  'NOT_RUN',
-                message: 'CF_API_TOKEN not configured — DNS records must be created manually',
-                phases:  {},
-              },
-            });
-          }
-
-          // PTR (reverse DNS) is a manual step — set in your hosting provider's
-          // control panel under Reverse DNS / PTR records for the sending IP.
-          mergePhases(identity.id, {
-            ptr: {
-              status:  'MANUAL',
-              message: `Set PTR record: ${identity.ip} → mail.${identity.domain} (in your hosting provider's control panel under Reverse DNS)`,
-            },
-          });
-
-        } catch (err) {
-          console.error(`[nodes/task-result] post-DONE phase error for ${identity.domain}:`, err.message);
-        }
-
-        // nginx+TLS provisioning (always fired, CF DNS may not be ready yet but
-        // provision-identity-hosts.sh handles certbot failure gracefully).
-        _execFile(
-          'sudo', [PROVISION_SCRIPT, identity.domain],
-          { timeout: 300_000, maxBuffer: 512 * 1024 },
-          (err, stdout) => {
-            const nginxPhases = parseNginxOutput(stdout || '');
-            mergePhases(identity.id, { nginx: { status: 'DONE', phases: nginxPhases } });
-            if (err) {
-              console.error(`[nodes/task-result] nginx failed for ${identity.domain}:`, err.message);
-            } else {
-              console.log(`[nodes/task-result] nginx provisioned for ${identity.domain}`);
-            }
-          }
-        );
-      })();
+      // Fire the controller pipeline non-blocking. The DNS-resolution gate inside
+      // ensures certbot is never run before unsubscribe/click actually resolve;
+      // if DNS is not ready, nginx stays PENDING and ProvisioningRetryService
+      // completes it automatically on its cooldown.
+      runControllerProvisioning(identity, { dkimPublicKey })
+        .catch(err => console.error(
+          `[nodes/task-result] controller provisioning error for ${identity.domain}:`, err.message
+        ));
     }
   }
 

@@ -23,18 +23,32 @@ const serverId = Number(
     .run(now).lastInsertRowid
 );
 
-// nginx phases: all OK (no PENDING TLS) so nginxNeedsRetry returns false
-// → runRetries only runs scheduleReverifyTask, no external calls needed
-const nginxPhasesOk = JSON.stringify({
+// All controller phases complete (cloudflare resolved, dns OK, nginx/TLS done) so
+// controllerNeedsRetry() returns false → runRetries only runs scheduleReverifyTask,
+// no external calls (no CF, no DNS lookups, no certbot) needed.
+const phasesComplete = JSON.stringify({
   mailNode:     { status: 'DONE',   phases: {} },
   cloudflare:   { status: 'NOT_RUN', phases: {} },
+  dns:          { status: 'OK',     message: 'resolves' },
   nginx:        { status: 'DONE',   phases: { unsubscribe: { status:'OK' }, click: { status:'OK' }, tls_unsubscribe: { status:'OK' }, tls_click: { status:'OK' } } },
   ptr:          { status: 'MANUAL', message: 'Set PTR manually' },
   verification: { status: 'PENDING', reasons: [] },
   updatedAt: now,
 });
 
-function mkIdentity(domain, verificationStatus = 'NOT_READY') {
+// nginx/DNS still pending — controllerNeedsRetry() returns true, so the retry
+// loop should route this identity through the controller pipeline.
+const phasesNeedingNginx = JSON.stringify({
+  mailNode:     { status: 'DONE',    phases: {} },
+  cloudflare:   { status: 'OK',      phases: { a_unsubscribe: { status:'OK' }, a_click: { status:'OK' } } },
+  dns:          { status: 'PENDING', message: 'waiting for DNS' },
+  nginx:        { status: 'PENDING', message: 'deferred', phases: {} },
+  ptr:          { status: 'MANUAL',  message: 'Set PTR manually' },
+  verification: { status: 'PENDING', reasons: [] },
+  updatedAt: now,
+});
+
+function mkIdentity(domain, verificationStatus = 'NOT_READY', phasesBlob = phasesComplete) {
   return Number(db.prepare(`
     INSERT INTO sender_identities
       (serverId, domain, ip, fromAddr, fromName, dkimSelector,
@@ -42,7 +56,7 @@ function mkIdentity(domain, verificationStatus = 'NOT_READY') {
        provisioningPhases, dailyLimit, dailySentCount, createdAt)
     VALUES (?, ?, '1.2.3.4', ?, 'T', 'mail',
             'active', ?, 'DONE', ?, 50, 0, ?)
-  `).run(serverId, domain, `s@${domain}`, verificationStatus, nginxPhasesOk, now).lastInsertRowid);
+  `).run(serverId, domain, `s@${domain}`, verificationStatus, phasesBlob, now).lastInsertRowid);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -97,6 +111,31 @@ test('runRetries: updates nextReverifyAt cooldown after scheduling', async () =>
   const si = db.prepare('SELECT nextReverifyAt FROM sender_identities WHERE id=?').get(id);
   assert.ok(si.nextReverifyAt, 'nextReverifyAt should be set after scheduling');
   assert.ok(new Date(si.nextReverifyAt) > new Date(), 'cooldown must be in the future');
+});
+
+test('runRetries: routes incomplete-pipeline identity through controller provisioner', async () => {
+  const id = mkIdentity('gate-retry.example', 'NOT_READY', phasesNeedingNginx);
+  const calls = [];
+  await runRetries({ provisioner: async (identity) => { calls.push(identity.id); } });
+  assert.ok(calls.includes(id), 'identity with pending DNS/nginx must be routed to the controller pipeline');
+});
+
+test('runRetries: does NOT call controller provisioner when pipeline already complete', async () => {
+  const id = mkIdentity('complete-pipeline.example', 'NOT_READY', phasesComplete);
+  const calls = [];
+  await runRetries({ provisioner: async (identity) => { calls.push(identity.id); } });
+  assert.ok(!calls.includes(id), 'completed pipeline must not re-run the controller provisioner');
+  // but a reverify task should still be scheduled
+  const task = db.prepare("SELECT taskType FROM provisioning_tasks WHERE identityId=?").get(id);
+  assert.equal(task?.taskType, 'reverify');
+});
+
+test('controllerNeedsRetry: gate logic (pending DNS/nginx → true, complete → false)', async () => {
+  const { controllerNeedsRetry } = await import('./services/ProvisioningRetryService.js');
+  assert.equal(controllerNeedsRetry(JSON.parse(phasesNeedingNginx)), true);
+  assert.equal(controllerNeedsRetry(JSON.parse(phasesComplete)), false);
+  // DNS phase missing entirely → needs retry (so we never skip the gate)
+  assert.equal(controllerNeedsRetry({ nginx: { status: 'DONE', phases: {} } }), true);
 });
 
 test('runRetries: no OVH API calls — ptr phase is never automatically retried', async () => {

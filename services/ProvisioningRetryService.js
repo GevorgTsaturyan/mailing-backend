@@ -1,28 +1,28 @@
 // ─── ProvisioningRetryService ─────────────────────────────────────────────────
-// Background service that automatically retries pending provisioning phases
-// for identities that have finished local mail-node config (provisioningStatus =
-// 'DONE') but have not yet achieved verificationStatus = 'READY'.
+// Background service that automatically completes provisioning for identities
+// that have finished local mail-node config (provisioningStatus = 'DONE') but
+// have not yet achieved verificationStatus = 'READY'.
 //
 // Two retry strategies run every RETRY_INTERVAL_MS (5 min):
 //
-// 1. Controller-side retries (no mail-node involvement):
-//    • Cloudflare DNS — re-runs provisionDns() for phases still PENDING/FAILED
-//    • nginx/TLS      — re-runs provision-identity-hosts.sh for pending TLS
+// 1. Controller-side pipeline (no mail-node involvement):
+//    Re-runs runControllerProvisioning() — CF DNS → DNS-resolution gate →
+//    nginx/TLS. Because the gate is inside the shared pipeline, certbot is only
+//    ever attempted once DNS actually resolves, so it is never hammered while
+//    unsubscribe/click are still NXDOMAIN. This is the retry that eventually
+//    completes nginx/TLS after Cloudflare DNS propagates.
 //
 // 2. Mail-node reverification:
 //    Creates a 'reverify' provisioning_task so the mail-node picks it up on its
 //    next 30-second poll and calls verifyAndReport().  Only one such task is
 //    queued at a time per identity; cooldown prevents rapid hammering.
 
-import { execFile as _execFile } from 'node:child_process';
 import db from '../db.js';
-import { provisionDns, isConfigured as cfConfigured } from './CloudflareService.js';
-import { PROVISION_SCRIPT } from '../routes/admin.js';
-import { mergePhases, parseNginxOutput } from './ProvisioningPhaseStore.js';
+import { isConfigured as cfConfigured } from './CloudflareService.js';
+import { runControllerProvisioning } from './ControllerProvisioningService.js';
 
 const RETRY_INTERVAL_MS  = 5 * 60 * 1000;  // 5 minutes between retry cycles
 const REVERIFY_COOLDOWN  = 5 * 60 * 1000;  // minimum gap between reverify tasks
-const CONTROLLER_PUBLIC_IP = process.env.CONTROLLER_PUBLIC_IP || '';
 
 function log(msg)  { console.log(`[prov-retry] ${msg}`); }
 function warn(msg) { console.warn(`[prov-retry] WARN: ${msg}`); }
@@ -42,63 +42,44 @@ function cfNeedsRetry(phases) {
   return Object.values(p).some(v => v?.status === 'PENDING' || v?.status === 'FAILED');
 }
 
-function nginxNeedsRetry(phases) {
-  const ng = phases.nginx?.phases || {};
-  return Object.values(ng).some(v => v?.status === 'PENDING');
+// Does the controller-side pipeline still have work to do for this identity?
+// True when Cloudflare, the DNS-resolution gate, or nginx/TLS is incomplete.
+export function controllerNeedsRetry(phases) {
+  // Cloudflare records not fully in place
+  if (cfNeedsRetry(phases)) return true;
+
+  // DNS-resolution gate not yet satisfied (missing, pending, or failed)
+  const dns = phases.dns;
+  if (!dns || dns.status === 'PENDING' || dns.status === 'FAILED') return true;
+
+  // nginx/TLS incomplete (deferred, never ran, or a sub-phase still pending)
+  const ng = phases.nginx;
+  if (!ng) return true;
+  if (ng.status === 'PENDING') return true;
+  const sub = ng.phases || {};
+  if (Object.values(sub).some(v => v?.status === 'PENDING')) return true;
+
+  return false;
 }
 
 // ─── Per-identity retry ───────────────────────────────────────────────────────
 
-async function retryIdentity(identity) {
+async function retryIdentity(identity, provision) {
   const phases = parsePhases(identity);
-  let updated = false;
 
-  // 1. Cloudflare DNS retry
-  if (cfNeedsRetry(phases)) {
-    log(`CF DNS retry for ${identity.domain}`);
+  // Re-run the shared controller pipeline if anything upstream of READY is
+  // incomplete. The DNS-resolution gate inside the pipeline guarantees certbot
+  // is deferred (not hammered) while DNS is still NXDOMAIN.
+  if (controllerNeedsRetry(phases)) {
+    log(`controller pipeline retry for ${identity.domain}`);
     try {
-      const cfResult = await provisionDns({
-        domain:       identity.domain,
-        ip:           identity.ip,
-        selector:     identity.dkimSelector,
-        dkimPublicKey: identity.dkimPublicKey || null,
-        controllerIp: CONTROLLER_PUBLIC_IP,
-      });
-      phases.cloudflare = {
-        status: cfResult.ok ? 'OK' : (cfResult.skipped ? 'NOT_RUN' : 'PARTIAL'),
-        phases: cfResult.phases,
-        ...(cfResult.skipped ? { message: cfResult.message } : {}),
-      };
-      updated = true;
+      await provision(identity, { dkimPublicKey: identity.dkimPublicKey || null });
     } catch (err) {
-      warn(`CF DNS retry failed for ${identity.domain}: ${err.message}`);
+      warn(`controller pipeline retry failed for ${identity.domain}: ${err.message}`);
     }
   }
 
-  // 2. nginx/TLS retry
-  if (nginxNeedsRetry(phases)) {
-    log(`nginx/TLS retry for ${identity.domain}`);
-    await new Promise(resolve => {
-      _execFile(
-        'sudo', [PROVISION_SCRIPT, identity.domain],
-        { timeout: 300_000, maxBuffer: 512 * 1024 },
-        (err, stdout) => {
-          const nginxPhases = parseNginxOutput(stdout || '');
-          phases.nginx = { status: 'DONE', phases: nginxPhases };
-          updated = true;
-          if (err) warn(`nginx retry for ${identity.domain}: ${err.message}`);
-          resolve();
-        }
-      );
-    });
-  }
-
-  if (updated) {
-    phases.updatedAt = new Date().toISOString();
-    mergePhases(identity.id, phases);
-  }
-
-  // 4. Schedule mail-node reverification task (only if no active task exists)
+  // Schedule mail-node reverification task (only if no active task exists)
   scheduleReverifyTask(identity);
 }
 
@@ -128,7 +109,10 @@ function scheduleReverifyTask(identity) {
 
 // ─── Main retry loop ──────────────────────────────────────────────────────────
 
-async function runRetries() {
+async function runRetries(opts = {}) {
+  // provisioner is injectable for tests; production uses the real pipeline.
+  const provision = opts.provisioner || runControllerProvisioning;
+
   const candidates = db.prepare(`
     SELECT id, domain, ip, dkimSelector, serverId, provisioningPhases,
            dkimPublicKey, nextReverifyAt
@@ -140,7 +124,7 @@ async function runRetries() {
   log(`checking ${candidates.length} DONE-but-not-READY identity(ies)`);
 
   for (const identity of candidates) {
-    try { await retryIdentity(identity); }
+    try { await retryIdentity(identity, provision); }
     catch (err) { warn(`retry cycle error for ${identity.domain}: ${err.message}`); }
   }
 }

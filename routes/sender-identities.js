@@ -94,17 +94,39 @@ router.put('/:id', (req, res) => {
 });
 
 router.delete('/:id', (req, res) => {
+  const id = req.params.id;
+  const si = db.prepare('SELECT id FROM sender_identities WHERE id = ?').get(id);
+  if (!si) return res.json({ ok: true, alreadyGone: true });   // idempotent delete
+
   const legacyPending = db.prepare(
     "SELECT id FROM send_jobs WHERE senderIdentityId=? AND status IN ('queued','claimed') LIMIT 1"
-  ).get(req.params.id);
+  ).get(id);
   const canonicalPending = db.prepare(
     "SELECT id FROM jobs WHERE identity_id=? AND status IN ('PENDING','PROCESSING') LIMIT 1"
-  ).get(req.params.id);
+  ).get(id);
   if (legacyPending || canonicalPending) {
     return res.status(409).json({ error: 'There are pending jobs for this identity. Wait for them to complete first.' });
   }
-  db.prepare('DELETE FROM sender_identities WHERE id = ?').run(req.params.id);
-  res.json({ ok: true });
+
+  // foreign_keys is ON, so the identity row cannot be deleted while child rows
+  // reference it. Clear them atomically first, otherwise a provisioned identity
+  // (which always has provisioning_tasks) can never be deleted — blocking the
+  // delete → re-add cycle. Provisioning lifecycle rows are removed outright;
+  // historical send records keep their rows but drop the FK reference so send
+  // history / stats survive the deletion.
+  try {
+    const purge = db.transaction((identityId) => {
+      db.prepare('DELETE FROM provisioning_tasks WHERE identityId = ?').run(identityId);
+      db.prepare('UPDATE send_jobs SET senderIdentityId = NULL WHERE senderIdentityId = ?').run(identityId);
+      db.prepare('UPDATE jobs SET identity_id = NULL WHERE identity_id = ?').run(identityId);
+      db.prepare('DELETE FROM sender_identities WHERE id = ?').run(identityId);
+    });
+    purge(id);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[sender-identities] delete failed for id', id, '-', e.message);
+    res.status(500).json({ error: 'Failed to delete identity' });
+  }
 });
 
 // POST /api/sender-identities/:id/provision
@@ -135,6 +157,7 @@ router.post('/:id/provision', (req, res) => {
   setPhases(si.id, {
     mailNode:     { status: 'PENDING', phases: {} },
     cloudflare:   { status: 'PENDING', phases: {} },
+    dns:          { status: 'PENDING', message: null },
     nginx:        { status: 'PENDING', phases: {} },
     ptr:          { status: 'PENDING', message: null },
     verification: { status: 'PENDING', reasons: [] },
