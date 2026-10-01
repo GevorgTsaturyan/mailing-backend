@@ -111,14 +111,23 @@ router.delete('/:id', (req, res) => {
   // foreign_keys is ON, so the identity row cannot be deleted while child rows
   // reference it. Clear them atomically first, otherwise a provisioned identity
   // (which always has provisioning_tasks) can never be deleted — blocking the
-  // delete → re-add cycle. Provisioning lifecycle rows are removed outright;
-  // historical send records keep their rows but drop the FK reference so send
-  // history / stats survive the deletion.
+  // delete → re-add cycle.
+  //
+  // The schema encodes the intent per table:
+  //   • provisioning_tasks.identityId is NOT NULL (a pure lifecycle row with no
+  //     historical value once the identity is gone) → delete outright. This also
+  //     removes any pending/in-progress task so no provisioning/reverify work is
+  //     left orphaned against a deleted identity.
+  //   • send_jobs.senderIdentityId, jobs.identity_id and campaigns.identity_id are
+  //     all NULLABLE historical references → detach (set NULL) so delivery/campaign
+  //     history survives the deletion instead of being destroyed.
+  // These are exactly the four FOREIGN KEYs that reference sender_identities(id).
   try {
     const purge = db.transaction((identityId) => {
       db.prepare('DELETE FROM provisioning_tasks WHERE identityId = ?').run(identityId);
       db.prepare('UPDATE send_jobs SET senderIdentityId = NULL WHERE senderIdentityId = ?').run(identityId);
       db.prepare('UPDATE jobs SET identity_id = NULL WHERE identity_id = ?').run(identityId);
+      db.prepare('UPDATE campaigns SET identity_id = NULL WHERE identity_id = ?').run(identityId);
       db.prepare('DELETE FROM sender_identities WHERE id = ?').run(identityId);
     });
     purge(id);
