@@ -72,7 +72,7 @@ export async function sendCampaignEmail({ to, templateName, templateContent, var
   // Extract the sending domain from cfg.fromAddr so the unsubscribe host matches the
   // From domain, consistent with the node dispatch paths.
   const contact = db.prepare('SELECT id FROM contacts WHERE email = ?').get(String(to).toLowerCase());
-  const fromDomain = cfg.fromAddr ? cfg.fromAddr.split('@')[1] ?? null : null;
+  const fromDomain = cfg.fromAddr ? (cfg.fromAddr.split('@')[1] || null) : null;
   const unsubscribeUrl = contact ? buildUnsubscribeUrl(contact.id, { domain: fromDomain }) : null;
   const mergedVars = {
     bonusAmount: '100',
