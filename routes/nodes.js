@@ -237,7 +237,7 @@ router.get('/provisioning-task', (req, res) => {
   const claim = db.transaction(() => {
     const task = db.prepare(`
       SELECT pt.id, pt.identityId, pt.taskType,
-             si.domain, si.ip, si.dkimSelector AS selector
+             si.domain, si.ip, si.dkimSelector AS selector, si.fromAddr
       FROM provisioning_tasks pt
       JOIN sender_identities si ON si.id = pt.identityId
       WHERE pt.serverId = ? AND pt.status = 'PENDING'
