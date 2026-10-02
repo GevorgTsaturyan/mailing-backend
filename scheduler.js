@@ -425,6 +425,7 @@ function planRecurringCampaigns() {
       const dispatch = CampaignRepo.create({
         type: 'recurring', date: todayUTC,
         recurring_campaign_id: campaign.id,
+        identity_id: identityId,
         label: campaign.name,
       });
       findOrCreateStats(dispatch.id);
