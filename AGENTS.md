@@ -800,6 +800,31 @@ All SQLite queries for the `servers` table's node-communication fields. Four fun
 - `recordHeartbeat(apiKey, metrics)` — validates apiKey, builds health object, calls NodeRepository.updateHeartbeat
 - `startOfflineWatcher()` — called once on startup; sets a 30 s interval that calls `markStaleOffline(90_000)`. Any node silent for 90 s gets status=offline.
 
+### ProvisioningRetryService.js — Controller-Side Provisioning Health Loop
+Runs every 5 minutes (`startProvisioningRetryService()`). Candidates: all identities with
+`provisioningStatus = 'DONE'` **plus** identities with `provisioningStatus = 'unprovisioned' AND
+verificationStatus = 'READY'` (manually configured identities that predate the controller
+pipeline — e.g. serawin.net). Two cases per identity:
+
+- **Case A** (`verificationStatus != 'READY'`): re-runs `runControllerProvisioning()` when
+  Cloudflare/DNS/nginx phases still need work (`controllerNeedsRetry(phases)`). Schedules a
+  mail-node `reverify` task (cooldown-guarded via `nextReverifyAt`) to re-evaluate DNS/DKIM/FCrDNS.
+- **Case B** (`verificationStatus = 'READY'`): strictly probes
+  `https://click.<domain>/tracking-health` and `https://unsubscribe.<domain>/unsubscribe-health`
+  via `checkControllerHostsHealthy()`. Writes result to `provisioningPhases.controllerHealth`.
+  If either host fails, re-runs the controller pipeline (idempotent heal). If both are healthy,
+  no provisioning changes are made — **no nginx/DNS/Postfix changes**. Never schedules a reverify
+  for an already-READY identity.
+
+**UI implication:** `controllerComplete()` in `Servers.vue` short-circuits to `true` when
+`provisioningPhases.controllerHealth.status === 'OK'`, clearing the amber NEEDS_ATTENTION badge.
+Manually provisioned identities (provisioningStatus = 'unprovisioned') previously caused a
+permanent false NEEDS_ATTENTION because they were excluded from the loop and controllerHealth was
+never written. The expanded candidates query fixes this.
+
+Exports: `runRetries` (injectable for tests), `controllerNeedsRetry`, `startProvisioningRetryService`.
+Tests: `provisioning-retry.test.js` (19 tests, in-memory DB, no network/CF/certbot).
+
 ### scheduler.js — Job Planner (Milestone 5: dual-queue; Milestone 6: campaign integration)
 Does NOT send email. Creates job queue rows for mail-nodes to pick up.
 
