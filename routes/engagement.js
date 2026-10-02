@@ -45,8 +45,30 @@ router.get('/campaigns', (req, res) => {
 // ── Unified engagement report ──────────────────────────────────────────────────
 router.get('/campaigns/:id/report', (req, res) => {
   const id = Number(req.params.id);
-  const campaign = findCampaign(id);
-  if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
+  if (!findCampaign(id)) return res.status(404).json({ error: 'Campaign not found' });
+
+  // Enrich campaign row with sender identity and template name.
+  // Template name source priority: scheduled_send → recurring_campaign → first job's send_log
+  const campaign = db.prepare(`
+    SELECT c.*,
+           si.fromAddr AS identity_from,
+           si.fromName AS identity_from_name,
+           si.domain   AS identity_domain,
+           COALESCE(
+             ss.templateName,
+             rc.templateName,
+             (SELECT sl.template FROM jobs j
+                JOIN send_log sl ON sl.id = j.send_log_id
+               WHERE j.campaign_id = c.id AND j.send_log_id IS NOT NULL
+               LIMIT 1)
+           ) AS template_name
+    FROM campaigns c
+    LEFT JOIN sender_identities   si ON si.id = c.identity_id
+    LEFT JOIN scheduled_sends     ss ON ss.id = c.scheduled_send_id
+    LEFT JOIN recurring_campaigns rc ON rc.id = c.recurring_campaign_id
+    WHERE c.id = ?
+  `).get(id);
+
   res.json({
     campaign,
     summary:   Engagement.campaignSummary(id),
