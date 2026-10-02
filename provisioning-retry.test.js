@@ -52,6 +52,12 @@ const phasesNeedingNginx = JSON.stringify({
   updatedAt: now,
 });
 
+// Matches what serawin.net has in production: only the verification phase is
+// present because the identity was set up before the controller pipeline existed.
+const phasesVerificationOnly = JSON.stringify({
+  verification: { status: 'READY', reasons: [], checkedAt: now },
+});
+
 function mkIdentity(domain, verificationStatus = 'NOT_READY', phasesBlob = phasesComplete) {
   return Number(db.prepare(`
     INSERT INTO sender_identities
@@ -60,6 +66,19 @@ function mkIdentity(domain, verificationStatus = 'NOT_READY', phasesBlob = phase
        provisioningPhases, dailyLimit, dailySentCount, createdAt)
     VALUES (?, ?, '1.2.3.4', ?, 'T', 'mail',
             'active', ?, 'DONE', ?, 50, 0, ?)
+  `).run(serverId, domain, `s@${domain}`, verificationStatus, phasesBlob, now).lastInsertRowid);
+}
+
+// Creates a manually-provisioned identity (provisioningStatus = 'unprovisioned'),
+// as serawin.net was set up before the controller pipeline existed.
+function mkManualIdentity(domain, verificationStatus = 'READY', phasesBlob = phasesVerificationOnly) {
+  return Number(db.prepare(`
+    INSERT INTO sender_identities
+      (serverId, domain, ip, fromAddr, fromName, dkimSelector,
+       status, verificationStatus, provisioningStatus,
+       provisioningPhases, dailyLimit, dailySentCount, createdAt)
+    VALUES (?, ?, '1.2.3.4', ?, 'T', 'mail',
+            'active', ?, 'unprovisioned', ?, 50, 0, ?)
   `).run(serverId, domain, `s@${domain}`, verificationStatus, phasesBlob, now).lastInsertRowid);
 }
 
@@ -193,6 +212,59 @@ test('Calerion-like recovery: READY + legacy (no phase blob) + broken click → 
   });
   assert.ok(calls.includes(id), 'legacy READY identity with a broken click host must be detected and healed');
   assert.equal(phasesOf(id).controllerHealth?.status, 'FAILED');
+});
+
+// ── Fix B: manually-provisioned (unprovisioned + READY) identities ────────────
+// Covers serawin.net-style identities: set up before the controller pipeline
+// existed, provisioningStatus = 'unprovisioned', verificationStatus = 'READY'.
+// Previously excluded from the retry loop → permanent false NEEDS_ATTENTION.
+
+test('PR-1: unprovisioned + READY identity IS included in health check', async () => {
+  const id = mkManualIdentity('pr1-manual.example', 'READY');
+  await run();
+  const phases = phasesOf(id);
+  assert.ok(phases.controllerHealth, 'controllerHealth must be written for unprovisioned+READY identity');
+  assert.ok(phases.controllerHealth.checkedAt, 'checkedAt must be set');
+});
+
+test('PR-2: unprovisioned + NOT_READY identity is excluded from health check', async () => {
+  const id = mkManualIdentity('pr2-notready.example', 'NOT_READY');
+  await run();
+  const phases = phasesOf(id);
+  assert.equal(phases.controllerHealth, undefined,
+    'unprovisioned+NOT_READY must not be health-checked (excluded from candidates query)');
+});
+
+test('PR-3: serawin.net scenario — unprovisioned + READY + healthy hosts → controllerHealth OK, no reprovisioning', async () => {
+  const id = mkManualIdentity('pr3-serawin.example', 'READY', phasesVerificationOnly);
+  const calls = [];
+  await run({
+    hostsHealthy: healthyProbe,
+    provisioner:  async (identity) => { calls.push(identity.id); },
+  });
+  assert.equal(phasesOf(id).controllerHealth?.status, 'OK',
+    'healthy manually-provisioned identity must get controllerHealth = OK (clears NEEDS_ATTENTION)');
+  assert.ok(!calls.includes(id),
+    'healthy manually-provisioned identity must NOT trigger controller reprovisioning');
+});
+
+test('PR-4: unprovisioned + READY + broken host → controller healing IS triggered', async () => {
+  const id = mkManualIdentity('pr4-broken.example', 'READY', phasesVerificationOnly);
+  const calls = [];
+  await run({
+    hostsHealthy: brokenClick,
+    provisioner:  async (identity) => { calls.push(identity.id); },
+  });
+  assert.ok(calls.includes(id),
+    'manually-provisioned identity with a broken click host must be passed to the controller pipeline');
+  assert.equal(phasesOf(id).controllerHealth?.status, 'FAILED');
+});
+
+test('PR-5: unprovisioned + READY identity never receives a reverify task', async () => {
+  const id = mkManualIdentity('pr5-noreverify.example', 'READY');
+  await run();
+  const task = db.prepare('SELECT id FROM provisioning_tasks WHERE identityId=?').get(id);
+  assert.equal(task, undefined, 'READY identity must never get a reverify task, regardless of provisioningStatus');
 });
 
 // ── Guards ─────────────────────────────────────────────────────────────────────

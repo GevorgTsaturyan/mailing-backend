@@ -1,7 +1,9 @@
 // ─── ProvisioningRetryService ─────────────────────────────────────────────────
 // Background service that automatically completes AND heals the controller-side
 // provisioning for every identity whose mail-node config is done
-// (provisioningStatus = 'DONE').
+// (provisioningStatus = 'DONE'), AND for identities that were manually
+// provisioned (provisioningStatus = 'unprovisioned') but have already been
+// verified by the mail-node (verificationStatus = 'READY').
 //
 // It runs every RETRY_INTERVAL_MS (5 min) and handles two distinct situations:
 //
@@ -23,6 +25,12 @@
 //    correctly, we re-run the (idempotent) controller pipeline to repair it. We
 //    NEVER schedule a mail-node reverify for an already-READY identity, and we
 //    never touch PTR (manual).
+//
+//    This case also covers manually provisioned identities (provisioningStatus =
+//    'unprovisioned') that are already READY — e.g. serawin.net, set up before
+//    the controller pipeline existed. Those identities were previously excluded
+//    from the loop entirely, causing a permanent false NEEDS_ATTENTION warning in
+//    the UI even when their tracking/unsubscribe hosts are fully operational.
 
 import db from '../db.js';
 import { isConfigured as cfConfigured } from './CloudflareService.js';
@@ -161,19 +169,24 @@ async function runRetries(opts = {}) {
   const provision     = opts.provisioner  || runControllerProvisioning;
   const hostsHealthy  = opts.hostsHealthy  || ((domain) => checkControllerHostsHealthy({ domain }));
 
-  // All DONE identities are considered. READY ones are not excluded any more —
-  // their controller-side hosts still need to be kept healthy (Fix A). The
-  // per-identity logic below decides whether any work is actually required, so
-  // healthy identities cause no provisioning churn.
+  // Include two sets of identities:
+  //  • DONE: went through the full pipeline; both in-flight (Case A) and
+  //    already-READY (Case B) variants need periodic checks.
+  //  • unprovisioned + READY: manually configured before the controller pipeline
+  //    existed (e.g. serawin.net). Their verificationStatus is READY (mail-node
+  //    confirmed) but controllerHealth was never written, causing a false
+  //    NEEDS_ATTENTION warning. Case B writes controllerHealth without touching
+  //    any infrastructure — no nginx/DNS/Postfix changes are made when healthy.
   const candidates = db.prepare(`
     SELECT id, domain, ip, dkimSelector, serverId, provisioningPhases,
            dkimPublicKey, nextReverifyAt, verificationStatus
     FROM sender_identities
     WHERE provisioningStatus = 'DONE'
+       OR (provisioningStatus = 'unprovisioned' AND verificationStatus = 'READY')
   `).all();
 
   if (candidates.length === 0) return;
-  log(`checking ${candidates.length} DONE identity(ies)`);
+  log(`checking ${candidates.length} identity(ies)`);
 
   for (const identity of candidates) {
     try { await retryIdentity(identity, provision, hostsHealthy); }
