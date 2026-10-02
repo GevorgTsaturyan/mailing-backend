@@ -415,6 +415,17 @@ function planRecurringCampaigns() {
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
+
+      // Look-ahead: if no eligible contacts remain after today's batch, mark
+      // completed now so the campaign does not sit in 'active' overnight.
+      const remaining = SendLedger.eligibleContacts({
+        sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
+        targetMode, groupIds, limit: 1,
+      });
+      if (remaining.length === 0) {
+        db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
+        console.log(`Recurring "${campaign.name}": no contacts remaining — marked completed`);
+      }
     } else {
       const identityId = campaign.sender_identity_id || null;
       const times    = randomTimesInWindow(rcStart, rcEnd, requestedCount);
@@ -438,6 +449,16 @@ function planRecurringCampaigns() {
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}): queued ${created} jobs`);
+
+      // Look-ahead: mark completed immediately if no eligible contacts remain.
+      const remaining = SendLedger.eligibleContacts({
+        sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
+        targetMode, groupIds, limit: 1,
+      });
+      if (remaining.length === 0) {
+        db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
+        console.log(`Recurring "${campaign.name}": no contacts remaining — marked completed`);
+      }
     }
   }
 }
