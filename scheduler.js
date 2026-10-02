@@ -250,8 +250,15 @@ function randomTimesInWindow(startTime, endTime, count) {
 
   if (rangeMins <= 0 || count <= 0) return [];
 
-  const now      = new Date();
+  const now     = new Date();
+  const nowMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+
+  // If the window has already fully ended today, return nothing — the midnight
+  // cron will schedule tomorrow's sends when it next runs.
+  if (nowMins >= endMins) return [];
+
   const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const nowMs    = now.getTime();
   const times    = [];
 
   for (let i = 0; i < count; i++) {
@@ -263,7 +270,8 @@ function randomTimesInWindow(startTime, endTime, count) {
     times.push(new Date(todayUTC + (h * 3600 + m * 60 + s) * 1000).toISOString());
   }
 
-  return times.sort();
+  // Drop any slots that are already in the past (partially elapsed window).
+  return times.filter(t => new Date(t).getTime() > nowMs).sort();
 }
 
 // ─── Daily batch ─────────────────────────────────────────────────────────────
@@ -302,6 +310,11 @@ function planDaySends() {
     }
 
     const times    = randomTimesInWindow(batchStart, batchEnd, count);
+    if (times.length === 0) {
+      console.log('Daily batch (canonical): send window already passed for today');
+      return;
+    }
+
     const contacts = SendLedger.eligibleContacts({
       sourceType: dbLedger.sourceType, sourceId: dbLedger.sourceId,
       targetMode, groupIds, limit: times.length,
@@ -327,7 +340,12 @@ function planDaySends() {
 
     console.log(`Daily batch (canonical): queued ${created} jobs (${batchStart}–${batchEnd} UTC)`);
   } else {
-    const times    = randomTimesInWindow(batchStart, batchEnd, cfg.batchSize);
+    const times = randomTimesInWindow(batchStart, batchEnd, cfg.batchSize);
+    if (times.length === 0) {
+      console.log('Daily batch: send window already passed for today');
+      return;
+    }
+
     const contacts = SendLedger.eligibleContacts({
       sourceType: dbLedger.sourceType, sourceId: dbLedger.sourceId,
       targetMode, groupIds, limit: times.length,
@@ -386,7 +404,13 @@ function planRecurringCampaigns() {
         continue;
       }
 
-      const times    = randomTimesInWindow(rcStart, rcEnd, count);
+      const times = randomTimesInWindow(rcStart, rcEnd, count);
+      if (times.length === 0) {
+        // Send window has already ended for today; midnight cron handles tomorrow.
+        console.log(`Recurring "${campaign.name}": send window already passed for today — will run tomorrow`);
+        continue;
+      }
+
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
         targetMode, groupIds, limit: times.length,
@@ -415,20 +439,15 @@ function planRecurringCampaigns() {
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
-
-      // Look-ahead: if no eligible contacts remain after today's batch, mark
-      // completed now so the campaign does not sit in 'active' overnight.
-      const remaining = SendLedger.eligibleContacts({
-        sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
-        targetMode, groupIds, limit: 1,
-      });
-      if (remaining.length === 0) {
-        db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
-        console.log(`Recurring "${campaign.name}": no contacts remaining — marked completed`);
-      }
     } else {
       const identityId = campaign.sender_identity_id || null;
-      const times    = randomTimesInWindow(rcStart, rcEnd, requestedCount);
+      const times      = randomTimesInWindow(rcStart, rcEnd, requestedCount);
+      if (times.length === 0) {
+        // Send window has already ended for today; midnight cron handles tomorrow.
+        console.log(`Recurring "${campaign.name}": send window already passed for today — will run tomorrow`);
+        continue;
+      }
+
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
         targetMode, groupIds, limit: times.length,
@@ -449,16 +468,6 @@ function planRecurringCampaigns() {
         .run(todayUTC, campaign.currentDay + 1, campaign.id);
 
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}): queued ${created} jobs`);
-
-      // Look-ahead: mark completed immediately if no eligible contacts remain.
-      const remaining = SendLedger.eligibleContacts({
-        sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
-        targetMode, groupIds, limit: 1,
-      });
-      if (remaining.length === 0) {
-        db.prepare("UPDATE recurring_campaigns SET status='completed' WHERE id=?").run(campaign.id);
-        console.log(`Recurring "${campaign.name}": no contacts remaining — marked completed`);
-      }
     }
   }
 }
