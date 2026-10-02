@@ -85,6 +85,21 @@ router.get('/campaigns/:id/report', (req, res) => {
   });
 });
 
+// ── Delete campaign (cascade: stats, events, buttons, job links) ───────────────
+router.delete('/campaigns/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!findCampaign(id)) return res.status(404).json({ error: 'Campaign not found' });
+  db.transaction(() => {
+    db.prepare('DELETE FROM click_events    WHERE campaign_id = ?').run(id);
+    db.prepare('DELETE FROM open_events     WHERE campaign_id = ?').run(id);
+    db.prepare('DELETE FROM campaign_buttons WHERE campaign_id = ?').run(id);
+    db.prepare('DELETE FROM campaign_stats  WHERE campaign_id = ?').run(id);
+    db.prepare('UPDATE jobs SET campaign_id = NULL WHERE campaign_id = ?').run(id);
+    db.prepare('DELETE FROM campaigns WHERE id = ?').run(id);
+  })();
+  res.json({ deleted: id });
+});
+
 router.get('/campaigns/:id/buttons', (req, res) => {
   const id = Number(req.params.id);
   if (!findCampaign(id)) return res.status(404).json({ error: 'Campaign not found' });
