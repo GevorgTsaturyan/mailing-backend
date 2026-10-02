@@ -262,13 +262,25 @@ function randomTimesInWindow(startTime, endTime, count) {
   const nowMs    = now.getTime();
   const times    = [];
 
-  for (let i = 0; i < count; i++) {
-    const offset  = Math.floor(Math.random() * rangeMins);
-    const totalM  = startMins + offset;
-    const h       = Math.floor(totalM / 60);
-    const m       = totalM % 60;
-    const s       = Math.floor(Math.random() * 60);
-    times.push(new Date(todayUTC + (h * 3600 + m * 60 + s) * 1000).toISOString());
+  // Split the window into 60-minute buckets and distribute count evenly.
+  // Leftover emails go to the first buckets so every email has a slot.
+  const numBuckets    = Math.ceil(rangeMins / 60);
+  const basePerBucket = Math.floor(count / numBuckets);
+  let   extra         = count % numBuckets;
+
+  for (let b = 0; b < numBuckets; b++) {
+    const bucketStart = startMins + b * 60;
+    const bucketEnd   = Math.min(bucketStart + 60, endMins);
+    const bucketCount = basePerBucket + (extra-- > 0 ? 1 : 0);
+
+    for (let i = 0; i < bucketCount; i++) {
+      const offset = Math.floor(Math.random() * (bucketEnd - bucketStart));
+      const totalM = bucketStart + offset;
+      const h      = Math.floor(totalM / 60);
+      const m      = totalM % 60;
+      const s      = Math.floor(Math.random() * 60);
+      times.push(new Date(todayUTC + (h * 3600 + m * 60 + s) * 1000).toISOString());
+    }
   }
 
   // Drop any slots that are already in the past (partially elapsed window).
