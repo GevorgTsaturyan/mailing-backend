@@ -662,4 +662,10 @@ db.exec(`
     ON inbound_messages(from_address);
 `);
 
+// ─── Identity selection for scheduled sends and recurring campaigns ───────────
+// Lets the operator pin a specific sender identity per campaign / scheduled send.
+// NULL means "auto-pick" (pickActiveIdentity() at run time, as before).
+try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN sender_identity_id INTEGER REFERENCES sender_identities(id)") } catch {}
+try { db.exec("ALTER TABLE scheduled_sends   ADD COLUMN sender_identity_id INTEGER REFERENCES sender_identities(id)") } catch {}
+
 export default db;

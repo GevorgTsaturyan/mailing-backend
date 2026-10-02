@@ -38,7 +38,7 @@ router.get('/:id', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { label, contactIds, groupIds, templateName, subject, html, txt, scheduledAt, content_type } = req.body;
+  const { label, contactIds, groupIds, templateName, subject, html, txt, scheduledAt, content_type, senderIdentityId } = req.body;
 
   // Resolve groups to member ids AT CREATION TIME and snapshot the distinct union
   // of explicit contactIds + group members. The snapshot is fixed once stored —
@@ -55,10 +55,14 @@ router.post('/', (req, res) => {
   if (content_type != null && content_type !== 'html' && content_type !== 'text')
     return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
+  const identityId = senderIdentityId
+    ? (db.prepare('SELECT id FROM sender_identities WHERE id=? AND status=?').get(senderIdentityId, 'active')?.id ?? null)
+    : null;
+
   const result = db.prepare(`
     INSERT INTO scheduled_sends
-      (label, contactIds, templateName, subject, html, txt, content_type, scheduledAt, status, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      (label, contactIds, templateName, subject, html, txt, content_type, scheduledAt, status, sender_identity_id, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
   `).run(
     label || null,
     JSON.stringify(snapshot),
@@ -68,6 +72,7 @@ router.post('/', (req, res) => {
     txt || null,
     content_type || 'html',
     scheduledAt,
+    identityId,
     new Date().toISOString()
   );
 

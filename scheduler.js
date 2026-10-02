@@ -344,7 +344,7 @@ function planRecurringCampaigns() {
     const rcLedger   = { sourceType: 'recurring', sourceId: campaign.id };
 
     if (useCanonicalQueue()) {
-      const identityId = pickActiveIdentity();
+      const identityId = campaign.sender_identity_id || pickActiveIdentity();
       if (!identityId) continue;
 
       const capacity = getIdentityRemainingCapacity(identityId);
@@ -385,6 +385,7 @@ function planRecurringCampaigns() {
 
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
     } else {
+      const identityId = campaign.sender_identity_id || null;
       const times    = randomTimesInWindow(campaign.startTime, campaign.endTime, requestedCount);
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
@@ -399,7 +400,7 @@ function planRecurringCampaigns() {
 
       let created = 0;
       for (let i = 0; i < contacts.length; i++) {
-        if (queueJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, null, rcLedger)) created++;
+        if (queueJobForContact(contacts[i], campaign.templateName, templateContent, times[i], null, identityId, rcLedger)) created++;
       }
 
       db.prepare('UPDATE recurring_campaigns SET lastRunDate=?, currentDay=? WHERE id=?')
@@ -442,7 +443,7 @@ function checkScheduledSends() {
         .run(new Date().toISOString(), task.id);
 
       if (useCanonicalQueue()) {
-        const identityId = pickActiveIdentity();
+        const identityId = task.sender_identity_id || pickActiveIdentity();
         let capacity = identityId ? getIdentityRemainingCapacity(identityId) : 0;
 
         const todayUTC = new Date().toISOString().slice(0, 10);

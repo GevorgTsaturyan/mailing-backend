@@ -38,7 +38,7 @@ router.get('/', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds } = req.body;
+  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds, senderIdentityId } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!templateName && !subject) return res.status(400).json({ error: 'templateName or subject required' });
   if (content_type != null && content_type !== 'html' && content_type !== 'text')
@@ -47,18 +47,22 @@ router.post('/', (req, res) => {
   const targetingError = validateTargeting(targetMode, groupIds);
   if (targetingError) return res.status(400).json({ error: targetingError });
 
+  const identityId = senderIdentityId
+    ? (db.prepare('SELECT id FROM sender_identities WHERE id=? AND status=?').get(senderIdentityId, 'active')?.id ?? null)
+    : null;
+
   const id = db.transaction(() => {
     const result = db.prepare(`
       INSERT INTO recurring_campaigns
-        (name, templateName, subject, html, txt, content_type, startTime, endTime, initialCount, increasePercent, status, currentDay, target_mode, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?)
+        (name, templateName, subject, html, txt, content_type, startTime, endTime, initialCount, increasePercent, status, currentDay, target_mode, sender_identity_id, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?)
     `).run(
       name,
       templateName || null, subject || null, html || null, txt || null,
       content_type || 'html',
       startTime || '09:00', endTime || '17:00',
       initialCount || 10, increasePercent || 0,
-      targetMode,
+      targetMode, identityId,
       new Date().toISOString()
     );
     const cid = result.lastInsertRowid;
@@ -75,7 +79,7 @@ router.put('/:id', (req, res) => {
   const row = db.prepare('SELECT * FROM recurring_campaigns WHERE id=?').get(id);
   if (!row) return res.status(404).json({ error: 'Not found' });
 
-  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds } = req.body;
+  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds, senderIdentityId } = req.body;
 
   if (content_type != null && content_type !== 'html' && content_type !== 'text')
     return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
@@ -89,11 +93,15 @@ router.put('/:id', (req, res) => {
   const targetingError = validateTargeting(nextMode, nextGroups);
   if (targetingError) return res.status(400).json({ error: targetingError });
 
+  const nextIdentityId = senderIdentityId !== undefined
+    ? (senderIdentityId ? (db.prepare('SELECT id FROM sender_identities WHERE id=? AND status=?').get(senderIdentityId, 'active')?.id ?? null) : null)
+    : row.sender_identity_id;
+
   db.transaction(() => {
     db.prepare(`
       UPDATE recurring_campaigns
       SET name=?, templateName=?, subject=?, html=?, txt=?, content_type=?,
-          startTime=?, endTime=?, initialCount=?, increasePercent=?, target_mode=?
+          startTime=?, endTime=?, initialCount=?, increasePercent=?, target_mode=?, sender_identity_id=?
       WHERE id=?
     `).run(
       name          ?? row.name,
@@ -106,7 +114,7 @@ router.put('/:id', (req, res) => {
       endTime       ?? row.endTime,
       initialCount  ?? row.initialCount,
       increasePercent ?? row.increasePercent,
-      nextMode,
+      nextMode, nextIdentityId,
       id
     );
     // Rewrite membership when mode/groups change; 'all' clears any stale rows.
