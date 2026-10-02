@@ -62,17 +62,20 @@ function sanitizeHtml(html) {
     stripIgnoreTagBody: ['script', 'noscript', 'iframe', 'object', 'embed', 'form'],
 
     onTagAttr: (tag, name, value) => {
-      // Validate href: only allow safe schemes; reject javascript:, data:, vbscript:
+      // Validate href: only allow safe schemes; reject javascript:, data:, vbscript:.
+      // Return the attribute explicitly rather than `undefined` — xss default URL filter
+      // strips cid: and other non-http(s) schemes even when we intend to allow them.
       if (tag === 'a' && name === 'href') {
         const v = value.trim().toLowerCase();
-        if (/^(https?:|mailto:|cid:|#)/.test(v)) return undefined; // default processing (keep)
+        if (/^(https?:|mailto:|cid:|#)/.test(v)) return `href="${value}"`;
         return '';  // strip unsafe href
       }
 
-      // Validate img src: only http/https/cid/data:image/
+      // Validate img src: only http/https/cid/data:image/.
+      // Explicit return required: xss default strips cid: values silently.
       if (tag === 'img' && name === 'src') {
         const v = value.trim().toLowerCase();
-        if (/^(https?:|cid:|data:image\/)/.test(v)) return undefined; // keep
+        if (/^(https?:|cid:|data:image\/)/.test(v)) return `src="${value}"`;
         return 'src=""';  // blank out unsafe src
       }
     },
