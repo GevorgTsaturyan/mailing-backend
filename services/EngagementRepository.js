@@ -121,9 +121,11 @@ export function buttonRows(campaignId) {
 export function listCampaigns(limit = 100) {
   return db.prepare(`
     SELECT c.id, c.type, c.label, c.status, c.date, c.created_at,
-           s.total_sent, s.total_delivered
+           s.total_sent, s.total_delivered,
+           si.fromAddr AS identity_from, si.domain AS identity_domain
     FROM campaigns c
-    LEFT JOIN campaign_stats s ON s.campaign_id = c.id
+    LEFT JOIN campaign_stats s  ON s.campaign_id = c.id
+    LEFT JOIN sender_identities si ON si.id = c.identity_id
     ORDER BY c.id DESC
     LIMIT ?
   `).all(limit);
