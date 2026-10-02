@@ -31,6 +31,7 @@ import trackRouter              from './routes/track.js';
 import buttonsRouter            from './routes/buttons.js';
 import engagementRouter         from './routes/engagement.js';
 import inboxRouter              from './routes/inbox.js';
+import dashboardRouter          from './routes/dashboard.js';
 import { cancelOutstandingJobsForContact } from './services/SuppressionService.js';
 import { requireAuth } from './middleware/auth.js';
 import { initScheduler } from './scheduler.js';
@@ -138,6 +139,7 @@ app.use('/api/admin',                adminRouter);
 app.use('/api/buttons',              buttonsRouter);
 app.use('/api/engagement',           engagementRouter);
 app.use('/api/inbox',                inboxRouter);
+app.use('/api/dashboard',            dashboardRouter);
 
 seedDevData();
 
