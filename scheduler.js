@@ -234,9 +234,10 @@ function localHHMMtoUTC(hhmm, timezone) {
   }).formatToParts(probe);
   const probeH = Number(parts.find(p => p.type === 'hour').value);
   const probeM = Number(parts.find(p => p.type === 'minute').value);
-  // Shift probe by the difference so the result gives h:m in the timezone
-  const diffMs = ((h * 60 + m) - (probeH * 60 + probeM)) * 60000;
-  return new Date(probe.getTime() - diffMs).toISOString().slice(11, 16);
+  // Correction: shift probe so that the local time in timezone becomes h:m.
+  // corrMs = how much local time needs to change → UTC shifts by the same amount.
+  const corrMs = ((h * 60 + m) - (probeH * 60 + probeM)) * 60000;
+  return new Date(probe.getTime() + corrMs).toISOString().slice(11, 16);
 }
 
 // ─── Random timestamps in a UTC window (returns sorted ISO strings) ───────────
