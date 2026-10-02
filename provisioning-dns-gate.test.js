@@ -38,7 +38,7 @@ function mkIdentity(domain) {
 // Dependency builders --------------------------------------------------------
 const cfConfiguredTrue  = () => true;
 const cfConfiguredFalse = () => false;
-const cfOk   = async () => ({ ok: true,  phases: { a_mail:{status:'OK'}, spf:{status:'OK'}, dkim:{status:'OK'}, dmarc:{status:'OK'}, a_unsubscribe:{status:'OK'}, a_click:{status:'OK'} } });
+const cfOk   = async () => ({ ok: true,  phases: { a_mail:{status:'OK'}, mx:{status:'OK'}, spf:{status:'OK'}, dkim:{status:'OK'}, dmarc:{status:'OK'}, a_unsubscribe:{status:'OK'}, a_click:{status:'OK'} } });
 const cfThrow = async () => { throw new Error('Cloudflare API 500'); };
 
 const dnsResolves    = async () => ({ ok: true,  hosts: { unsubscribe:{resolves:true, matches:true,  addresses:['45.32.235.159']}, click:{resolves:true, matches:true, addresses:['45.32.235.159']} } });

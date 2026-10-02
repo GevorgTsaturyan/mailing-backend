@@ -800,6 +800,25 @@ All SQLite queries for the `servers` table's node-communication fields. Four fun
 - `recordHeartbeat(apiKey, metrics)` — validates apiKey, builds health object, calls NodeRepository.updateHeartbeat
 - `startOfflineWatcher()` — called once on startup; sets a 30 s interval that calls `markStaleOffline(90_000)`. Any node silent for 90 s gets status=offline.
 
+### CloudflareService.js — DNS Provisioning (CF API)
+`provisionDns({ domain, ip, selector, dkimPublicKey, controllerIp })` — creates/verifies all
+DNS records for a sender identity via the Cloudflare API. All operations are idempotent.
+Returns `{ ok, phases, skipped? }`. When `CF_API_TOKEN` is unset, returns `ok:false, skipped:true`.
+
+**Call order and phase keys:**
+1. `a_mail` — `A mail.<domain> → <ip>` (absent→create, correct→skip, wrong→update)
+2. `mx` — `MX <domain> 10 mail.<domain>` (absent→create, correct→skip, wrong host/priority→update)
+3. `spf` — `TXT <domain>` v=spf1 (absent→create, ip missing→merge, 2+ records→FAIL)
+4. `dkim` — `TXT <sel>._domainkey.<domain>` (absent→create, same→skip, different→FAIL — never overwrite)
+5. `dmarc` — `TXT _dmarc.<domain>` (absent→create p=none, existing→preserve — never overwrite)
+6. `a_unsubscribe` — `A unsubscribe.<domain> → <controllerIp>` (only if controllerIp provided)
+7. `a_click` — `A click.<domain> → <controllerIp>` (only if controllerIp provided)
+
+`ok=false` when any phase is FAILED or PENDING (DKIM key not yet available).
+`cloudflare.phases.mx` failing blocks the READY badge in `controllerComplete()` (Servers.vue) —
+the identity stays NEEDS_ATTENTION until MX is confirmed, preventing sending with a broken inbound path.
+Tests: `cloudflare.test.js` (30 tests, mocked fetch, no real CF calls).
+
 ### ProvisioningRetryService.js — Controller-Side Provisioning Health Loop
 Runs every 5 minutes (`startProvisioningRetryService()`). Candidates: all identities with
 `provisioningStatus = 'DONE'` **plus** identities with `provisioningStatus = 'unprovisioned' AND

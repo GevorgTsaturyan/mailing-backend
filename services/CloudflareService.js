@@ -6,6 +6,8 @@
 //
 // Rules enforced by each operation:
 //   A record:   absent→create, correct→skip, wrong→update
+//   MX record:  absent→create (priority 10 mail.<domain>), correct→skip,
+//               wrong host/priority→update (reconcile to expected)
 //   SPF:        absent→create, 1 record+ip→skip, 1 record−ip→merge,
 //               2+ records→fail (RFC violation, manual fix required)
 //   DKIM TXT:   absent→create, identical→skip, different→fail (never overwrite)
@@ -77,6 +79,30 @@ async function ensureARecord(zoneId, fqdn, targetIp) {
   }
   await patchRecord(zoneId, rec.id, 'A', fqdn, targetIp);
   return { status: 'OK', message: `A ${fqdn} → ${targetIp} (updated from ${rec.content})` };
+}
+
+async function ensureMX(zoneId, domain, priority = 10) {
+  const mailHost = `mail.${domain}`;
+  const records  = await listRecords(zoneId, 'MX', domain);
+
+  if (records.length === 0) {
+    await cfFetch('POST', `/zones/${zoneId}/dns_records`, {
+      type: 'MX', name: domain, content: mailHost, priority, proxied: false, ttl: 1,
+    });
+    return { status: 'OK', message: `MX ${domain} 10 ${mailHost} (created)` };
+  }
+
+  const correct = records.find(r => r.content === mailHost && Number(r.priority) === priority);
+  if (correct) {
+    return { status: 'SKIPPED', message: `MX ${domain} 10 ${mailHost} (already correct)` };
+  }
+
+  // Reconcile: wrong host or wrong priority — update the first record
+  const rec = records[0];
+  await cfFetch('PATCH', `/zones/${zoneId}/dns_records/${rec.id}`, {
+    type: 'MX', name: domain, content: mailHost, priority, proxied: false, ttl: 1,
+  });
+  return { status: 'OK', message: `MX ${domain} 10 ${mailHost} (updated from ${rec.content})` };
 }
 
 async function ensureSPF(zoneId, domain, ip) {
@@ -183,6 +209,7 @@ export async function provisionDns({ domain, ip, selector, dkimPublicKey, contro
   }
 
   await run('a_mail',        () => ensureARecord(zoneId, `mail.${domain}`, ip));
+  await run('mx',            () => ensureMX(zoneId, domain));
   await run('spf',           () => ensureSPF(zoneId, domain, ip));
   await run('dkim',          () => ensureDKIM(zoneId, domain, selector, dkimPublicKey));
   await run('dmarc',         () => ensureDMARC(zoneId, domain));
