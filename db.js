@@ -603,4 +603,63 @@ db.exec(`
 try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN target_mode TEXT NOT NULL DEFAULT 'all'") } catch {}
 try { db.exec("ALTER TABLE schedule_config     ADD COLUMN target_mode TEXT NOT NULL DEFAULT 'all'") } catch {}
 
+// ─── Inbound messages (Inbox / Replies feature) ───────────────────────────────
+//
+// Stores parsed emails received by the mail-node and pushed to the controller.
+// The mail-node scans /var/vmail/*/new/ (Maildir), parses each message with
+// mailparser, and POSTs batches to POST /api/nodes/inbound-messages.
+//
+// Deduplication: UNIQUE index on message_id (RFC Message-ID header). Rows with
+// null message_id are not deduplicated at DB level (but the Maildir move-to-cur
+// ensures each file is submitted exactly once per mail-node).
+//
+// HTML safety: html_body is sanitized with xss before storage; the frontend renders
+// with v-html safely.
+//
+// Threading (future): in_reply_to / references columns are stored for future
+// correlation with outbound jobs — not yet matched, but available.
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS inbound_messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id      TEXT,
+    from_address    TEXT NOT NULL DEFAULT '',
+    from_name       TEXT,
+    to_address      TEXT NOT NULL DEFAULT '',
+    reply_to        TEXT,
+    subject         TEXT NOT NULL DEFAULT '',
+    text_body       TEXT,
+    html_body       TEXT,
+    received_at     TEXT NOT NULL,
+    is_read         INTEGER NOT NULL DEFAULT 0,
+    read_at         TEXT,
+    mailbox         TEXT NOT NULL DEFAULT '',
+    domain          TEXT NOT NULL DEFAULT '',
+    in_reply_to     TEXT,
+    msg_references  TEXT,
+    server_id       INTEGER NOT NULL DEFAULT 0,
+    snippet         TEXT,
+    has_attachments INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_messages_message_id
+    ON inbound_messages(message_id) WHERE message_id IS NOT NULL;
+
+  CREATE INDEX IF NOT EXISTS idx_inbound_messages_mailbox
+    ON inbound_messages(mailbox);
+
+  CREATE INDEX IF NOT EXISTS idx_inbound_messages_domain
+    ON inbound_messages(domain);
+
+  CREATE INDEX IF NOT EXISTS idx_inbound_messages_is_read
+    ON inbound_messages(is_read);
+
+  CREATE INDEX IF NOT EXISTS idx_inbound_messages_received_at
+    ON inbound_messages(received_at DESC);
+
+  CREATE INDEX IF NOT EXISTS idx_inbound_messages_from_address
+    ON inbound_messages(from_address);
+`);
+
 export default db;

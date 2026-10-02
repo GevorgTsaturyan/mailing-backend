@@ -58,6 +58,7 @@ backend/
     nodes.js                # Node API thin handlers: delegates register/heartbeat to services
                             #   Also: GET /provisioning-task (poll+claim) + POST /provisioning-task/:id/result
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
+    inbox.js                # Inbound message API (/api/inbox list/get/read/unread/stats) — JWT required
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   scripts/
     provision-identity-hosts.sh          # Idempotent: provisions nginx + Let's Encrypt for unsubscribe.<domain> AND click.<domain>
@@ -75,6 +76,7 @@ backend/
                                  #   domain-aware. getReadyDomains() returns Set<domain> for PollingService SQL filter. Probe:
                                  #   https://unsubscribe.<domain>/unsubscribe-health with hairpin-NAT fallback.
     SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact/suppressionExclusionSql
+    InboxRepository.js      # DB layer for inbound_messages: insertMessage (HTML sanitized + dedup), listMessages (no body columns), getMessage, markRead/Unread, getUnreadCount
     GroupRepository.js      # DB layer for contact groups: CRUD, membership, contactIdsInGroups (union), usages (deletion guard)
     SendLedger.js           # Per-campaign de-dup ledger: record, eligibleContacts (target_mode/groups + suppression), runBackfillOnce; DAILY_BATCH_SOURCE_ID
     ProvisioningService.js  # Applies node provisioning reports to sender_identities.verificationStatus (ownership-checked, safe metadata only)
@@ -108,6 +110,7 @@ backend/
   groups-targeting.test.js  # target_mode config + group deletion safety (409 / detach) (both queue modes)
   admin-provision.test.js   # POST /api/admin/provision-identity: auth, validation, injection prevention, execFile args
   provisioning-task.test.js # Automated provisioning task flow: poll+claim, result DONE/FAILED, JWT provision trigger, idempotency
+  inbox.test.js             # 30 tests (INBOX-A..Z5): node POST inbound-messages + JWT inbox CRUD, dedup, filters, pagination, read/unread, HTML sanitization
 ```
 
 > Run the suite in **both** queue modes: `npm test` (legacy) and `USE_CANONICAL_QUEUE=true npm test` (canonical).
@@ -218,6 +221,20 @@ verifies — mail never ships a dead `List-Unsubscribe` endpoint. Domain A's rea
 affects Domain B. Withheld jobs stay PENDING/queued and dispatch resumes automatically.
 Raw jobs (no contact, no unsubscribe URL) are never gated. Dev/test escape hatch:
 `UNSUBSCRIBE_REQUIRE_READY=false`. Tests: `unsubscribe-readiness.test.js`.
+
+### Inbox (JWT required — `/api/inbox/*`)
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/api/inbox` | List messages. Query: `page`, `limit` (max 100), `domain`, `mailbox`, `is_read` (0/1), `search`. Returns `{messages[], total, page, limit}` (no body columns in list) |
+| GET | `/api/inbox/stats` | `{unread}` count. Optional `domain`/`mailbox` filter |
+| GET | `/api/inbox/:id` | Full message including `text_body`, `html_body` (sanitized), headers |
+| PATCH | `/api/inbox/:id/read` | Mark read; returns `{ok}` |
+| PATCH | `/api/inbox/:id/unread` | Mark unread; returns `{ok}` |
+
+### Node — Inbound Messages (apiKey auth)
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/nodes/inbound-messages` | Body: `{ apiKey, messages[] }`. Authenticates by apiKey. Inserts each message via `insertMessage` (dedup by message_id). Returns `{ok, inserted, duplicates, errors}` |
 
 ### Auth
 | Method | Path | Body | Response |
@@ -587,6 +604,33 @@ schedule_config.target_mode     TEXT NOT NULL DEFAULT 'all'  -- 'all' | 'groups'
 
 -- One-time migration marker (SendLedger.runBackfillOnce):
 schema_migrations ( name TEXT PK, ran_at TEXT NOT NULL )
+
+-- Inbound messages received by mail-nodes (Dovecot LMTP delivery):
+inbound_messages (
+  id              INTEGER PK,
+  message_id      TEXT,          -- RFC 2822 Message-ID (nullable; not all mail has one)
+  from_address    TEXT NOT NULL DEFAULT '',
+  from_name       TEXT,
+  to_address      TEXT NOT NULL DEFAULT '',
+  reply_to        TEXT,
+  subject         TEXT NOT NULL DEFAULT '',
+  text_body       TEXT,          -- plain-text part (or text extracted from HTML-only emails)
+  html_body       TEXT,          -- sanitized HTML (xss filterXSS; scripts/iframes stripped)
+  received_at     TEXT NOT NULL, -- from parsed email headers
+  is_read         INTEGER NOT NULL DEFAULT 0,
+  read_at         TEXT,
+  mailbox         TEXT NOT NULL DEFAULT '',  -- e.g. support@calerion.org
+  domain          TEXT NOT NULL DEFAULT '',  -- calerion.org (derived from mailbox)
+  in_reply_to     TEXT,
+  msg_references  TEXT,          -- NOTE: 'references' is a SQLite reserved word → renamed
+  server_id       INTEGER NOT NULL DEFAULT 0,  -- FK→servers (which mail-node delivered this)
+  snippet         TEXT,          -- first 200 chars of plain text; used in list view
+  has_attachments INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL
+)
+-- Indexes:
+--   UNIQUE partial: idx_inbound_messages_message_id ON (message_id) WHERE message_id IS NOT NULL
+--   idx_inbound_messages_mailbox, _domain, _is_read, _received_at DESC, _from_address
 ```
 
 ---
@@ -642,6 +686,29 @@ zero groups, and deletes. Completed recurring campaigns and one-off/manual sends
 ---
 
 ## Services
+
+### InboxRepository.js — DB Layer for Inbound Messages
+
+All SQLite queries for `inbound_messages`. Handles HTML sanitization, deduplication, and
+server-side filtering/pagination.
+
+**HTML sanitization (`sanitizeHtml`):** runs on every `html_body` at insert time (before storage).
+Uses `xss` `filterXSS` with an email-safe tag/attribute allowlist (html, head, body, table layout
+tags, a, img, font, etc.). Strips `script`, `noscript`, `iframe`, `object`, `embed`, `form` and
+their bodies. Validates `href` (allows only `http:`, `https:`, `mailto:`, `cid:`, `#`; strips
+others). Validates `img src` (allows `http:`, `https:`, `cid:`, `data:image/`). Post-processes to
+add `target="_blank" rel="noopener noreferrer"` to every `<a>` tag. Returns `null` for null input.
+
+**Functions:**
+- `insertMessage(serverId, msg)` — checks for existing `message_id` (dedup), sanitizes `html_body`,
+  derives `domain` from `mailbox`, computes `snippet` from text body, inserts. Returns `{ id, duplicate }`.
+- `listMessages({ page, limit, domain, mailbox, is_read, search })` — dynamic WHERE, ORDER BY
+  `received_at DESC`. SELECT excludes `text_body` / `html_body` (large columns omitted from list view).
+  Returns `{ messages, total, page, limit }`.
+- `getMessage(id)` — `SELECT *` including full body columns; returns `null` if not found.
+- `markRead(id)` — sets `is_read=1`, `read_at=now`.
+- `markUnread(id)` — sets `is_read=0`, `read_at=NULL`.
+- `getUnreadCount({ domain?, mailbox? })` — COUNT with optional domain/mailbox filter.
 
 ### JobRepository.js — DB Layer for Jobs
 All SQLite queries for the `jobs` table. Six functions:

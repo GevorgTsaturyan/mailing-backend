@@ -10,6 +10,7 @@ import { isSignerHealthy } from '../services/NodeRepository.js';
 import { allowDispatch as unsubscribeHostAllowsDispatch } from '../services/UnsubscribeHostReadiness.js';
 import { mergePhases } from '../services/ProvisioningPhaseStore.js';
 import { runControllerProvisioning } from '../services/ControllerProvisioningService.js';
+import { insertMessage } from '../services/InboxRepository.js';
 
 const router = express.Router();
 
@@ -344,6 +345,35 @@ router.post('/delivery-events', (req, res) => {
 
   const { processed, skipped } = processEvents(events);
   res.json({ ok: true, processed, skipped });
+});
+
+// ─── POST /api/nodes/inbound-messages ────────────────────────────────────────
+// Mail-node submits batches of parsed inbound emails received in /var/vmail.
+// Authenticated by apiKey (same mechanism as all other node endpoints).
+// Idempotent: duplicate message_ids are silently ignored.
+// HTML bodies are sanitized by InboxRepository before storage.
+router.post('/inbound-messages', (req, res) => {
+  const { apiKey, messages } = req.body;
+  const server = getServer(apiKey);
+  if (!server) return res.status(401).json({ error: 'Invalid apiKey' });
+  if (!Array.isArray(messages)) return res.status(400).json({ error: 'messages array required' });
+  touch(server.id);
+
+  let inserted = 0, duplicates = 0, errors = 0;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') { errors++; continue; }
+    if (!msg.to_address && !msg.mailbox) { errors++; continue; }
+    try {
+      const result = insertMessage(server.id, msg);
+      if (result.duplicate) duplicates++;
+      else                  inserted++;
+    } catch (err) {
+      console.error('[inbound-messages] insert error:', err.message);
+      errors++;
+    }
+  }
+
+  res.json({ ok: true, inserted, duplicates, errors });
 });
 
 export default router;
