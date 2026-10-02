@@ -216,6 +216,29 @@ function getIdentityRemainingCapacity(identityId) {
   return row ? Math.max(0, row.dailyLimit - row.dailySentCount) : 0;
 }
 
+// ─── Timezone-aware local→UTC conversion ─────────────────────────────────────
+// Converts "HH:MM" in the given IANA timezone to "HH:MM" UTC for today.
+// Uses Intl (built-in, no deps) with the probe-and-correct technique so DST is
+// handled correctly on every day this runs.
+// If timezone is absent or 'UTC' the input is returned unchanged.
+function localHHMMtoUTC(hhmm, timezone) {
+  if (!timezone || timezone === 'UTC') return hhmm;
+  const [h, m] = hhmm.split(':').map(Number);
+  // Today's date in the target timezone (sv locale gives "YYYY-MM-DD")
+  const todayInTz = new Intl.DateTimeFormat('sv', { timeZone: timezone }).format(new Date());
+  const [y, mo, d] = todayInTz.split('-').map(Number);
+  // Probe: treat h:m as UTC and see what local time that gives in the timezone
+  const probe = new Date(Date.UTC(y, mo - 1, d, h, m));
+  const parts = new Intl.DateTimeFormat('en', {
+    timeZone: timezone, hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(probe);
+  const probeH = Number(parts.find(p => p.type === 'hour').value);
+  const probeM = Number(parts.find(p => p.type === 'minute').value);
+  // Shift probe by the difference so the result gives h:m in the timezone
+  const diffMs = ((h * 60 + m) - (probeH * 60 + probeM)) * 60000;
+  return new Date(probe.getTime() - diffMs).toISOString().slice(11, 16);
+}
+
 // ─── Random timestamps in a UTC window (returns sorted ISO strings) ───────────
 
 function randomTimesInWindow(startTime, endTime, count) {
@@ -263,6 +286,10 @@ function planDaySends() {
   const groupIds   = targetMode === 'groups' ? dailyBatchGroupIds() : [];
   const dbLedger   = { sourceType: 'daily_batch', sourceId: DAILY_BATCH_SOURCE_ID };
 
+  const batchTZ    = cfg.timezone || 'UTC';
+  const batchStart = localHHMMtoUTC(cfg.startTime, batchTZ);
+  const batchEnd   = localHHMMtoUTC(cfg.endTime,   batchTZ);
+
   if (useCanonicalQueue()) {
     const identityId = pickActiveIdentity();
     if (!identityId) return;
@@ -274,7 +301,7 @@ function planDaySends() {
       return;
     }
 
-    const times    = randomTimesInWindow(cfg.startTime, cfg.endTime, count);
+    const times    = randomTimesInWindow(batchStart, batchEnd, count);
     const contacts = SendLedger.eligibleContacts({
       sourceType: dbLedger.sourceType, sourceId: dbLedger.sourceId,
       targetMode, groupIds, limit: times.length,
@@ -298,9 +325,9 @@ function planDaySends() {
     }
     if (created > 0) incrementJobs(dispatch.id, created);
 
-    console.log(`Daily batch (canonical): queued ${created} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
+    console.log(`Daily batch (canonical): queued ${created} jobs (${batchStart}–${batchEnd} UTC)`);
   } else {
-    const times    = randomTimesInWindow(cfg.startTime, cfg.endTime, cfg.batchSize);
+    const times    = randomTimesInWindow(batchStart, batchEnd, cfg.batchSize);
     const contacts = SendLedger.eligibleContacts({
       sourceType: dbLedger.sourceType, sourceId: dbLedger.sourceId,
       targetMode, groupIds, limit: times.length,
@@ -311,7 +338,7 @@ function planDaySends() {
       if (queueJobForContact(contacts[i], cfg.template, null, times[i], null, null, dbLedger)) created++;
     }
 
-    console.log(`Daily batch: queued ${created} jobs (${cfg.startTime}–${cfg.endTime} UTC)`);
+    console.log(`Daily batch: queued ${created} jobs (${batchStart}–${batchEnd} UTC)`);
   }
 }
 
@@ -343,6 +370,10 @@ function planRecurringCampaigns() {
       : [];
     const rcLedger   = { sourceType: 'recurring', sourceId: campaign.id };
 
+    const rcTZ    = campaign.timezone || 'UTC';
+    const rcStart = localHHMMtoUTC(campaign.startTime, rcTZ);
+    const rcEnd   = localHHMMtoUTC(campaign.endTime,   rcTZ);
+
     if (useCanonicalQueue()) {
       const identityId = campaign.sender_identity_id || pickActiveIdentity();
       if (!identityId) continue;
@@ -355,7 +386,7 @@ function planRecurringCampaigns() {
         continue;
       }
 
-      const times    = randomTimesInWindow(campaign.startTime, campaign.endTime, count);
+      const times    = randomTimesInWindow(rcStart, rcEnd, count);
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
         targetMode, groupIds, limit: times.length,
@@ -386,7 +417,7 @@ function planRecurringCampaigns() {
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
     } else {
       const identityId = campaign.sender_identity_id || null;
-      const times    = randomTimesInWindow(campaign.startTime, campaign.endTime, requestedCount);
+      const times    = randomTimesInWindow(rcStart, rcEnd, requestedCount);
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
         targetMode, groupIds, limit: times.length,

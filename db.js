@@ -662,6 +662,13 @@ db.exec(`
     ON inbound_messages(from_address);
 `);
 
+// ─── Timezone support for send windows ───────────────────────────────────────
+// startTime/endTime are stored as "HH:MM" in local time for the given timezone.
+// The scheduler converts to UTC at run time so DST is handled correctly each day.
+// DEFAULT 'UTC' keeps all existing rows working without change.
+try { db.exec("ALTER TABLE schedule_config      ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'") } catch {}
+try { db.exec("ALTER TABLE recurring_campaigns  ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'") } catch {}
+
 // ─── Identity selection for scheduled sends and recurring campaigns ───────────
 // Lets the operator pin a specific sender identity per campaign / scheduled send.
 // NULL means "auto-pick" (pickActiveIdentity() at run time, as before).

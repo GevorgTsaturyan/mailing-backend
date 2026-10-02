@@ -13,7 +13,7 @@ router.get('/', (req, res) => {
 });
 
 router.post('/', (req, res) => {
-  const { startTime, endTime, batchSize, enabled, template, target_mode, groupIds } = req.body;
+  const { startTime, endTime, batchSize, enabled, template, target_mode, groupIds, timezone } = req.body;
 
   const cfg = db.prepare('SELECT * FROM schedule_config WHERE id = 1').get();
 
@@ -34,12 +34,13 @@ router.post('/', (req, res) => {
     batchSize:   batchSize ?? cfg.batchSize,
     template:    template  ?? cfg.template,
     target_mode: nextMode,
+    timezone:    timezone  ?? cfg.timezone ?? 'UTC',
   };
 
   db.transaction(() => {
     db.prepare(
-      'UPDATE schedule_config SET enabled=?, startTime=?, endTime=?, batchSize=?, template=?, target_mode=? WHERE id=1'
-    ).run(updated.enabled, updated.startTime, updated.endTime, updated.batchSize, updated.template, updated.target_mode);
+      'UPDATE schedule_config SET enabled=?, startTime=?, endTime=?, batchSize=?, template=?, target_mode=?, timezone=? WHERE id=1'
+    ).run(updated.enabled, updated.startTime, updated.endTime, updated.batchSize, updated.template, updated.target_mode, updated.timezone);
 
     if (target_mode !== undefined || groupIds !== undefined) {
       db.prepare('DELETE FROM daily_batch_groups').run();
