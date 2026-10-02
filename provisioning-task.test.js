@@ -320,6 +320,94 @@ test('result: DONE with dkim_key phase stores dkimPublicKey on identity', async 
   assert.equal(si.dkimPublicKey, pubKey, 'dkimPublicKey must be stored from dkim_key phase result');
 });
 
+// ── B. Identity cannot be READY/dispatched if task reported FAILED ────────────
+// Regression: an identity whose provisioning task reports FAILED must have
+// provisioningStatus='FAILED' and verificationStatus='unverified', blocking dispatch.
+
+test('B: FAILED provisioning task keeps identity NOT dispatchable (verificationStatus stays unverified)', async () => {
+  const id = mkIdentity(serverC, 'failed-prov-test.example');
+
+  await req('POST', `/api/sender-identities/${id}/provision`, {}, AUTH);
+  const { body: claimed } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_C}`);
+  assert.equal(claimed.identityId, id);
+
+  // Mail-node reports FAILED (simulates provisionPostfixTransport throwing
+  // because senderTransportLive returned false after ensureSenderTransport).
+  await req('POST', `/api/nodes/provisioning-task/${claimed.id}/result`, {
+    apiKey: API_KEY_C,
+    status: 'FAILED',
+    phases: [{ phase: 'postfix_transport', status: 'FAILED', message: 'sender transport not live after provisioning' }],
+    error: 'sender transport for failed-prov-test.example is not live after provisioning',
+  });
+
+  const si = db.prepare('SELECT provisioningStatus, verificationStatus FROM sender_identities WHERE id=?').get(id);
+  assert.equal(si.provisioningStatus, 'FAILED', 'provisioningStatus must be FAILED');
+  // verificationStatus is never set to READY when task failed (applyReports was never called)
+  assert.notEqual(si.verificationStatus, 'READY', 'verificationStatus must NOT be READY after task failure');
+});
+
+// ── H. Delete → recreate same domain → provisioning starts fresh ─────────────
+// Extends the delete+recreate test to verify the PROVISION task is claimed with
+// a clean slate: no lingering IN_PROGRESS task, correct taskType, correct domain
+// and IP in the claimed task payload.
+
+test('H: delete → recreate ardovia.co → new provision task is claimable with correct domain+IP', async () => {
+  const API_KEY_D = 'PTASK-KEY-D';
+  const serverD = Number(
+    db.prepare("INSERT INTO servers (label, apiKey, status, createdAt) VALUES ('srv-d', ?, 'online', ?)")
+      .run(API_KEY_D, now).lastInsertRowid
+  );
+  const IP = '51.255.209.148';
+  const DOMAIN = 'ardovia-repro.example';
+  const FROM  = `support@${DOMAIN}`;
+
+  // Step 1: create a provisioned identity (simulates existing ardovia.co state)
+  const firstId = Number(db.prepare(`
+    INSERT INTO sender_identities
+      (serverId, domain, ip, fromAddr, fromName, dkimSelector,
+       status, verificationStatus, provisioningStatus, dailyLimit, dailySentCount, createdAt)
+    VALUES (?, ?, ?, ?, 'Ardovia', 'mail', 'active', 'READY', 'DONE', 50, 0, ?)
+  `).run(serverD, DOMAIN, IP, FROM, now).lastInsertRowid);
+  db.prepare("INSERT INTO provisioning_tasks (identityId, serverId, status, taskType, requestedAt) VALUES (?,?,'DONE','provision',?)")
+    .run(firstId, serverD, now);
+
+  // Step 2: delete (normal Controller flow)
+  const del = await req('DELETE', `/api/sender-identities/${firstId}`, null, AUTH);
+  assert.equal(del.status, 200);
+  assert.equal(db.prepare('SELECT id FROM sender_identities WHERE id=?').get(firstId), undefined, 'identity removed');
+  assert.equal(
+    db.prepare('SELECT count(*) n FROM provisioning_tasks WHERE identityId=?').get(firstId).n,
+    0, 'all provisioning tasks removed'
+  );
+
+  // Step 3: recreate through normal Controller flow
+  const add = await req('POST', '/api/sender-identities', {
+    serverId: serverD, domain: DOMAIN, ip: IP, fromAddr: FROM,
+  }, AUTH);
+  assert.equal(add.status, 200);
+  const newId = add.body.id;
+  assert.notEqual(newId, firstId, 'fresh identity row');
+  assert.equal(add.body.verificationStatus ?? 'unverified', 'unverified', 'starts unverified');
+
+  // Step 4: trigger provisioning
+  const prov = await req('POST', `/api/sender-identities/${newId}/provision`, {}, AUTH);
+  assert.equal(prov.status, 200);
+  assert.equal(prov.body.status, 'PENDING');
+
+  // Step 5: mail-node claims the task — must see correct domain and IP
+  const { status: claimStatus, body: claimed } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_D}`);
+  assert.equal(claimStatus, 200, 'task must be claimable');
+  assert.equal(claimed.domain, DOMAIN, 'task carries the correct domain');
+  assert.equal(claimed.ip, IP, 'task carries the assigned IP (not server main IP)');
+  assert.equal(claimed.taskType, 'provision');
+  assert.equal(claimed.identityId, newId);
+
+  // Drain
+  await req('POST', `/api/nodes/provisioning-task/${claimed.id}/result`, {
+    apiKey: API_KEY_D, status: 'DONE', phases: [],
+  });
+});
+
 // ── Manual PTR in pipeline ────────────────────────────────────────────────────
 
 test('result: DONE sets ptr phase to MANUAL with generic (non-OVH) message', async () => {
