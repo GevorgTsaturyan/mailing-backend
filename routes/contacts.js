@@ -3,6 +3,7 @@ import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import db from '../db.js';
 import * as Groups from '../services/GroupRepository.js';
+import * as FailedMails from '../services/FailedMailRepository.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -73,6 +74,8 @@ router.put('/:id', (req, res) => {
     db.prepare(
       'UPDATE contacts SET firstName=?, lastName=?, email=?, status=?, sentAt=? WHERE id=?'
     ).run(updated.firstName, updated.lastName, updated.email, updated.status, updated.sentAt, id);
+    // Keep the failed list in step: a status moved off 'failed' is no longer failed.
+    if (updated.status !== 'failed') FailedMails.clear(id);
     res.json(db.prepare('SELECT * FROM contacts WHERE id = ?').get(id));
   } catch (err) {
     if (err.message.includes('UNIQUE')) return res.status(409).json({ error: 'Email already exists' });

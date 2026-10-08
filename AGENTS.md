@@ -43,6 +43,7 @@ backend/
   routes/
     auth.js                 # POST /api/auth/login, GET /api/auth/me
     contacts.js             # CRUD /api/contacts (+ ?groupId filter) + POST /api/contacts/import (CSV, optional group)
+    failed-mails.js         # GET /api/failed-mails (failed contacts + total), POST /:id/reset, DELETE /:id
     groups.js               # CRUD /api/groups + members + delete guard (409 / ?detach=true)
     templates.js            # CRUD /api/templates/:name
     send.js                 # POST /api/send (queue jobs), GET /api/send/jobs (queue overview)
@@ -78,6 +79,7 @@ backend/
     SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact/suppressionExclusionSql
     InboxRepository.js      # DB layer for inbound_messages: insertMessage (HTML sanitized + dedup), listMessages (no body columns), getMessage, markRead/Unread, getUnreadCount
     GroupRepository.js      # DB layer for contact groups: CRUD, membership, contactIdsInGroups (union), usages (deletion guard)
+    FailedMailRepository.js # DB layer for failed_mails: record (upsert, fail_count++), clear, list (join contacts), count
     SendLedger.js           # Per-campaign de-dup ledger: record, eligibleContacts (target_mode/groups + suppression), runBackfillOnce; DAILY_BATCH_SOURCE_ID
     ProvisioningService.js  # Applies node provisioning reports to sender_identities.verificationStatus (ownership-checked, safe metadata only)
     NodeRepository.js       # All DB queries for the servers table (node layer)
@@ -247,10 +249,13 @@ Raw jobs (no contact, no unsubscribe URL) are never gated. Dev/test escape hatch
 |--------|------|-------|
 | GET | `/api/contacts` | All contacts ordered by id. Each row carries `groupIds: number[]` (ids of groups it belongs to, `[]` if none) — the frontend uses this to render the expandable groups + ungrouped tree |
 | POST | `/api/contacts` | `{firstName, lastName, email, status?}` |
-| PUT | `/api/contacts/:id` | Partial update (any field). Response does **not** include `groupIds` |
+| PUT | `/api/contacts/:id` | Partial update (any field). Response does **not** include `groupIds`. Moving `status` off `'failed'` also clears the contact from `failed_mails` |
 | DELETE | `/api/contacts/:id` | — |
 | GET | `/api/contacts?groupId=N` | Only contacts in group N (JOIN contact_group_members); rows also carry `groupIds[]` |
 | POST | `/api/contacts/import` | Multipart `file` field, CSV (firstName/lastName/email). Accepts alternate column names: first_name, firstname, Email, EMAIL. Skips duplicates. Optional multipart `groupId` **or** `newGroupName` adds **every** row (new *and* pre-existing) to that group. Returns `{imported, skipped, group?:{id,name,addedToGroup}}` |
+| GET | `/api/failed-mails` | Contacts whose latest delivery failed, joined to the live contact, newest first. Returns `{total, items[]}` where each item is `{id, firstName, lastName, email, status, sentAt, reason, source('send'|'bounce'), failCount, firstFailedAt, failedAt}`. `total` = failed-contact count |
+| POST | `/api/failed-mails/:id/reset` | Sets the contact (`:id`) back to `pending` (clears `sentAt`) and removes it from `failed_mails` so it can be re-queued |
+| DELETE | `/api/failed-mails/:id` | Dismisses the contact from the failed list only; contact row/status untouched |
 
 ### Contact Groups
 | Method | Path | Notes |
@@ -336,7 +341,7 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | POST | `/api/nodes/heartbeat` | `{apiKey, uptime, cpu, ram, disk, queue_size, postfix_running, opendkim_running}`. Stores health JSON in `servers.health`, sets status=online. If no heartbeat for 90 s, offline watcher sets status=offline. |
 | GET | `/api/nodes/jobs` | `?apiKey=&limit=10`. Returns due queued jobs for this server's identities. Marks them claimed. Resets daily counts at day rollover. |
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
-| POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Delegates to `DeliveryEventService.processEvents`. Updates `delivery_events` (INSERT OR IGNORE), applies FSM transitions on `jobs.delivery_status`, updates `send_jobs`+`send_log` (both pipelines), updates `campaign_stats` counters, and marks contacts failed/unsubscribed. Returns `{ok, processed, skipped}`. |
+| POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Delegates to `DeliveryEventService.processEvents`. Updates `delivery_events` (INSERT OR IGNORE), applies FSM transitions on `jobs.delivery_status`, updates `send_jobs`+`send_log` (both pipelines), updates `campaign_stats` counters, and marks contacts failed/unsubscribed. BOUNCED records the contact in `failed_mails` (source='bounce'); DELIVERED clears it. Returns `{ok, processed, skipped}`. |
 | GET | `/api/nodes/provisioning-task` | `?apiKey=`. Returns the oldest `PENDING` provisioning task for this server's identities and atomically transitions it to `IN_PROGRESS`. Returns **204 No Content** when no task is pending. Response: `{id, identityId, domain, ip, selector}`. Node executes DKIM+Postfix+OpenDKIM locally, then POSTs the result. |
 | POST | `/api/nodes/provisioning-task/:id/result` | `{apiKey, status:'DONE'\|'FAILED', phases:[{phase,status,message}], error?}`. Node reports task completion. Updates `provisioning_tasks.status`, sets `sender_identities.provisioningStatus`. On `DONE`: non-blocking fire of `provision-identity-hosts.sh` for nginx/TLS (uses same sudo mechanism as admin endpoint). |
 
@@ -346,8 +351,8 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | POST | `/api/jobs` | JWT | `{identity_id?, recipient, subject, body?, priority?, content_type?}`. `content_type`: `'html'` (default) or `'text'` — controls MIME structure the node uses when sending. Creates a PENDING job. Returns the created job. `identity_id` must reference a `sender_identities` row with a populated `fromAddr` or the node will FAIL the job at send time. |
 | GET | `/api/jobs/poll` | apiKey | `?apiKey=`. Read-only peek at the next PENDING job (highest priority, oldest first). Filters by `scheduled_for <= now` (withholds future-scheduled campaign jobs). Response includes `fromAddr`, `fromName`, `domain` from `sender_identities`. Returns the job or **204 No Content** if queue is empty. Does NOT claim the job. |
 | POST | `/api/jobs/:id/start` | apiKey | `{apiKey}`. Atomically claims the job: PENDING → PROCESSING. Returns 409 if another node already claimed it. |
-| POST | `/api/jobs/:id/complete` | apiKey | `{apiKey, queue_id?}`. Marks PROCESSING → SENT. **Milestone 5**: also calls `CampaignResultService.onJobCompleted` — updates `send_log` status, marks contact `sent`, increments `dailySentCount`. Only the owning node may call this. |
-| POST | `/api/jobs/:id/fail` | apiKey | `{apiKey, error_message?}`. Marks PROCESSING → FAILED. **Milestone 5**: also calls `CampaignResultService.onJobFailed` — marks `send_log` failed, marks contact `failed`. Only the owning node may call this. |
+| POST | `/api/jobs/:id/complete` | apiKey | `{apiKey, queue_id?}`. Marks PROCESSING → SENT. **Milestone 5**: also calls `CampaignResultService.onJobCompleted` — updates `send_log` status, marks contact `sent`, increments `dailySentCount`, and clears the contact from `failed_mails`. Only the owning node may call this. |
+| POST | `/api/jobs/:id/fail` | apiKey | `{apiKey, error_message?}`. Marks PROCESSING → FAILED. **Milestone 5**: also calls `CampaignResultService.onJobFailed` — marks `send_log` failed, marks contact `failed`, and records the contact in `failed_mails` (source='send'). Only the owning node may call this. |
 
 ### Admin (JWT required)
 | Method | Path | Body | Response |
@@ -631,6 +636,22 @@ inbound_messages (
 -- Indexes:
 --   UNIQUE partial: idx_inbound_messages_message_id ON (message_id) WHERE message_id IS NOT NULL
 --   idx_inbound_messages_mailbox, _domain, _is_read, _received_at DESC, _from_address
+
+-- Contacts whose latest delivery failed (one row per contact; the Failed Mails UI):
+failed_mails (
+  contact_id      INTEGER PK REFERENCES contacts(id) ON DELETE CASCADE,
+  email           TEXT NOT NULL DEFAULT '',  -- snapshot of the recipient at fail time
+  reason          TEXT,                       -- error message / bounce detail
+  source          TEXT NOT NULL DEFAULT 'send', -- 'send' (SMTP submit fail) | 'bounce' (hard bounce)
+  fail_count      INTEGER NOT NULL DEFAULT 1,  -- climbs on each repeat failure (upsert)
+  first_failed_at TEXT NOT NULL,
+  failed_at       TEXT NOT NULL                -- most recent failure
+)
+-- Index: idx_failed_mails_failed_at ON (failed_at DESC)
+-- Written by FailedMailRepository.record() from CampaignResultService.onJobFailed
+-- (source='send') and DeliveryEventService BOUNCED (source='bounce'). Cleared by
+-- .clear() on a later success (onJobCompleted / delivery DELIVERED), on reset, or
+-- when a contact's status is edited off 'failed'.
 ```
 
 ---

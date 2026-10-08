@@ -1,5 +1,6 @@
 import db from '../db.js';
 import * as JobRepository from './JobRepository.js';
+import * as FailedMails from './FailedMailRepository.js';
 import { incrementSent, incrementSendFailed } from './CampaignStatsRepository.js';
 import { checkAndCompleteCampaign } from './CampaignRepository.js';
 
@@ -29,6 +30,8 @@ export function onJobCompleted(jobId, queueId) {
     if (job.contact_id) {
       db.prepare("UPDATE contacts SET status='sent', sentAt=? WHERE id=?")
         .run(now, job.contact_id);
+      // A successful send resolves any earlier failure for this contact.
+      FailedMails.clear(job.contact_id);
     }
     if (job.identity_id) {
       db.prepare('UPDATE sender_identities SET dailySentCount = dailySentCount + 1 WHERE id=?')
@@ -54,6 +57,12 @@ export function onJobFailed(jobId, errorMessage) {
     if (job.contact_id) {
       db.prepare("UPDATE contacts SET status='failed' WHERE id=?")
         .run(job.contact_id);
+      // Record (or bump) this contact in the failed-mails list.
+      FailedMails.record(job.contact_id, {
+        email:  job.recipient,
+        reason: errorMessage ?? 'Send failed',
+        source: 'send',
+      });
     }
     db.prepare("UPDATE jobs SET delivery_status = 'SEND_FAILED' WHERE id=?").run(jobId);
     if (job.campaign_id) incrementSendFailed(job.campaign_id);

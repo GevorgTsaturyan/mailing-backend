@@ -2,6 +2,7 @@ import db from '../db.js';
 import { findOrCreate as findOrCreateStats, applyDeliveryEvent } from './CampaignStatsRepository.js';
 import { checkAndCompleteCampaign } from './CampaignRepository.js';
 import { cancelOutstandingJobsForContact } from './SuppressionService.js';
+import * as FailedMails from './FailedMailRepository.js';
 
 // ─── DeliveryEventService ─────────────────────────────────────────────────────
 // Processes delivery events reported by mail-nodes from Postfix mail.log.
@@ -204,6 +205,14 @@ function processSingleEvent(event, now) {
         complainedContactId = contactId;  // cancel their queued jobs after commit
       } else if (newDeliveryStatus === 'BOUNCED') {
         markContactFailed.run(contactId);
+        FailedMails.record(contactId, {
+          email:  email ?? '',
+          reason: event.reasonDetail || event.response || 'Hard bounce',
+          source: 'bounce',
+        });
+      } else if (newDeliveryStatus === 'DELIVERED') {
+        // Confirmed delivery clears any prior failure for this contact.
+        FailedMails.clear(contactId);
       }
     }
 

@@ -12,6 +12,7 @@ import { seedDevData } from './seed.js';
 
 import authRouter               from './routes/auth.js';
 import contactsRouter           from './routes/contacts.js';
+import failedMailsRouter         from './routes/failed-mails.js';
 import groupsRouter             from './routes/groups.js';
 import templatesRouter          from './routes/templates.js';
 import sendRouter               from './routes/send.js';
@@ -124,6 +125,7 @@ app.post('/unsubscribe', express.urlencoded({ extended: false }), (req, res) => 
 // All API routes below require a valid JWT
 app.use('/api', requireAuth);
 app.use('/api/contacts',             contactsRouter);
+app.use('/api/failed-mails',         failedMailsRouter);
 app.use('/api/groups',               groupsRouter);
 app.use('/api/templates',            templatesRouter);
 app.use('/api/send',                 sendRouter);

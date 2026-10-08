@@ -662,6 +662,31 @@ db.exec(`
     ON inbound_messages(from_address);
 `);
 
+// ─── Failed mails (Failed Deliveries feature) ─────────────────────────────────
+//
+// One row per contact whose most recent delivery FAILED — either a SMTP
+// submission failure (source='send', from CampaignResultService.onJobFailed) or
+// a hard bounce (source='bounce', from DeliveryEventService). The row is upserted
+// on each new failure (fail_count climbs, reason/failed_at refreshed) and removed
+// again when that contact later succeeds (send completes / message is DELIVERED)
+// or is manually reset. ON DELETE CASCADE keeps it in step with the contact.
+//
+// The Failed Mails section lists these rows (joined to the live contact) and the
+// row count is the "total failed contacts" figure shown in the UI.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS failed_mails (
+    contact_id      INTEGER PRIMARY KEY REFERENCES contacts(id) ON DELETE CASCADE,
+    email           TEXT NOT NULL DEFAULT '',
+    reason          TEXT,
+    source          TEXT NOT NULL DEFAULT 'send',
+    fail_count      INTEGER NOT NULL DEFAULT 1,
+    first_failed_at TEXT NOT NULL,
+    failed_at       TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_failed_mails_failed_at ON failed_mails(failed_at DESC);
+`);
+
 // ─── Timezone support for send windows ───────────────────────────────────────
 // startTime/endTime are stored as "HH:MM" in local time for the given timezone.
 // The scheduler converts to UTC at run time so DST is handled correctly each day.
