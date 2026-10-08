@@ -60,6 +60,7 @@ backend/
                             #   Also: GET /provisioning-task (poll+claim) + POST /provisioning-task/:id/result
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
     inbox.js                # Inbound message API (/api/inbox list/get/read/unread/stats) — JWT required
+    dashboard.js            # GET /api/dashboard analytics payload (see below) — JWT required
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   scripts/
     provision-identity-hosts.sh          # Idempotent: provisions nginx + Let's Encrypt for unsubscribe.<domain> AND click.<domain>
@@ -1395,6 +1396,17 @@ campaign with `unique_opens` / `unique_clicks` (COUNT DISTINCT contact_id over
 open_events / click_events) so the Campaigns UI shows unique open/click counts per
 campaign and rolls them up per name-group. The report view still exposes the full
 raw/human/prefetch breakdown via `campaignSummary()`.
+
+**Dashboard analytics** — `GET /api/dashboard` (`routes/dashboard.js`) returns a
+single analytics payload: `contacts` (status counts), `failedMails` (count),
+`identities` (health), `totals` (all-time emails_sent/delivered/bounced,
+campaign_count, and globally-distinct `unique_opens`/`unique_clicks`), `today` /
+`yesterday` summaries (campaigns_count, sent, delivered, unique_opens,
+unique_clicks), `todayCampaigns` / `yesterdayCampaigns` (per-campaign rows with
+unique opens/clicks), a zero-filled 14-day `trend` array, `inboxUnread`, and
+`recentLog` (last 15). Day buckets use UTC to match `campaigns.date`. Per-campaign
+unique opens/clicks are `COUNT(DISTINCT contact_id)`; day/period rollups SUM those
+per-campaign uniques (so a contact engaging with two campaigns counts in each).
 
 **Transformation point**: queue time only, inside `scheduler.js:queueCanonicalJobForContact`
 (via `CampaignBodyCompiler`). No-button + open-off templates are byte-identical to before.
