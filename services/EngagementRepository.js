@@ -119,16 +119,16 @@ export function buttonRows(campaignId) {
 
 // Campaign list for report navigation (most recent first).
 export function listCampaigns(limit = 100) {
-  // `opens` / `clicks` are RAW event totals (all pixel/click hits for the
-  // campaign) so the Campaigns UI can show a total open/click count per campaign
-  // and roll them up per name-group. The report view still breaks these down into
-  // human vs prefetch/bot — see campaignSummary().
+  // `unique_opens` / `unique_clicks` are the count of DISTINCT contacts who opened
+  // / clicked (not raw event hits) so the Campaigns UI shows a unique open/click
+  // count per campaign and rolls them up per name-group. The report view still
+  // breaks these down into raw vs human vs prefetch/bot — see campaignSummary().
   return db.prepare(`
     SELECT c.id, c.type, c.label, c.status, c.date, c.created_at,
            s.total_sent, s.total_delivered,
            si.fromAddr AS identity_from, si.domain AS identity_domain,
-           (SELECT COUNT(*) FROM open_events  oe WHERE oe.campaign_id = c.id) AS opens,
-           (SELECT COUNT(*) FROM click_events ce WHERE ce.campaign_id = c.id) AS clicks
+           (SELECT COUNT(DISTINCT oe.contact_id) FROM open_events  oe WHERE oe.campaign_id = c.id AND oe.contact_id IS NOT NULL) AS unique_opens,
+           (SELECT COUNT(DISTINCT ce.contact_id) FROM click_events ce WHERE ce.campaign_id = c.id AND ce.contact_id IS NOT NULL) AS unique_clicks
     FROM campaigns c
     LEFT JOIN campaign_stats s  ON s.campaign_id = c.id
     LEFT JOIN sender_identities si ON si.id = c.identity_id

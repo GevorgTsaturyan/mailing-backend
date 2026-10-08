@@ -1391,9 +1391,10 @@ token). Mounted **before** `app.use('/api', requireAuth)`. Authed: `routes/butto
 (`/api/buttons` CRUD + `/:id/preview`), `routes/engagement.js` (`/api/engagement/config`,
 `/campaigns`, `/campaigns/:id/report`, `/campaigns/:id/open-tracking`). `GET
 /api/engagement/campaigns` (`EngagementRepository.listCampaigns`) returns each
-campaign with raw `opens` / `clicks` totals (subquery COUNT over open_events /
-click_events) so the Campaigns UI can show per-campaign open/click counts and roll
-them up per name-group.
+campaign with `unique_opens` / `unique_clicks` (COUNT DISTINCT contact_id over
+open_events / click_events) so the Campaigns UI shows unique open/click counts per
+campaign and rolls them up per name-group. The report view still exposes the full
+raw/human/prefetch breakdown via `campaignSummary()`.
 
 **Transformation point**: queue time only, inside `scheduler.js:queueCanonicalJobForContact`
 (via `CampaignBodyCompiler`). No-button + open-off templates are byte-identical to before.
