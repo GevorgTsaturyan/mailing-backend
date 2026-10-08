@@ -1389,7 +1389,11 @@ destination for ALL classifications — no cloaking; `no-store` + `no-referrer`;
 invalid token → 404) and `GET /o/:file` (1×1 gif always; records only on valid
 token). Mounted **before** `app.use('/api', requireAuth)`. Authed: `routes/buttons.js`
 (`/api/buttons` CRUD + `/:id/preview`), `routes/engagement.js` (`/api/engagement/config`,
-`/campaigns`, `/campaigns/:id/report`, `/campaigns/:id/open-tracking`).
+`/campaigns`, `/campaigns/:id/report`, `/campaigns/:id/open-tracking`). `GET
+/api/engagement/campaigns` (`EngagementRepository.listCampaigns`) returns each
+campaign with raw `opens` / `clicks` totals (subquery COUNT over open_events /
+click_events) so the Campaigns UI can show per-campaign open/click counts and roll
+them up per name-group.
 
 **Transformation point**: queue time only, inside `scheduler.js:queueCanonicalJobForContact`
 (via `CampaignBodyCompiler`). No-button + open-off templates are byte-identical to before.
