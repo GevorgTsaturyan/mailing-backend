@@ -71,9 +71,10 @@ router.get('/campaigns/:id/report', (req, res) => {
 
   res.json({
     campaign,
-    summary:   Engagement.campaignSummary(id),
-    recipients: Engagement.recipientRows(id),
-    buttons:    Engagement.buttonRows(id),
+    summary:       Engagement.campaignSummary(id),
+    recipients:    Engagement.recipientRows(id),
+    buttons:       Engagement.buttonRows(id),
+    timeAnalytics: Engagement.timeAnalytics(id),
     // Reminder surfaced to the UI: opens are MEASURED events, not confirmed human
     // opens. Raw Opens / Unique Openers are reliable counts of pixel requests;
     // they cannot be attributed to humans (Gmail proxies AND caches images — real

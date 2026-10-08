@@ -1397,6 +1397,12 @@ by `contact_id` when present, else `ip_hash`, else event id (so campaigns whose
 tracking events carry no contact_id still report non-zero) — so the Campaigns UI
 shows unique open/click counts per campaign and rolls them up per name-group. The
 report view still exposes the full raw/human/prefetch breakdown via `campaignSummary()`.
+`GET /api/engagement/campaigns/:id/report` additionally returns `timeAnalytics`
+(`EngagementRepository.timeAnalytics`: `{timezone:'UTC', sentByHour[24],
+opensByHour[24], clicksByHour[24]}` — UTC hour-of-day buckets via
+`strftime('%H', …)` over jobs.finished_at / open_events / click_events, for the
+"best time to send" chart), and each `recipients` row now carries `sent_at` (the
+SENT job's `finished_at`).
 
 **Dashboard analytics** — `GET /api/dashboard` (`routes/dashboard.js`) returns a
 single analytics payload: `contacts` (status counts), `failedMails` (count),

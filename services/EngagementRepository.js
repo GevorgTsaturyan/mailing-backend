@@ -76,9 +76,9 @@ export function recipientRows(campaignId) {
   `).all(campaignId);
 
   const byContact = new Map();
-  for (const o of opens) byContact.set(o.contact_id, { contact_id: o.contact_id, opens: o.opens, first_open: o.first_open, last_open: o.last_open, clicks: 0, first_click: null, last_click: null });
+  for (const o of opens) byContact.set(o.contact_id, { contact_id: o.contact_id, opens: o.opens, first_open: o.first_open, last_open: o.last_open, clicks: 0, first_click: null, last_click: null, sent_at: null });
   for (const c of clicks) {
-    const row = byContact.get(c.contact_id) || { contact_id: c.contact_id, opens: 0, first_open: null, last_open: null };
+    const row = byContact.get(c.contact_id) || { contact_id: c.contact_id, opens: 0, first_open: null, last_open: null, sent_at: null };
     row.clicks = c.clicks || 0;
     row.first_click = c.first_click;
     row.last_click = c.last_click;
@@ -95,9 +95,44 @@ export function recipientRows(campaignId) {
       row.email = c?.email ?? null;
       row.name = c ? `${c.firstName} ${c.lastName}` : null;
     }
+    // When each contact's email was actually sent (SMTP completion time).
+    const sent = db.prepare(`
+      SELECT contact_id, MIN(finished_at) AS sent_at
+      FROM jobs
+      WHERE campaign_id = ? AND status = 'SENT' AND finished_at IS NOT NULL AND contact_id IN (${placeholders})
+      GROUP BY contact_id
+    `).all(campaignId, ...ids);
+    const smap = new Map(sent.map(s => [s.contact_id, s.sent_at]));
+    for (const row of byContact.values()) row.sent_at = smap.get(row.contact_id) ?? null;
   }
 
   return [...byContact.values()].sort((a, b) => (b.clicks - a.clicks) || (b.opens - a.opens));
+}
+
+// Hour-of-day (UTC) distribution of sends, opens and clicks for one campaign.
+// Three 24-slot arrays (index = hour 0–23) so the report can show which time
+// ranges produce the most engagement — i.e. when it's best to send. Hours are
+// UTC (all timestamps are stored in UTC); the UI labels them as such.
+export function timeAnalytics(campaignId) {
+  const zero = () => Array.from({ length: 24 }, () => 0);
+  const sentByHour = zero(), opensByHour = zero(), clicksByHour = zero();
+
+  const fill = (arr, rows) => { for (const r of rows) if (r.h != null && r.h >= 0 && r.h < 24) arr[r.h] = r.n; };
+
+  fill(sentByHour, db.prepare(`
+    SELECT CAST(strftime('%H', finished_at) AS INTEGER) AS h, COUNT(*) AS n
+    FROM jobs WHERE campaign_id = ? AND status = 'SENT' AND finished_at IS NOT NULL GROUP BY h
+  `).all(campaignId));
+  fill(opensByHour, db.prepare(`
+    SELECT CAST(strftime('%H', opened_at) AS INTEGER) AS h, COUNT(*) AS n
+    FROM open_events WHERE campaign_id = ? GROUP BY h
+  `).all(campaignId));
+  fill(clicksByHour, db.prepare(`
+    SELECT CAST(strftime('%H', clicked_at) AS INTEGER) AS h, COUNT(*) AS n
+    FROM click_events WHERE campaign_id = ? GROUP BY h
+  `).all(campaignId));
+
+  return { timezone: 'UTC', sentByHour, opensByHour, clicksByHour };
 }
 
 // Button-level performance for a campaign.
