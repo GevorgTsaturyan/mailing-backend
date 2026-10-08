@@ -245,11 +245,11 @@ Raw jobs (no contact, no unsubscribe URL) are never gated. Dev/test escape hatch
 ### Contacts
 | Method | Path | Notes |
 |--------|------|-------|
-| GET | `/api/contacts` | All contacts ordered by id |
+| GET | `/api/contacts` | All contacts ordered by id. Each row carries `groupIds: number[]` (ids of groups it belongs to, `[]` if none) — the frontend uses this to render the expandable groups + ungrouped tree |
 | POST | `/api/contacts` | `{firstName, lastName, email, status?}` |
-| PUT | `/api/contacts/:id` | Partial update (any field) |
+| PUT | `/api/contacts/:id` | Partial update (any field). Response does **not** include `groupIds` |
 | DELETE | `/api/contacts/:id` | — |
-| GET | `/api/contacts?groupId=N` | Only contacts in group N (JOIN contact_group_members) |
+| GET | `/api/contacts?groupId=N` | Only contacts in group N (JOIN contact_group_members); rows also carry `groupIds[]` |
 | POST | `/api/contacts/import` | Multipart `file` field, CSV (firstName/lastName/email). Accepts alternate column names: first_name, firstname, Email, EMAIL. Skips duplicates. Optional multipart `groupId` **or** `newGroupName` adds **every** row (new *and* pre-existing) to that group. Returns `{imported, skipped, group?:{id,name,addedToGroup}}` |
 
 ### Contact Groups

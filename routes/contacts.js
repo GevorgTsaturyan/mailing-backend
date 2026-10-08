@@ -9,17 +9,32 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // GET /api/contacts            → all contacts
 // GET /api/contacts?groupId=N  → only contacts in group N
+//
+// Every contact is returned with a `groupIds` array (the ids of the groups it
+// belongs to, empty when it belongs to none). The frontend uses this to render
+// the expandable groups-and-ungrouped tree without extra round trips.
+const GROUP_IDS_SUBSELECT = `
+  (SELECT group_concat(m.group_id) FROM contact_group_members m WHERE m.contact_id = c.id) AS groupIds
+`;
+
+function withGroupIds(rows) {
+  return rows.map((r) => ({
+    ...r,
+    groupIds: r.groupIds ? r.groupIds.split(',').map(Number) : [],
+  }));
+}
+
 router.get('/', (req, res) => {
   const groupId = req.query.groupId != null ? Number(req.query.groupId) : null;
   if (groupId != null && !Number.isNaN(groupId)) {
-    return res.json(db.prepare(`
-      SELECT c.* FROM contacts c
-      JOIN contact_group_members m ON m.contact_id = c.id
-      WHERE m.group_id = ?
+    return res.json(withGroupIds(db.prepare(`
+      SELECT c.*, ${GROUP_IDS_SUBSELECT} FROM contacts c
+      JOIN contact_group_members gm ON gm.contact_id = c.id
+      WHERE gm.group_id = ?
       ORDER BY c.id
-    `).all(groupId));
+    `).all(groupId)));
   }
-  res.json(db.prepare('SELECT * FROM contacts ORDER BY id').all());
+  res.json(withGroupIds(db.prepare(`SELECT c.*, ${GROUP_IDS_SUBSELECT} FROM contacts c ORDER BY c.id`).all()));
 });
 
 router.post('/', (req, res) => {
