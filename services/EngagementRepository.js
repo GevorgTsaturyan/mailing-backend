@@ -119,16 +119,23 @@ export function buttonRows(campaignId) {
 
 // Campaign list for report navigation (most recent first).
 export function listCampaigns(limit = 100) {
-  // `unique_opens` / `unique_clicks` are the count of DISTINCT contacts who opened
-  // / clicked (not raw event hits) so the Campaigns UI shows a unique open/click
-  // count per campaign and rolls them up per name-group. The report view still
+  // `unique_opens` / `unique_clicks` count DISTINCT openers / clickers (not raw
+  // event hits). We dedup by contact_id when known, else by ip_hash, else by the
+  // event id — so a campaign whose tracking events carry no contact_id (e.g. older
+  // sends) still reports a non-zero unique count instead of 0. The report view
   // breaks these down into raw vs human vs prefetch/bot — see campaignSummary().
   return db.prepare(`
     SELECT c.id, c.type, c.label, c.status, c.date, c.created_at,
            s.total_sent, s.total_delivered,
            si.fromAddr AS identity_from, si.domain AS identity_domain,
-           (SELECT COUNT(DISTINCT oe.contact_id) FROM open_events  oe WHERE oe.campaign_id = c.id AND oe.contact_id IS NOT NULL) AS unique_opens,
-           (SELECT COUNT(DISTINCT ce.contact_id) FROM click_events ce WHERE ce.campaign_id = c.id AND ce.contact_id IS NOT NULL) AS unique_clicks
+           (SELECT COUNT(DISTINCT CASE WHEN oe.contact_id IS NOT NULL THEN 'c'||oe.contact_id
+                                       WHEN oe.ip_hash    IS NOT NULL THEN 'h'||oe.ip_hash
+                                       ELSE 'e'||oe.id END)
+              FROM open_events  oe WHERE oe.campaign_id = c.id) AS unique_opens,
+           (SELECT COUNT(DISTINCT CASE WHEN ce.contact_id IS NOT NULL THEN 'c'||ce.contact_id
+                                       WHEN ce.ip_hash    IS NOT NULL THEN 'h'||ce.ip_hash
+                                       ELSE 'e'||ce.id END)
+              FROM click_events ce WHERE ce.campaign_id = c.id) AS unique_clicks
     FROM campaigns c
     LEFT JOIN campaign_stats s  ON s.campaign_id = c.id
     LEFT JOIN sender_identities si ON si.id = c.identity_id

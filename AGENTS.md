@@ -1392,10 +1392,11 @@ token). Mounted **before** `app.use('/api', requireAuth)`. Authed: `routes/butto
 (`/api/buttons` CRUD + `/:id/preview`), `routes/engagement.js` (`/api/engagement/config`,
 `/campaigns`, `/campaigns/:id/report`, `/campaigns/:id/open-tracking`). `GET
 /api/engagement/campaigns` (`EngagementRepository.listCampaigns`) returns each
-campaign with `unique_opens` / `unique_clicks` (COUNT DISTINCT contact_id over
-open_events / click_events) so the Campaigns UI shows unique open/click counts per
-campaign and rolls them up per name-group. The report view still exposes the full
-raw/human/prefetch breakdown via `campaignSummary()`.
+campaign with `unique_opens` / `unique_clicks` — distinct openers/clickers deduped
+by `contact_id` when present, else `ip_hash`, else event id (so campaigns whose
+tracking events carry no contact_id still report non-zero) — so the Campaigns UI
+shows unique open/click counts per campaign and rolls them up per name-group. The
+report view still exposes the full raw/human/prefetch breakdown via `campaignSummary()`.
 
 **Dashboard analytics** — `GET /api/dashboard` (`routes/dashboard.js`) returns a
 single analytics payload: `contacts` (status counts), `failedMails` (count),
@@ -1405,8 +1406,8 @@ campaign_count, and globally-distinct `unique_opens`/`unique_clicks`), `today` /
 unique_clicks), `todayCampaigns` / `yesterdayCampaigns` (per-campaign rows with
 unique opens/clicks), a zero-filled 14-day `trend` array, `inboxUnread`, and
 `recentLog` (last 15). Day buckets use UTC to match `campaigns.date`. Per-campaign
-unique opens/clicks are `COUNT(DISTINCT contact_id)`; day/period rollups SUM those
-per-campaign uniques (so a contact engaging with two campaigns counts in each).
+unique opens/clicks dedup by contact_id → ip_hash → event id; day/period rollups
+SUM those per-campaign uniques (so a contact engaging with two campaigns counts in each).
 
 **Transformation point**: queue time only, inside `scheduler.js:queueCanonicalJobForContact`
 (via `CampaignBodyCompiler`). No-button + open-off templates are byte-identical to before.

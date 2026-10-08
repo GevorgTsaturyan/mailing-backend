@@ -50,9 +50,11 @@ router.get('/', (req, res) => {
            COUNT(DISTINCT campaign_id)        AS campaign_count
     FROM campaign_stats
   `).get();
-  // Globally-unique engaged contacts (distinct across ALL campaigns).
-  const uniqueOpens  = db.prepare('SELECT COUNT(DISTINCT contact_id) AS n FROM open_events  WHERE contact_id IS NOT NULL').get().n;
-  const uniqueClicks = db.prepare('SELECT COUNT(DISTINCT contact_id) AS n FROM click_events WHERE contact_id IS NOT NULL').get().n;
+  // Globally-unique engaged contacts (distinct across ALL campaigns). Dedup by
+  // contact_id when known, else ip_hash, else event id — so campaigns whose
+  // tracking events lack a contact_id still contribute a non-zero figure.
+  const uniqueOpens  = db.prepare("SELECT COUNT(DISTINCT CASE WHEN contact_id IS NOT NULL THEN 'c'||contact_id WHEN ip_hash IS NOT NULL THEN 'h'||ip_hash ELSE 'e'||id END) AS n FROM open_events").get().n;
+  const uniqueClicks = db.prepare("SELECT COUNT(DISTINCT CASE WHEN contact_id IS NOT NULL THEN 'c'||contact_id WHEN ip_hash IS NOT NULL THEN 'h'||ip_hash ELSE 'e'||id END) AS n FROM click_events").get().n;
   const totals = { ...stats, unique_opens: uniqueOpens, unique_clicks: uniqueClicks };
 
   // ── Per-campaign rows for the last 14 days (today + yesterday + trend) ───────
@@ -63,8 +65,14 @@ router.get('/', (req, res) => {
            COALESCE(s.total_sent, 0)      AS total_sent,
            COALESCE(s.total_delivered, 0) AS total_delivered,
            COALESCE(s.total_bounced, 0)   AS total_bounced,
-           (SELECT COUNT(DISTINCT oe.contact_id) FROM open_events  oe WHERE oe.campaign_id = c.id AND oe.contact_id IS NOT NULL) AS unique_opens,
-           (SELECT COUNT(DISTINCT ce.contact_id) FROM click_events ce WHERE ce.campaign_id = c.id AND ce.contact_id IS NOT NULL) AS unique_clicks
+           (SELECT COUNT(DISTINCT CASE WHEN oe.contact_id IS NOT NULL THEN 'c'||oe.contact_id
+                                       WHEN oe.ip_hash    IS NOT NULL THEN 'h'||oe.ip_hash
+                                       ELSE 'e'||oe.id END)
+              FROM open_events  oe WHERE oe.campaign_id = c.id) AS unique_opens,
+           (SELECT COUNT(DISTINCT CASE WHEN ce.contact_id IS NOT NULL THEN 'c'||ce.contact_id
+                                       WHEN ce.ip_hash    IS NOT NULL THEN 'h'||ce.ip_hash
+                                       ELSE 'e'||ce.id END)
+              FROM click_events ce WHERE ce.campaign_id = c.id) AS unique_clicks
     FROM campaigns c
     LEFT JOIN campaign_stats    s  ON s.campaign_id = c.id
     LEFT JOIN sender_identities si ON si.id = c.identity_id
