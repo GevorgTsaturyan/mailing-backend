@@ -198,6 +198,11 @@ export function markUnread(id) {
   ).run(id);
 }
 
+// Permanently remove an inbound message. Returns the number of rows deleted.
+export function deleteMessage(id) {
+  return db.prepare('DELETE FROM inbound_messages WHERE id = ?').run(id).changes;
+}
+
 export function getUnreadCount({ domain, mailbox } = {}) {
   const conditions = ['is_read = 0'];
   const params     = [];

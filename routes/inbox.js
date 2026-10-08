@@ -8,6 +8,7 @@ import {
   getMessage,
   markRead,
   markUnread,
+  deleteMessage,
   getUnreadCount,
 } from '../services/InboxRepository.js';
 
@@ -63,6 +64,13 @@ router.patch('/:id/read', (req, res) => {
 router.patch('/:id/unread', (req, res) => {
   if (!getMessage(req.params.id)) return res.status(404).json({ error: 'Message not found' });
   markUnread(req.params.id);
+  res.json({ ok: true });
+});
+
+// DELETE /api/inbox/:id — permanently remove an inbound message
+router.delete('/:id', (req, res) => {
+  if (!getMessage(req.params.id)) return res.status(404).json({ error: 'Message not found' });
+  deleteMessage(req.params.id);
   res.json({ ok: true });
 });
 

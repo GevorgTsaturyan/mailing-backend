@@ -59,7 +59,7 @@ backend/
     nodes.js                # Node API thin handlers: delegates register/heartbeat to services
                             #   Also: GET /provisioning-task (poll+claim) + POST /provisioning-task/:id/result
     jobs.js                 # Canonical job queue API (/api/jobs poll/start/complete/fail); poll attaches unsubscribeUrl
-    inbox.js                # Inbound message API (/api/inbox list/get/read/unread/stats) — JWT required
+    inbox.js                # Inbound message API (/api/inbox list/get/read/unread/delete/stats) — JWT required
     dashboard.js            # GET /api/dashboard analytics payload (see below) — JWT required
     unsubscribe.js          # Public token-based unsubscribe: GET /u/:token (confirm page, no mutation) + POST /u/:token (RFC 8058 one-click + form)
   scripts/
@@ -78,7 +78,7 @@ backend/
                                  #   domain-aware. getReadyDomains() returns Set<domain> for PollingService SQL filter. Probe:
                                  #   https://unsubscribe.<domain>/unsubscribe-health with hairpin-NAT fallback.
     SuppressionService.js   # Central "may we send to X?" gate: isContactSuppressed/isEmailSuppressed/suppressedContactIdSet/cancelOutstandingJobsForContact/suppressionExclusionSql
-    InboxRepository.js      # DB layer for inbound_messages: insertMessage (HTML sanitized + dedup), listMessages (no body columns), getMessage, markRead/Unread, getUnreadCount
+    InboxRepository.js      # DB layer for inbound_messages: insertMessage (HTML sanitized + dedup), listMessages (no body columns), getMessage, markRead/Unread, deleteMessage, getUnreadCount
     GroupRepository.js      # DB layer for contact groups: CRUD, membership, contactIdsInGroups (union), usages (deletion guard)
     FailedMailRepository.js # DB layer for failed_mails: record (upsert, fail_count++), clear, list (join contacts), count
     SendLedger.js           # Per-campaign de-dup ledger: record, eligibleContacts (target_mode/groups + suppression), runBackfillOnce; DAILY_BATCH_SOURCE_ID
@@ -233,6 +233,7 @@ Raw jobs (no contact, no unsubscribe URL) are never gated. Dev/test escape hatch
 | GET | `/api/inbox/:id` | Full message including `text_body`, `html_body` (sanitized), headers |
 | PATCH | `/api/inbox/:id/read` | Mark read; returns `{ok}` |
 | PATCH | `/api/inbox/:id/unread` | Mark unread; returns `{ok}` |
+| DELETE | `/api/inbox/:id` | Permanently delete the message; 404 if missing; returns `{ok}` |
 
 ### Node — Inbound Messages (apiKey auth)
 | Method | Path | Notes |
