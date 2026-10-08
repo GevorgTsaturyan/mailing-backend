@@ -57,9 +57,9 @@ router.get('/', (req, res) => {
   const uniqueClicks = db.prepare("SELECT COUNT(DISTINCT CASE WHEN contact_id IS NOT NULL THEN 'c'||contact_id WHEN ip_hash IS NOT NULL THEN 'h'||ip_hash ELSE 'e'||id END) AS n FROM click_events").get().n;
   const totals = { ...stats, unique_opens: uniqueOpens, unique_clicks: uniqueClicks };
 
-  // ── Per-campaign rows for the last 14 days (today + yesterday + trend) ───────
+  // ── Per-campaign rows since a given day (reused for trend + month-to-date) ───
   // unique_opens / unique_clicks = distinct contacts who opened / clicked.
-  const windowCampaigns = db.prepare(`
+  const campaignRowsSince = db.prepare(`
     SELECT c.id, c.type, c.label, c.status, c.date,
            si.fromAddr AS identity_from, si.domain AS identity_domain,
            COALESCE(s.total_sent, 0)      AS total_sent,
@@ -78,7 +78,15 @@ router.get('/', (req, res) => {
     LEFT JOIN sender_identities si ON si.id = c.identity_id
     WHERE c.date >= ?
     ORDER BY c.id DESC
-  `).all(since);
+  `);
+
+  const monthStart = today.slice(0, 7) + '-01';           // 'YYYY-MM-01' (UTC)
+  const windowCampaigns = campaignRowsSince.all(since);
+  // Month-to-date uses the widest window we already have when possible, else its
+  // own query (early in the month `since` is inside the month; later it isn't).
+  const monthCampaigns = monthStart >= since
+    ? windowCampaigns.filter(c => c.date >= monthStart)
+    : campaignRowsSince.all(monthStart);
 
   const summarise = (rows) => rows.reduce((a, c) => ({
     campaigns_count: a.campaigns_count + 1,
@@ -122,6 +130,7 @@ router.get('/', (req, res) => {
     failedMails,
     identities,
     totals,
+    month:     { date: monthStart, ...summarise(monthCampaigns) },
     today:     { date: today,     ...summarise(todayCampaigns) },
     yesterday: { date: yesterday, ...summarise(yesterdayCampaigns) },
     todayCampaigns,

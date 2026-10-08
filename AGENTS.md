@@ -1407,7 +1407,9 @@ SENT job's `finished_at`).
 **Dashboard analytics** — `GET /api/dashboard` (`routes/dashboard.js`) returns a
 single analytics payload: `contacts` (status counts), `failedMails` (count),
 `identities` (health), `totals` (all-time emails_sent/delivered/bounced,
-campaign_count, and globally-distinct `unique_opens`/`unique_clicks`), `today` /
+campaign_count, and globally-distinct `unique_opens`/`unique_clicks`), `month`
+(month-to-date summary — campaigns with `date >= 'YYYY-MM-01'` — powering the
+headline KPI cards), `today` /
 `yesterday` summaries (campaigns_count, sent, delivered, unique_opens,
 unique_clicks), `todayCampaigns` / `yesterdayCampaigns` (per-campaign rows with
 unique opens/clicks), a zero-filled 14-day `trend` array, `inboxUnread`, and
