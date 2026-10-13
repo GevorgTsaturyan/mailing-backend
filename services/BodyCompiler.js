@@ -46,6 +46,7 @@ function escapeHtml(s) {
 }
 
 const DEFAULT_STYLE = {
+  type:            'button', // 'button' (block CTA) | 'link' (inline text link)
   background_color: '#2563eb',
   text_color:      '#ffffff',
   font_size:       16,
@@ -55,6 +56,7 @@ const DEFAULT_STYLE = {
   padding_y:       12,
   align:           'center',
   width:           'auto', // 'auto' | 'full'
+  underline:       false,  // text-decoration: underline when true
 };
 
 function normalizeStyle(style) {
@@ -67,6 +69,24 @@ function normalizeStyle(style) {
 // block, no JavaScript. border-radius degrades gracefully where unsupported.
 export function renderButtonHtml(style, text, url) {
   const s = normalizeStyle(style);
+  const label = escapeHtml(text);
+  const href  = escapeHtml(url);
+
+  // Inline text link — flows with the surrounding copy (no table, no padding),
+  // e.g. "verify it here: open my account". Underline on by default.
+  if (s.type === 'link') {
+    const fg   = escapeHtml(s.text_color);
+    const fs   = Number(s.font_size) || DEFAULT_STYLE.font_size;
+    const fw   = escapeHtml(s.font_weight);
+    const deco = s.underline === false ? 'none' : 'underline';
+    return (
+      `<a href="${href}" target="_blank" ` +
+      `style="color:${fg};font-family:Arial,Helvetica,sans-serif;` +
+      `font-size:${fs}px;font-weight:${fw};text-decoration:${deco};">` +
+      `${label}</a>`
+    );
+  }
+
   const bg   = escapeHtml(s.background_color);
   const fg   = escapeHtml(s.text_color);
   const fs   = Number(s.font_size)     || DEFAULT_STYLE.font_size;
@@ -76,8 +96,7 @@ export function renderButtonHtml(style, text, url) {
   const py   = Number(s.padding_y)     || 0;
   const align = ['left', 'center', 'right'].includes(s.align) ? s.align : 'center';
   const full  = s.width === 'full';
-  const label = escapeHtml(text);
-  const href  = escapeHtml(url);
+  const deco  = s.underline ? 'underline' : 'none';
 
   const tableWidth = full ? 'width:100%;' : '';
   const linkBlock  = full ? 'display:block;text-align:center;' : 'display:inline-block;';
@@ -90,7 +109,7 @@ export function renderButtonHtml(style, text, url) {
     `<a href="${href}" target="_blank" ` +
     `style="${linkBlock}background-color:${bg};color:${fg};` +
     `font-family:Arial,Helvetica,sans-serif;font-size:${fs}px;font-weight:${fw};` +
-    `text-decoration:none;padding:${py}px ${px}px;border-radius:${br}px;">` +
+    `text-decoration:${deco};padding:${py}px ${px}px;border-radius:${br}px;">` +
     `${label}</a></td></tr></table>`
   );
 }

@@ -7,9 +7,10 @@ import db from '../db.js';
 // whitelisted, email-safe property set (NOT a free-form CSS editor).
 
 const STYLE_KEYS = new Set([
-  'background_color', 'text_color', 'font_size', 'font_weight',
-  'border_radius', 'padding_x', 'padding_y', 'align', 'width',
+  'type', 'background_color', 'text_color', 'font_size', 'font_weight',
+  'border_radius', 'padding_x', 'padding_y', 'align', 'width', 'underline',
 ]);
+const TYPES   = new Set(['button', 'link']);
 const ALIGN   = new Set(['left', 'center', 'right']);
 const WIDTH   = new Set(['auto', 'full']);
 const WEIGHTS = new Set(['normal', 'bold', '400', '600', '700']);
@@ -23,11 +24,13 @@ export function validateStyle(input = {}) {
     if (!STYLE_KEYS.has(k)) continue;
     s[k] = v;
   }
+  if (s.type             != null && !TYPES.has(s.type))            throw new Error('type must be button|link');
   if (s.background_color != null && !HEX.test(s.background_color)) throw new Error('background_color must be a hex color');
   if (s.text_color       != null && !HEX.test(s.text_color))       throw new Error('text_color must be a hex color');
   if (s.font_weight      != null && !WEIGHTS.has(String(s.font_weight))) throw new Error('invalid font_weight');
   if (s.align            != null && !ALIGN.has(s.align))           throw new Error('align must be left|center|right');
   if (s.width            != null && !WIDTH.has(s.width))           throw new Error('width must be auto|full');
+  if (s.underline        != null) s.underline = !!s.underline;
   for (const num of ['font_size', 'border_radius', 'padding_x', 'padding_y']) {
     if (s[num] != null) {
       const n = Number(s[num]);
