@@ -114,8 +114,12 @@ export function renderButtonHtml(style, text, url) {
   );
 }
 
+// Plain-text rendering of a button is the tracking URL ALONE — no label, no
+// "text:" prefix. A button placed mid-sentence ("see details here: {{button:N}}")
+// must not duplicate the surrounding copy; the sentence already supplies context.
+// Click tracking is preserved because `url` is the click.<domain>/c/<token> link.
 export function renderButtonText(text, url) {
-  return `${text}: ${url}`;
+  return url;
 }
 
 const PIXEL_RE = /<\/body\s*>/i;

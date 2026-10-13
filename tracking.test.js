@@ -134,8 +134,10 @@ test('HTML button expands to a table anchor with the tracking URL', () => {
   assert.ok(html.includes('<table'));
   assert.ok(html.includes('href="https://click.serawin.net/c/TOK700"'));
   assert.ok(html.includes('PLAY NOW'));
-  // plain text stays usable
-  assert.ok(txt.includes('PLAY NOW: https://click.serawin.net/c/TOK700'));
+  // plain text carries the tracking URL alone (no label, no "text:" prefix) so a
+  // button placed mid-sentence does not duplicate the surrounding copy.
+  assert.equal(txt, 'hi https://click.serawin.net/c/TOK700');
+  assert.ok(!txt.includes('PLAY NOW'));
 });
 
 test('pixel injected only when pixelUrl provided, and before </body>', () => {

@@ -154,7 +154,9 @@ test('compileForContact expands buttons with a resolvable tracking URL (+ text C
   });
   assert.ok(out.body.includes('<table'));
   assert.ok(out.body.includes('https://click.serawin.net/c/'));
-  assert.ok(out.bodyText.includes('PLAY NOW: https://click.serawin.net/c/'));
+  // plain text = tracking URL only (no label), keeping mid-sentence copy clean
+  assert.ok(out.bodyText.includes('https://click.serawin.net/c/'));
+  assert.ok(!out.bodyText.includes('PLAY NOW'));
 
   // the generated click URL actually resolves to the frozen destination
   const clickUrl = out.body.match(/href="(https:\/\/click\.serawin\.net\/c\/[^"]+)"/)[1];
