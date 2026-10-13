@@ -163,6 +163,27 @@ test('compileForContact expands buttons with a resolvable tracking URL (+ text C
   assert.equal(res.headers.get('location'), 'https://example.com/e2e');
 });
 
+test('plain text tracks the same click URL even when it holds the raw destination link (no {{button}} token)', () => {
+  const now = new Date().toISOString();
+  const srv = db.prepare("INSERT INTO servers (label, apiKey, createdAt) VALUES ('s', ?, ?)").run(`k-${seq++}`, now).lastInsertRowid;
+  const idn = db.prepare("INSERT INTO sender_identities (serverId, domain, ip, createdAt) VALUES (?, 'serawin.net', '1.2.3.4', ?)").run(srv, now).lastInsertRowid;
+  const button = ButtonRepository.create({ internal_name: 'RawLink', text: 'open my account', destination_url: 'https://app.example.com/verify' });
+  const campaign = db.prepare('SELECT * FROM campaigns WHERE id=?').get(mkCampaign());
+  const contact = { id: mkContact() };
+
+  // Button only in the HTML as a token; the plain-text was authored with the raw link.
+  const out = compileForContact({
+    campaign, contact, identityId: Number(idn),
+    tmpl: {
+      html: `<p>Verify it here: {{button:${button.id}}}</p>`,
+      txt:  'Verify it here: https://app.example.com/verify',
+      content_type: 'html',
+    },
+  });
+  assert.ok(out.bodyText.includes('https://click.serawin.net/c/'), 'plain text should carry the tracking URL');
+  assert.ok(!out.bodyText.includes('https://app.example.com/verify'), 'raw destination must not survive in plain text');
+});
+
 // ── Open-tracking readiness gate (default ON) ─────────────────────────────────
 
 test('pixel injected only when the tracking host is ready; ON is the default', () => {

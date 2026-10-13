@@ -78,12 +78,29 @@ export function compileForContact({ campaign, contact, identityId, tmpl }) {
     { resolveSnapshot, clickUrl, pixelUrl },
   );
 
+  // Make the plain-text part track like the HTML part. `{{button:ID}}` tokens are
+  // already expanded to tracking URLs by compile(); this additionally rewrites any
+  // LITERAL button destination_url the author typed into the text (or that was only
+  // added to the HTML) into the same per-recipient click URL — so a text reader
+  // follows the identical tracked link, never the raw destination.
+  const trackTextLinks = (txt) => {
+    if (!txt) return txt;
+    let out = txt;
+    for (const id of referencedButtonIds({ html: tmpl.html, txt: tmpl.txt })) {
+      const snap = resolveSnapshot(id);
+      if (snap.destination_url && out.includes(snap.destination_url)) {
+        out = out.split(snap.destination_url).join(clickUrl(snap.id));
+      }
+    }
+    return out;
+  };
+
   if (contentType === 'text') {
-    return { body: compiled.txt, bodyText: null };
+    return { body: trackTextLinks(compiled.txt), bodyText: null };
   }
 
   // HTML email: body = compiled HTML; bodyText = a usable plain-text alternative.
-  let bodyText = compiled.txt;
+  let bodyText = trackTextLinks(compiled.txt);
   if (usesButtons && !bodyText.trim()) {
     // The template has no text body — synthesise one so the plain-text part still
     // carries each CTA as "TEXT: url" (never a stripped, link-less button).
