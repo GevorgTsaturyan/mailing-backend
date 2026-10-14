@@ -114,6 +114,62 @@ async function insertOne(overrides = {}) {
   return row?.id;
 }
 
+// Raw GET that returns the response as a Buffer (for binary attachment downloads).
+function rawGet(path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const r = http.request({
+      hostname: '127.0.0.1', port: server.address().port, path, method: 'GET', headers,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, buffer: Buffer.concat(chunks) }));
+    });
+    r.on('error', reject);
+    r.end();
+  });
+}
+
+// ── Attachments ───────────────────────────────────────────────────────────────
+
+test('INBOX-ATT: attachments are stored, listed, and downloadable with correct bytes', async () => {
+  const pdf = Buffer.from('%PDF-1.4 hello attachment');
+  const r = await nodePost([{
+    message_id: '<att-1@test.com>', from_address: 'a@gmail.com', to_address: 'support@calerion.org',
+    mailbox: 'support@calerion.org', subject: 'With attachment', text_body: 'see attached',
+    has_attachments: 1, received_at: now,
+    attachments: [
+      { filename: 'invoice.pdf', content_type: 'application/pdf', content_base64: pdf.toString('base64') },
+      { filename: 'toobig.bin',  content_type: 'application/octet-stream', size: 123 }, // metadata only
+    ],
+  }]);
+  assert.equal(r.status, 200);
+  const id = db.prepare('SELECT id FROM inbound_messages WHERE message_id = ?').get('<att-1@test.com>').id;
+
+  // GET message includes attachment metadata (never the bytes)
+  const msg = await req('GET', `/api/inbox/${id}`, null, AUTH);
+  assert.equal(msg.status, 200);
+  assert.equal(msg.body.attachments.length, 2);
+  const [a0, a1] = msg.body.attachments;
+  assert.equal(a0.filename, 'invoice.pdf');
+  assert.equal(a0.downloadable, true);
+  assert.equal(a0.size, pdf.length);
+  assert.equal(a1.downloadable, false); // no content shipped → metadata only
+  assert.ok(!('content' in a0));
+
+  // Download returns the exact bytes with an attachment disposition
+  const dl = await rawGet(`/api/inbox/${id}/attachments/${a0.id}`, AUTH);
+  assert.equal(dl.status, 200);
+  assert.equal(dl.headers['content-type'], 'application/pdf');
+  assert.match(dl.headers['content-disposition'], /attachment; filename="invoice\.pdf"/);
+  assert.ok(dl.buffer.equals(pdf), 'downloaded bytes match the original');
+
+  // Metadata-only attachment → 404; download requires JWT
+  const gone = await req('GET', `/api/inbox/${id}/attachments/${a1.id}`, null, AUTH);
+  assert.equal(gone.status, 404);
+  const noAuth = await req('GET', `/api/inbox/${id}/attachments/${a0.id}`);
+  assert.equal(noAuth.status, 401);
+});
+
 // ── Node ingestion: authentication ────────────────────────────────────────────
 
 test('INBOX-A: invalid apiKey → 401', async () => {

@@ -662,6 +662,27 @@ db.exec(`
     ON inbound_messages(from_address);
 `);
 
+// ─── Inbound attachments ──────────────────────────────────────────────────────
+// One row per attachment of an inbound message. Content is stored inline as a
+// BLOB (base64-decoded by the controller on receipt). `content` may be NULL when
+// the attachment exceeded the size cap at ingest time — metadata is still kept so
+// the UI can list it, and the download endpoint returns 404 for a NULL body.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS inbound_attachments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id   INTEGER NOT NULL REFERENCES inbound_messages(id) ON DELETE CASCADE,
+    filename     TEXT NOT NULL DEFAULT 'attachment',
+    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    size         INTEGER NOT NULL DEFAULT 0,
+    content_id   TEXT,
+    content      BLOB,
+    created_at   TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_inbound_attachments_message_id
+    ON inbound_attachments(message_id);
+`);
+
 // ─── Failed mails (Failed Deliveries feature) ─────────────────────────────────
 //
 // One row per contact whose most recent delivery FAILED — either a SMTP

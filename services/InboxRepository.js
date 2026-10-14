@@ -106,6 +106,8 @@ export function insertMessage(serverId, msg) {
   const toAddr    = msg.to_address || '';
   const mailbox   = msg.mailbox    || toAddr;
   const domain    = mailbox.includes('@') ? mailbox.split('@')[1] : '';
+  const attachments  = Array.isArray(msg.attachments) ? msg.attachments : [];
+  const hasAttach    = (msg.has_attachments || attachments.length > 0) ? 1 : 0;
 
   const info = db.prepare(`
     INSERT INTO inbound_messages (
@@ -130,11 +132,62 @@ export function insertMessage(serverId, msg) {
     msg.references    || msg.msg_references || null,
     Number(serverId)  || 0,
     snippet,
-    msg.has_attachments ? 1 : 0,
+    hasAttach,
     new Date().toISOString()
   );
 
-  return { id: Number(info.lastInsertRowid), duplicate: false };
+  const id = Number(info.lastInsertRowid);
+  insertAttachments(id, attachments);
+  return { id, duplicate: false };
+}
+
+// Attachments larger than this are not stored inline (metadata only). Keeps the
+// SQLite row and the controller's JSON body within sane bounds.
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+function insertAttachments(messageId, attachments) {
+  if (!attachments || attachments.length === 0) return;
+  const now  = new Date().toISOString();
+  const stmt = db.prepare(`
+    INSERT INTO inbound_attachments
+      (message_id, filename, content_type, size, content_id, content, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const att of attachments) {
+    if (!att || typeof att !== 'object') continue;
+    let content = null;
+    let size    = Number(att.size) || 0;
+    if (typeof att.content_base64 === 'string' && att.content_base64) {
+      const buf = Buffer.from(att.content_base64, 'base64');
+      size = buf.length;
+      if (buf.length <= MAX_ATTACHMENT_BYTES) content = buf;  // else: metadata only
+    }
+    stmt.run(
+      messageId,
+      String(att.filename || 'attachment').slice(0, 255),
+      att.content_type || 'application/octet-stream',
+      size,
+      att.content_id || null,
+      content,
+      now,
+    );
+  }
+}
+
+// Attachment metadata for a message (never the BLOB — keeps list payloads small).
+export function listAttachments(messageId) {
+  return db.prepare(`
+    SELECT id, filename, content_type, size, content_id,
+           (content IS NOT NULL) AS downloadable
+    FROM inbound_attachments WHERE message_id = ? ORDER BY id
+  `).all(messageId).map(r => ({ ...r, downloadable: !!r.downloadable }));
+}
+
+// A single attachment row INCLUDING its BLOB, scoped to its message for safety.
+export function getAttachment(messageId, attachmentId) {
+  return db.prepare(
+    'SELECT * FROM inbound_attachments WHERE id = ? AND message_id = ?'
+  ).get(attachmentId, messageId) || null;
 }
 
 export function listMessages({
@@ -198,8 +251,11 @@ export function markUnread(id) {
   ).run(id);
 }
 
-// Permanently remove an inbound message. Returns the number of rows deleted.
+// Permanently remove an inbound message and its attachments. (Explicit attachment
+// delete so it works regardless of the foreign_keys pragma state.) Returns the
+// number of message rows deleted.
 export function deleteMessage(id) {
+  db.prepare('DELETE FROM inbound_attachments WHERE message_id = ?').run(id);
   return db.prepare('DELETE FROM inbound_messages WHERE id = ?').run(id).changes;
 }
 

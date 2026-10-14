@@ -10,6 +10,8 @@ import {
   markUnread,
   deleteMessage,
   getUnreadCount,
+  listAttachments,
+  getAttachment,
 } from '../services/InboxRepository.js';
 
 const router = express.Router();
@@ -46,11 +48,32 @@ router.get('/stats', (req, res) => {
   res.json({ unread });
 });
 
-// GET /api/inbox/:id — full message including html_body, text_body
+// GET /api/inbox/:id — full message including html_body, text_body, attachments
 router.get('/:id', (req, res) => {
   const msg = getMessage(req.params.id);
   if (!msg) return res.status(404).json({ error: 'Message not found' });
-  res.json(msg);
+  res.json({ ...msg, attachments: listAttachments(msg.id) });
+});
+
+// GET /api/inbox/:id/attachments/:attachmentId — download one attachment.
+// JWT-protected (like all /api/inbox routes); the frontend fetches it as a blob
+// so the Authorization header is sent. The attachment is scoped to its message.
+router.get('/:id/attachments/:attachmentId', (req, res) => {
+  const msg = getMessage(req.params.id);
+  if (!msg) return res.status(404).json({ error: 'Message not found' });
+  const att = getAttachment(msg.id, req.params.attachmentId);
+  if (!att) return res.status(404).json({ error: 'Attachment not found' });
+  if (att.content == null) {
+    return res.status(404).json({ error: 'Attachment content not stored (too large)' });
+  }
+  const name = String(att.filename || 'attachment');
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  res.setHeader('Content-Type', att.content_type || 'application/octet-stream');
+  res.setHeader('Content-Disposition',
+    `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  res.setHeader('Content-Length', att.content.length);
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  return res.send(att.content);
 });
 
 // PATCH /api/inbox/:id/read
