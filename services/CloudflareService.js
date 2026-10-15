@@ -14,6 +14,8 @@
 //   DMARC:      absent→create p=none, existing→preserve (never overwrite)
 //   unsubscribe/click A: same rules as A record
 
+import { isValidDkimPublicKey } from './DkimKey.js';
+
 const CF_BASE = 'https://api.cloudflare.com/client/v4';
 
 function token() { return process.env.CF_API_TOKEN || ''; }
@@ -138,6 +140,17 @@ async function ensureDKIM(zoneId, domain, selector, dkimPublicKey) {
   if (!dkimPublicKey) {
     return { status: 'PENDING', message: 'DKIM public key not yet available from mail-node' };
   }
+  // Never publish a key that does not decode to a valid RSA public key — that is
+  // exactly the truncated-key failure this whole fix exists to prevent. Treat it
+  // as PENDING (not FAILED) so the retry/repair loop can re-fetch the full key
+  // from the mail-node rather than permanently failing the identity.
+  if (!isValidDkimPublicKey(dkimPublicKey)) {
+    return {
+      status: 'PENDING',
+      message: `DKIM public key from mail-node is invalid/truncated ` +
+               `(${dkimPublicKey.replace(/\s/g, '').length} chars) — awaiting full key before publishing`,
+    };
+  }
   const name = `${selector}._domainkey.${domain}`;
   const content = `v=DKIM1; k=rsa; p=${dkimPublicKey}`;
   const records = await listRecords(zoneId, 'TXT', name);
@@ -146,11 +159,29 @@ async function ensureDKIM(zoneId, domain, selector, dkimPublicKey) {
     await createRecord(zoneId, 'TXT', name, content);
     return { status: 'OK', message: `DKIM TXT ${name} created` };
   }
-  // Normalise for comparison: strip all whitespace and quote characters
+
+  // Normalise for comparison: strip all whitespace and quote characters.
   const normalise = s => s.replace(/["\s]/g, '');
-  if (normalise(records[0].content).includes(normalise(`p=${dkimPublicKey}`))) {
+  const desired   = dkimPublicKey.replace(/\s/g, '');
+  const existing  = normalise(records[0].content);
+
+  if (existing.includes(`p=${desired}`)) {
     return { status: 'SKIPPED', message: `DKIM TXT ${name} already correct` };
   }
+
+  // Truncation repair: if the PUBLISHED key is a strict, non-empty prefix of the
+  // correct full key, it is provably the SAME key cut short by the old parsing
+  // bug — not a different key — so it is safe to patch it to the full value. A
+  // genuinely different key is never a prefix and still fails (never overwritten).
+  const publishedP = (existing.match(/p=([A-Za-z0-9+/=]+)/) || [])[1] || '';
+  if (publishedP && publishedP.length < desired.length && desired.startsWith(publishedP)) {
+    await patchRecord(zoneId, records[0].id, 'TXT', name, content);
+    return {
+      status: 'OK',
+      message: `DKIM TXT ${name} repaired (truncated ${publishedP.length} → full ${desired.length} chars)`,
+    };
+  }
+
   return {
     status: 'FAILED',
     message: `DKIM DNS mismatch on ${name} — existing record has a different key. Manual fix required.`,

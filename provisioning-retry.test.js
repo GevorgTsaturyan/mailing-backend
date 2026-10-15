@@ -267,6 +267,51 @@ test('PR-5: unprovisioned + READY identity never receives a reverify task', asyn
   assert.equal(task, undefined, 'READY identity must never get a reverify task, regardless of provisioningStatus');
 });
 
+// ── DKIM truncation repair scheduling ─────────────────────────────────────────
+// The stored dkimPublicKey equals what was published to DNS, so a key that does
+// not parse as a valid RSA key is the signature of the old truncation bug. The
+// retry loop must schedule a reverify so the mail-node re-reports the full key —
+// even for an already-READY identity (the one exception to "no reverify when
+// READY"). Requires CF to be configured.
+const FULL_KEY =
+  'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxhBK9pohlyMVb5byExPuRX02SNNlIJ2cJAiSXNunatSbdnzwny7cF/OkBCCfkEs2ImFWqU86kj1hR2+nebtWxm2mix/yNYol/bkmLYNhYcQJ9Wt3DO7a3B6xFra2spf+RmxCK0UUtLh3+yvWIoOx5rDs1d9cu7dQHRaI1OW/VN0oU5RXSYbWvi5yEJouMF35rIz8lV5GHoFr6BAnVC7N/JmTbEq4xh/QSMW04WcfrL7r5xhZgKEZ9uepHjPZ2CtNkgFzkVr9+WjWFDurDjHYKVbl/2nLsKocu+MpfnVBEv0DC2BLgPTdbctlZXreWS85DHb615S7WeBk9lEnOfv3NwIDAQAB';
+const TRUNC_KEY = FULL_KEY.slice(0, 250);
+
+function setDkimKey(id, key) {
+  db.prepare('UPDATE sender_identities SET dkimPublicKey=? WHERE id=?').run(key, id);
+}
+
+async function withCf(fn) {
+  const prev = process.env.CF_API_TOKEN;
+  process.env.CF_API_TOKEN = 'retry-cf-token';
+  try { return await fn(); } finally { process.env.CF_API_TOKEN = prev; }
+}
+
+test('DKIM repair: READY identity with a TRUNCATED stored key gets a reverify scheduled', async () => {
+  const id = mkIdentity('dkim-trunc-ready.example', 'READY', phasesComplete);
+  setDkimKey(id, TRUNC_KEY);
+  await withCf(() => run({ hostsHealthy: healthyProbe }));
+  const task = db.prepare("SELECT taskType, status FROM provisioning_tasks WHERE identityId=?").get(id);
+  assert.ok(task, 'a truncated DKIM key must schedule a repair reverify even when READY');
+  assert.equal(task.taskType, 'reverify');
+});
+
+test('DKIM repair: READY identity with a VALID full key schedules nothing (no churn)', async () => {
+  const id = mkIdentity('dkim-valid-ready.example', 'READY', phasesComplete);
+  setDkimKey(id, FULL_KEY);
+  await withCf(() => run({ hostsHealthy: healthyProbe }));
+  const task = db.prepare("SELECT id FROM provisioning_tasks WHERE identityId=?").get(id);
+  assert.equal(task, undefined, 'a valid DKIM key must not trigger a repair reverify');
+});
+
+test('DKIM repair: no reverify scheduled when Cloudflare is not configured', async () => {
+  const id = mkIdentity('dkim-trunc-nocf.example', 'READY', phasesComplete);
+  setDkimKey(id, TRUNC_KEY);
+  await run({ hostsHealthy: healthyProbe }); // CF_API_TOKEN = '' for this file
+  const task = db.prepare("SELECT id FROM provisioning_tasks WHERE identityId=?").get(id);
+  assert.equal(task, undefined, 'without CF automation there is nothing to repair');
+});
+
 // ── Guards ─────────────────────────────────────────────────────────────────────
 
 test('runRetries: no OVH — OvhService.js must not exist', async () => {

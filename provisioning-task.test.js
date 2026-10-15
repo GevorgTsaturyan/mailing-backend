@@ -320,6 +320,34 @@ test('result: DONE with dkim_key phase stores dkimPublicKey on identity', async 
   assert.equal(si.dkimPublicKey, pubKey, 'dkimPublicKey must be stored from dkim_key phase result');
 });
 
+test('result: reverify DONE re-reporting a corrected (full) DKIM key updates the stored key', async () => {
+  // Simulates the merovia.org repair: a previously-stored TRUNCATED key is
+  // replaced when a reverify task re-reports the full key (read-only, no genkey).
+  const id = mkIdentity(serverC, 'dkim-repair-reverify.example');
+  const truncated = 'MIIBIjANtruncatedprefix';
+  const full      = 'MIIBIjANtruncatedprefixANDTHEREST==';
+  db.prepare('UPDATE sender_identities SET dkimPublicKey=? WHERE id=?').run(truncated, id);
+
+  // Insert + claim a reverify task (as the retry service would).
+  db.prepare(
+    "INSERT INTO provisioning_tasks (identityId, serverId, status, taskType, requestedAt) VALUES (?,?,'PENDING','reverify',?)"
+  ).run(id, serverC, now);
+  const { body: claimed } = await req('GET', `/api/nodes/provisioning-task?apiKey=${API_KEY_C}`);
+  assert.equal(claimed.taskType, 'reverify');
+
+  await req('POST', `/api/nodes/provisioning-task/${claimed.id}/result`, {
+    apiKey: API_KEY_C,
+    status: 'DONE',
+    phases: [
+      { phase: 'dkim_key', status: 'SKIPPED', message: 'DKIM public key re-read for repair', dkimPublicKey: full },
+      { phase: 'verify',   status: 'OK',      message: 'Sent' },
+    ],
+  });
+
+  const si = db.prepare('SELECT dkimPublicKey FROM sender_identities WHERE id=?').get(id);
+  assert.equal(si.dkimPublicKey, full, 'a reverify that re-reports the full key must overwrite the truncated one');
+});
+
 // ── B. Identity cannot be READY/dispatched if task reported FAILED ────────────
 // Regression: an identity whose provisioning task reports FAILED must have
 // provisioningStatus='FAILED' and verificationStatus='unverified', blocking dispatch.

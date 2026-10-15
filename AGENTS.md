@@ -345,7 +345,7 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | POST | `/api/nodes/results` | `{apiKey, results[]}`. Reports send outcomes. Updates send_jobs, send_log, contacts. |
 | POST | `/api/nodes/delivery-events` | `{apiKey, events[]}`. Delegates to `DeliveryEventService.processEvents`. Updates `delivery_events` (INSERT OR IGNORE), applies FSM transitions on `jobs.delivery_status`, updates `send_jobs`+`send_log` (both pipelines), updates `campaign_stats` counters, and marks contacts failed/unsubscribed. BOUNCED records the contact in `failed_mails` (source='bounce'); DELIVERED clears it. Returns `{ok, processed, skipped}`. |
 | GET | `/api/nodes/provisioning-task` | `?apiKey=`. Returns the oldest `PENDING` provisioning task for this server's identities and atomically transitions it to `IN_PROGRESS`. Returns **204 No Content** when no task is pending. Response: `{id, identityId, domain, ip, selector}`. Node executes DKIM+Postfix+OpenDKIM locally, then POSTs the result. |
-| POST | `/api/nodes/provisioning-task/:id/result` | `{apiKey, status:'DONE'\|'FAILED', phases:[{phase,status,message}], error?}`. Node reports task completion. Updates `provisioning_tasks.status`, sets `sender_identities.provisioningStatus`. On `DONE`: non-blocking fire of `provision-identity-hosts.sh` for nginx/TLS (uses same sudo mechanism as admin endpoint). |
+| POST | `/api/nodes/provisioning-task/:id/result` | `{apiKey, status:'DONE'\|'FAILED', phases:[{phase,status,message,dkimPublicKey?}], error?}`. Node reports task completion. Updates `provisioning_tasks.status`, sets `sender_identities.provisioningStatus`. On `DONE`: extracts the `dkim_key` phase's `dkimPublicKey` (both `provision` AND `reverify` tasks carry it); if it changed, stores it on the identity. Fires `runControllerProvisioning()` (CF DNS → DNS gate → nginx/TLS, non-blocking) for `provision` tasks always, and for `reverify` tasks ONLY when the key changed (a DKIM repair) — a routine reverify of a healthy identity causes no DNS/certbot churn. |
 
 ### Job Queue API (Milestone 4 — fully active; Milestone 5: side-effects added)
 | Method | Path | Auth | Notes |
@@ -832,15 +832,26 @@ Returns `{ ok, phases, skipped? }`. When `CF_API_TOKEN` is unset, returns `ok:fa
 1. `a_mail` — `A mail.<domain> → <ip>` (absent→create, correct→skip, wrong→update)
 2. `mx` — `MX <domain> 10 mail.<domain>` (absent→create, correct→skip, wrong host/priority→update)
 3. `spf` — `TXT <domain>` v=spf1 (absent→create, ip missing→merge, 2+ records→FAIL)
-4. `dkim` — `TXT <sel>._domainkey.<domain>` (absent→create, same→skip, different→FAIL — never overwrite)
+4. `dkim` — `TXT <sel>._domainkey.<domain>` (absent→create, same→skip, **truncated-prefix→repair (PATCH)**,
+   genuinely different→FAIL — never overwrite). Before publishing, the key is validated with
+   `DkimKey.isValidDkimPublicKey()`; an invalid/truncated key returns **PENDING** (never published) so the
+   retry/repair loop can re-fetch the full key. "Truncated-prefix" = the already-published key is a strict
+   prefix of the full key (the old mail-node multi-segment parsing bug) → provably the same key cut short,
+   so it is safe to PATCH to the full value.
 5. `dmarc` — `TXT _dmarc.<domain>` (absent→create p=none, existing→preserve — never overwrite)
 6. `a_unsubscribe` — `A unsubscribe.<domain> → <controllerIp>` (only if controllerIp provided)
 7. `a_click` — `A click.<domain> → <controllerIp>` (only if controllerIp provided)
 
-`ok=false` when any phase is FAILED or PENDING (DKIM key not yet available).
+`ok=false` when any phase is FAILED or PENDING (DKIM key not yet available/invalid).
 `cloudflare.phases.mx` failing blocks the READY badge in `controllerComplete()` (Servers.vue) —
 the identity stays NEEDS_ATTENTION until MX is confirmed, preventing sending with a broken inbound path.
-Tests: `cloudflare.test.js` (30 tests, mocked fetch, no real CF calls).
+Tests: `cloudflare.test.js` (mocked fetch, no real CF calls). `DkimKey.js` validator tests: `dkim-key.test.js`.
+
+### DkimKey.js — DKIM public-key validation (controller)
+`isValidDkimPublicKey(base64)` — base64-decodes the key and parses it as an RSA SPKI. A key truncated by
+the old mail-node parsing bug is valid base64 with a `p=` but does NOT decode to a complete key; this guard
+catches that (what Gmail reports as `dkim=neutral (invalid public key)`). Mirrors
+`mail-node/services/DkimKey.js` (the two packages do not share code).
 
 ### ProvisioningRetryService.js — Controller-Side Provisioning Health Loop
 Runs every 5 minutes (`startProvisioningRetryService()`). Candidates: all identities with
@@ -857,6 +868,14 @@ pipeline — e.g. serawin.net). Two cases per identity:
   If either host fails, re-runs the controller pipeline (idempotent heal). If both are healthy,
   no provisioning changes are made — **no nginx/DNS/Postfix changes**. Never schedules a reverify
   for an already-READY identity.
+- **DKIM truncation repair** (both cases, only when `CF_API_TOKEN` is set): the stored
+  `dkimPublicKey` equals what was published to DNS, so a key that fails `isValidDkimPublicKey()`
+  is the signature of the old multi-segment truncation bug — detectable WITHOUT re-querying DNS.
+  Schedules a one-off `reverify` (the one exception to "no reverify when READY") so the mail-node
+  re-reports the FULL key; the task-result handler then stores it and republishes via the pipeline
+  (`ensureDKIM` PATCHes the truncated record). Self-terminating: once a valid key is stored, the
+  condition no longer fires. This is the automatic repair path for already-provisioned identities
+  (e.g. merovia.org) — no private key is regenerated and no DNS is patched by hand.
 
 **UI implication:** `controllerComplete()` in `Servers.vue` short-circuits to `true` when
 `provisioningPhases.controllerHealth.status === 'OK'`, clearing the amber NEEDS_ATTENTION badge.

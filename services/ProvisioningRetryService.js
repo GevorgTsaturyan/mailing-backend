@@ -37,6 +37,7 @@ import { isConfigured as cfConfigured } from './CloudflareService.js';
 import { runControllerProvisioning } from './ControllerProvisioningService.js';
 import { checkControllerHostsHealthy } from './ControllerHostHealth.js';
 import { mergePhases } from './ProvisioningPhaseStore.js';
+import { isValidDkimPublicKey } from './DkimKey.js';
 
 const RETRY_INTERVAL_MS  = 5 * 60 * 1000;  // 5 minutes between retry cycles
 const REVERIFY_COOLDOWN  = 5 * 60 * 1000;  // minimum gap between reverify tasks
@@ -84,6 +85,18 @@ export function controllerNeedsRetry(phases) {
 async function retryIdentity(identity, provision, hostsHealthy) {
   const phases  = parsePhases(identity);
   const isReady = identity.verificationStatus === 'READY';
+
+  // DKIM truncation repair (works for in-flight AND already-READY identities).
+  // The stored key equals what was published to DNS, so a key that does not parse
+  // as a valid RSA public key is the signature of the old multi-segment parsing
+  // bug — detectable here WITHOUT re-querying DNS. Schedule a one-off reverify so
+  // the mail-node re-reports the FULL key (read-only, no genkey) and the pipeline
+  // republishes it. Cooldown-guarded and self-terminating: once the full valid key
+  // is stored and published, this condition no longer fires.
+  if (cfConfigured() && identity.dkimPublicKey && !isValidDkimPublicKey(identity.dkimPublicKey)) {
+    log(`DKIM key for ${identity.domain} is invalid/truncated — scheduling repair reverify`);
+    scheduleReverifyTask(identity);
+  }
 
   if (isReady) {
     // ── Case B: mail-node is satisfied — only heal the CONTROLLER side ────────

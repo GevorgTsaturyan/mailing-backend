@@ -289,23 +289,31 @@ router.post('/provisioning-task/:id/result', (req, res) => {
 
   touch(server.id);
 
-  // On 'provision' task DONE: extract DKIM public key, then run the controller
-  // pipeline (CF DNS → DNS resolution gate → nginx/TLS) non-blocking.
-  if (status === 'DONE' && task.taskType !== 'reverify') {
+  // On task DONE: extract the DKIM public key the node reported, then drive the
+  // controller pipeline. Both 'provision' and 'reverify' tasks now carry a
+  // 'dkim_key' phase — reverify re-reports the full key (read-only, no genkey) so
+  // a record truncated by the old parsing bug can be repaired without touching
+  // the private key.
+  if (status === 'DONE') {
     const identity = db.prepare(
       'SELECT id, domain, ip, dkimSelector, dkimPublicKey FROM sender_identities WHERE id=?'
     ).get(task.identityId);
 
     if (identity?.domain) {
       // Extract DKIM public key from the mail-node's phases report so the
-      // controller can create the CF DKIM TXT record.
+      // controller can create/repair the CF DKIM TXT record.
       const dkimPhase = Array.isArray(phases) ? phases.find(p => p.phase === 'dkim_key') : null;
-      const dkimPublicKey = dkimPhase?.dkimPublicKey || null;
+      const reportedKey = dkimPhase?.dkimPublicKey || null;
+      // The key the controller will act on: prefer a freshly reported one, else
+      // fall back to the stored value (e.g. a reverify that omitted the phase).
+      const dkimPublicKey = reportedKey || identity.dkimPublicKey || null;
+      const keyChanged    = reportedKey && reportedKey !== identity.dkimPublicKey;
 
       // Persist the public key for retry use (needed if CF not configured now).
-      if (dkimPublicKey) {
+      // A changed key means the node re-reported a corrected (un-truncated) key.
+      if (keyChanged) {
         db.prepare('UPDATE sender_identities SET dkimPublicKey=? WHERE id=?')
-          .run(dkimPublicKey, identity.id);
+          .run(reportedKey, identity.id);
       }
 
       // Store mail-node phase results in the pipeline blob.
@@ -318,14 +326,19 @@ router.post('/provisioning-task/:id/result', (req, res) => {
         mailNode: { status: 'DONE', phases: mailNodePhaseMap },
       });
 
-      // Fire the controller pipeline non-blocking. The DNS-resolution gate inside
-      // ensures certbot is never run before unsubscribe/click actually resolve;
-      // if DNS is not ready, nginx stays PENDING and ProvisioningRetryService
-      // completes it automatically on its cooldown.
-      runControllerProvisioning(identity, { dkimPublicKey })
-        .catch(err => console.error(
-          `[nodes/task-result] controller provisioning error for ${identity.domain}:`, err.message
-        ));
+      // Fire the controller pipeline non-blocking when there is work to do:
+      //   • initial provision tasks always run it (first-time DNS/TLS setup);
+      //   • reverify tasks run it ONLY when the key changed (a repair), so a
+      //     routine reverify of a healthy identity causes no DNS/certbot churn.
+      // The DNS-resolution gate inside ensures certbot is never run before
+      // unsubscribe/click resolve; if DNS is not ready, nginx stays PENDING and
+      // ProvisioningRetryService completes it automatically on its cooldown.
+      if (task.taskType !== 'reverify' || keyChanged) {
+        runControllerProvisioning({ ...identity, dkimPublicKey }, { dkimPublicKey })
+          .catch(err => console.error(
+            `[nodes/task-result] controller provisioning error for ${identity.domain}:`, err.message
+          ));
+      }
     }
   }
 

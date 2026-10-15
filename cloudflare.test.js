@@ -35,7 +35,11 @@ const ZONE    = 'zone-id-test-123';
 const DOMAIN  = 'example-cf-test.com';
 const IP      = '10.0.0.1';
 const SEL     = 'mail';
-const PUBKEY  = 'MIGfMA0GCSqGSIb3DQEBA';
+// A real, complete 2048-bit RSA DKIM public key (392 base64 chars). ensureDKIM
+// now refuses to publish a key that does not decode to a valid RSA public key
+// (the truncation guard), so the fixture must be a genuine key.
+const PUBKEY  =
+  'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxhBK9pohlyMVb5byExPuRX02SNNlIJ2cJAiSXNunatSbdnzwny7cF/OkBCCfkEs2ImFWqU86kj1hR2+nebtWxm2mix/yNYol/bkmLYNhYcQJ9Wt3DO7a3B6xFra2spf+RmxCK0UUtLh3+yvWIoOx5rDs1d9cu7dQHRaI1OW/VN0oU5RXSYbWvi5yEJouMF35rIz8lV5GHoFr6BAnVC7N/JmTbEq4xh/QSMW04WcfrL7r5xhZgKEZ9uepHjPZ2CtNkgFzkVr9+WjWFDurDjHYKVbl/2nLsKocu+MpfnVBEv0DC2BLgPTdbctlZXreWS85DHb615S7WeBk9lEnOfv3NwIDAQAB';
 const CTLR_IP = '10.0.0.2';
 
 // Convenience: zone-found response
@@ -253,6 +257,38 @@ test('DKIM: FAILED when existing record has a different key — never overwrites
   assert.equal(r.phases.dkim?.status, 'FAILED');
   assert.ok(r.phases.dkim.message.includes('mismatch') || r.phases.dkim.message.includes('Manual fix'));
   assert.equal(r.ok, false);
+});
+
+test('DKIM: repairs a TRUNCATED record (published key is a prefix of the full key)', async () => {
+  const TRUNC = PUBKEY.slice(0, 250); // first DNS character-string only (the bug)
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queueSpfOk();
+  queue.push(ok([{ id: 'dk-1', content: `v=DKIM1; k=rsa; p=${TRUNC}` }])); // list → truncated
+  queue.push(ok({ id: 'dk-1' }));                                          // PATCH → repaired
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY });
+  assert.equal(r.phases.dkim?.status, 'OK');
+  assert.match(r.phases.dkim.message, /repaired/i);
+  // The repair must be a PATCH carrying the FULL key.
+  const patch = calls.find(c => c.method === 'PATCH' && c.url.includes('/dns_records/dk-1'));
+  assert.ok(patch, 'expected a PATCH to the existing DKIM record');
+  assert.ok(JSON.parse(patch.body).content.includes(PUBKEY), 'PATCH must publish the full key');
+  assert.equal(r.ok, true);
+});
+
+test('DKIM: refuses to publish an INVALID/truncated key (PENDING, no write)', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queueSpfOk();
+  // No DKIM list/create fetch expected — the key is rejected before any API call.
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY.slice(0, 250) });
+  assert.equal(r.phases.dkim?.status, 'PENDING');
+  assert.match(r.phases.dkim.message, /invalid|truncated/i);
+  assert.ok(!calls.some(c => c.url.includes('_domainkey')), 'must not touch DNS for an invalid key');
 });
 
 test('DKIM: PENDING when dkimPublicKey is not yet available', async () => {
