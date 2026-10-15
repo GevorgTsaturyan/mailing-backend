@@ -47,6 +47,8 @@ router.put('/:name', (req, res) => {
 router.delete('/:name', (req, res) => {
   const result = db.prepare('DELETE FROM templates WHERE name = ?').run(req.params.name);
   if (result.changes === 0) return res.status(404).json({ error: 'Template not found' });
+  // Drop the template from any groups it belonged to (membership is keyed by name).
+  db.prepare('DELETE FROM template_group_members WHERE template_name = ?').run(req.params.name);
   res.json({ ok: true });
 });
 

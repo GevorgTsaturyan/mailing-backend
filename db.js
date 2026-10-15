@@ -708,6 +708,30 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_failed_mails_failed_at ON failed_mails(failed_at DESC);
 `);
 
+// ─── Template groups ──────────────────────────────────────────────────────────
+// Organise email templates into named groups (many-to-many, mirroring contact
+// groups). Membership is keyed by template NAME because templates.name is the
+// primary key. Deleting a template clears its memberships (handled explicitly in
+// the templates route so it works regardless of the foreign_keys pragma).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS template_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    createdAt   TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS template_group_members (
+    group_id      INTEGER NOT NULL REFERENCES template_groups(id) ON DELETE CASCADE,
+    template_name TEXT    NOT NULL,
+    addedAt       TEXT    NOT NULL,
+    PRIMARY KEY (group_id, template_name)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_template_group_members_name
+    ON template_group_members(template_name);
+`);
+
 // ─── Timezone support for send windows ───────────────────────────────────────
 // startTime/endTime are stored as "HH:MM" in local time for the given timezone.
 // The scheduler converts to UTC at run time so DST is handled correctly each day.
