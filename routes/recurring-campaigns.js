@@ -1,6 +1,8 @@
 import express from 'express';
 import db from '../db.js';
 import { applyRecurringCampaigns } from '../scheduler.js';
+import { validateWeeklySchedule, validateStartDate } from '../services/RecurringSchedule.js';
+import { resendPreview } from '../services/SendLedger.js';
 
 const router = express.Router();
 
@@ -13,15 +15,23 @@ function withGroups(row) {
   return { ...row, groupIds };
 }
 
-// Validate target_mode + groupIds. Returns an error string, or null when valid.
-// Empty group set in 'groups' mode is rejected — it must never fall through to all.
-function validateTargeting(targetMode, groupIds) {
-  if (targetMode != null && targetMode !== 'all' && targetMode !== 'groups')
-    return "target_mode must be 'all' or 'groups'";
+// Validate target_mode + groupIds / resendCampaignIds. Returns an error string, or
+// null when valid. An empty group/source set is rejected — never falls through to all.
+function validateTargeting(targetMode, groupIds, resendCampaignIds) {
+  if (targetMode != null && !['all', 'groups', 'resend'].includes(targetMode))
+    return "target_mode must be 'all', 'groups' or 'resend'";
   if (targetMode === 'groups' && (!Array.isArray(groupIds) || groupIds.length === 0))
     return 'At least one group is required when target_mode is "groups"';
+  if (targetMode === 'resend') {
+    if (!Array.isArray(resendCampaignIds) || resendCampaignIds.length === 0)
+      return 'At least one source campaign is required when target_mode is "resend"';
+    const exists = db.prepare('SELECT 1 FROM campaigns WHERE id = ?');
+    if (!resendCampaignIds.every((cid) => exists.get(Number(cid)))) return 'Source campaign not found';
+  }
   return null;
 }
+
+const parseIds = (raw) => { try { return JSON.parse(raw || '[]'); } catch { return []; } };
 
 // Replace a campaign's targeted groups with the given set (only existing groups).
 function syncGroups(campaignId, groupIds) {
@@ -33,19 +43,30 @@ function syncGroups(campaignId, groupIds) {
   }
 }
 
+// Non-opener audience size for a prospective resend: ?campaignIds=1,2,3
+router.get('/resend-preview', (req, res) => {
+  const ids = String(req.query.campaignIds || '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  if (ids.length === 0) return res.status(400).json({ error: 'campaignIds required' });
+  res.json(resendPreview(ids));
+});
+
 router.get('/', (req, res) => {
   res.json(db.prepare('SELECT * FROM recurring_campaigns ORDER BY createdAt DESC').all().map(withGroups));
 });
 
 router.post('/', (req, res) => {
-  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds, senderIdentityId, timezone } = req.body;
+  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds, senderIdentityId, timezone, startDate, weeklySchedule, resendCampaignIds } = req.body;
   if (!name) return res.status(400).json({ error: 'name required' });
   if (!templateName && !subject) return res.status(400).json({ error: 'templateName or subject required' });
   if (content_type != null && content_type !== 'html' && content_type !== 'text')
     return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
   const targetMode = target_mode || 'all';
-  const targetingError = validateTargeting(targetMode, groupIds);
+  const targetingError = validateTargeting(targetMode, groupIds, resendCampaignIds);
   if (targetingError) return res.status(400).json({ error: targetingError });
+  const sd = validateStartDate(startDate);
+  if (sd.error) return res.status(400).json({ error: sd.error });
+  const ws = validateWeeklySchedule(weeklySchedule);
+  if (ws.error) return res.status(400).json({ error: ws.error });
 
   const identityId = senderIdentityId
     ? (db.prepare('SELECT id FROM sender_identities WHERE id=? AND status=?').get(senderIdentityId, 'active')?.id ?? null)
@@ -54,8 +75,9 @@ router.post('/', (req, res) => {
   const id = db.transaction(() => {
     const result = db.prepare(`
       INSERT INTO recurring_campaigns
-        (name, templateName, subject, html, txt, content_type, startTime, endTime, initialCount, increasePercent, status, currentDay, target_mode, sender_identity_id, timezone, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?)
+        (name, templateName, subject, html, txt, content_type, startTime, endTime, initialCount, increasePercent, status, currentDay, target_mode, sender_identity_id, timezone,
+         start_date, weekly_schedule, resend_campaign_ids, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name,
       templateName || null, subject || null, html || null, txt || null,
@@ -63,6 +85,9 @@ router.post('/', (req, res) => {
       startTime || '09:00', endTime || '17:00',
       initialCount || 10, increasePercent || 0,
       targetMode, identityId, timezone || 'UTC',
+      sd.value,
+      ws.value ? JSON.stringify(ws.value) : null,
+      targetMode === 'resend' ? JSON.stringify([...new Set(resendCampaignIds.map(Number))]) : null,
       new Date().toISOString()
     );
     const cid = result.lastInsertRowid;
@@ -79,7 +104,7 @@ router.put('/:id', (req, res) => {
   const row = db.prepare('SELECT * FROM recurring_campaigns WHERE id=?').get(id);
   if (!row) return res.status(404).json({ error: 'Not found' });
 
-  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds, senderIdentityId, timezone } = req.body;
+  const { name, templateName, subject, html, txt, startTime, endTime, initialCount, increasePercent, content_type, target_mode, groupIds, senderIdentityId, timezone, startDate, weeklySchedule, resendCampaignIds } = req.body;
 
   if (content_type != null && content_type !== 'html' && content_type !== 'text')
     return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
@@ -90,8 +115,16 @@ router.put('/:id', (req, res) => {
   const nextGroups = groupIds !== undefined
     ? groupIds
     : db.prepare('SELECT group_id FROM recurring_campaign_groups WHERE recurring_campaign_id = ?').all(id).map((r) => r.group_id);
-  const targetingError = validateTargeting(nextMode, nextGroups);
+  const nextResend = resendCampaignIds !== undefined ? resendCampaignIds : parseIds(row.resend_campaign_ids);
+  const targetingError = validateTargeting(nextMode, nextGroups, nextResend);
   if (targetingError) return res.status(400).json({ error: targetingError });
+  // Omitted startDate / weeklySchedule keep the stored value; explicit null clears it.
+  const sd = startDate !== undefined ? validateStartDate(startDate) : { value: row.start_date };
+  if (sd.error) return res.status(400).json({ error: sd.error });
+  const ws = weeklySchedule !== undefined
+    ? validateWeeklySchedule(weeklySchedule)
+    : { value: row.weekly_schedule ? JSON.parse(row.weekly_schedule) : null };
+  if (ws.error) return res.status(400).json({ error: ws.error });
 
   const nextIdentityId = senderIdentityId !== undefined
     ? (senderIdentityId ? (db.prepare('SELECT id FROM sender_identities WHERE id=? AND status=?').get(senderIdentityId, 'active')?.id ?? null) : null)
@@ -101,7 +134,8 @@ router.put('/:id', (req, res) => {
     db.prepare(`
       UPDATE recurring_campaigns
       SET name=?, templateName=?, subject=?, html=?, txt=?, content_type=?,
-          startTime=?, endTime=?, initialCount=?, increasePercent=?, target_mode=?, sender_identity_id=?, timezone=?
+          startTime=?, endTime=?, initialCount=?, increasePercent=?, target_mode=?, sender_identity_id=?, timezone=?,
+          start_date=?, weekly_schedule=?, resend_campaign_ids=?
       WHERE id=?
     `).run(
       name          ?? row.name,
@@ -116,6 +150,9 @@ router.put('/:id', (req, res) => {
       increasePercent ?? row.increasePercent,
       nextMode, nextIdentityId,
       timezone      !== undefined ? (timezone || 'UTC') : (row.timezone || 'UTC'),
+      sd.value,
+      ws.value ? JSON.stringify(ws.value) : null,
+      nextMode === 'resend' ? JSON.stringify([...new Set(nextResend.map(Number))]) : null,
       id
     );
     // Rewrite membership when mode/groups change; 'all' clears any stale rows.

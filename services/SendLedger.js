@@ -32,12 +32,60 @@ export function record(sourceType, sourceId, contactId, now) {
   return r.changes > 0;
 }
 
+const cleanIds = (ids) => [...new Set((ids || []).map(Number).filter((n) => Number.isInteger(n)))];
+
+// "Non-opener of these dispatch campaigns": the contact was successfully sent at
+// least one job from them (status SENT, not bounced/failed/complained) and has NO
+// open or click event in any of them. Any open counts — bot/prefetch included — so
+// we never resend to someone who may have opened. Note: with open tracking off,
+// nobody can register an open, so every delivered recipient qualifies.
+function nonOpenerSql(ids) {
+  const ph = ids.map(() => '?').join(',');
+  return {
+    sql: `EXISTS (
+        SELECT 1 FROM jobs j
+        WHERE j.contact_id = c.id AND j.campaign_id IN (${ph})
+          AND j.status = 'SENT'
+          AND COALESCE(j.delivery_status, '') NOT IN ('BOUNCED', 'SEND_FAILED', 'COMPLAINED')
+      )
+      AND NOT EXISTS (SELECT 1 FROM open_events  o WHERE o.contact_id = c.id AND o.campaign_id IN (${ph}))
+      AND NOT EXISTS (SELECT 1 FROM click_events k WHERE k.contact_id = c.id AND k.campaign_id IN (${ph}))`,
+    params: [...ids, ...ids, ...ids],
+  };
+}
+
+// Audience preview for a resend: how many recipients were sent, how many opened
+// (or clicked), and how many non-openers are currently eligible (not suppressed).
+export function resendPreview(campaignIds) {
+  const ids = cleanIds(campaignIds);
+  if (ids.length === 0) return { sent: 0, opened: 0, eligible: 0 };
+  const ph = ids.map(() => '?').join(',');
+  const sent = db.prepare(`
+    SELECT COUNT(DISTINCT contact_id) n FROM jobs
+    WHERE campaign_id IN (${ph}) AND status = 'SENT' AND contact_id IS NOT NULL
+  `).get(...ids).n;
+  const opened = db.prepare(`
+    SELECT COUNT(*) n FROM (
+      SELECT contact_id FROM open_events  WHERE campaign_id IN (${ph}) AND contact_id IS NOT NULL
+      UNION
+      SELECT contact_id FROM click_events WHERE campaign_id IN (${ph}) AND contact_id IS NOT NULL
+    )
+  `).get(...ids, ...ids).n;
+  const { sql, params } = nonOpenerSql(ids);
+  const eligible = db.prepare(`
+    SELECT COUNT(*) n FROM contacts c WHERE ${sql} AND ${suppressionExclusionSql('c')}
+  `).get(...params).n;
+  return { sent, opened, eligible };
+}
+
 // Contacts eligible for the next send from a source: NOT already in this source's
 // ledger, NOT suppressed (unsubscribed), ordered by id and capped at `limit`.
 //   target_mode='all'    → whole contact pool
 //   target_mode='groups' → DISTINCT union of the targeted groups' members;
 //                          an empty groupIds set yields ZERO rows (never "all").
-export function eligibleContacts({ sourceType, sourceId, targetMode, groupIds = [], limit }) {
+//   target_mode='resend' → non-openers of the source dispatch campaigns
+//                          (`campaignIds`, see nonOpenerSql); empty set → ZERO rows.
+export function eligibleContacts({ sourceType, sourceId, targetMode, groupIds = [], campaignIds = [], limit }) {
   if (limit == null || limit <= 0) return [];
   const notLedgered = `NOT EXISTS (
       SELECT 1 FROM campaign_send_ledger l
@@ -58,6 +106,20 @@ export function eligibleContacts({ sourceType, sourceId, targetMode, groupIds = 
       ORDER BY c.id
       LIMIT ?
     `).all(...ids, sourceType, sourceId, limit);
+  }
+
+  if (targetMode === 'resend') {
+    const ids = cleanIds(campaignIds);
+    if (ids.length === 0) return []; // empty source set is NEVER all contacts
+    const { sql, params } = nonOpenerSql(ids);
+    return db.prepare(`
+      SELECT c.* FROM contacts c
+      WHERE ${sql}
+        AND ${notLedgered}
+        AND ${notSuppressed}
+      ORDER BY c.id
+      LIMIT ?
+    `).all(...params, sourceType, sourceId, limit);
   }
 
   // target_mode='all' (default)

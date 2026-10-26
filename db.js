@@ -745,4 +745,15 @@ try { db.exec("ALTER TABLE recurring_campaigns  ADD COLUMN timezone TEXT NOT NUL
 try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN sender_identity_id INTEGER REFERENCES sender_identities(id)") } catch {}
 try { db.exec("ALTER TABLE scheduled_sends   ADD COLUMN sender_identity_id INTEGER REFERENCES sender_identities(id)") } catch {}
 
+// ─── Recurring campaign start date + weekly schedule + resend-to-non-openers ──
+// All three are nullable with no default, so every existing row keeps its exact
+// behaviour (start immediately, one startTime–endTime window every day).
+//   start_date          'YYYY-MM-DD' — nothing is planned before this UTC day
+//   weekly_schedule     JSON {"0".."6": [{start:"HH:MM", end:"HH:MM"}, ...]} (0=Sunday),
+//                       times in the campaign's timezone; days with no ranges are skipped
+//   resend_campaign_ids JSON [campaigns.id, ...] — used when target_mode='resend'
+try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN start_date TEXT") } catch {}
+try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN weekly_schedule TEXT") } catch {}
+try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN resend_campaign_ids TEXT") } catch {}
+
 export default db;

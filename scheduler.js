@@ -9,6 +9,7 @@ import { hasButtonPlaceholder } from './services/BodyCompiler.js';
 import { purgeOldEvents, retentionDays } from './services/EventRetention.js';
 import * as SendLedger from './services/SendLedger.js';
 import { DAILY_BATCH_SOURCE_ID } from './services/SendLedger.js';
+import { rangesForDay, splitCount, parseWeeklySchedule } from './services/RecurringSchedule.js';
 
 // Pre-validate a template before queueing a campaign's jobs. Returns true when
 // safe to proceed. On a problem it logs an actionable error and returns false so
@@ -381,6 +382,42 @@ function nextCount(campaign) {
   ));
 }
 
+// Today's random send times for a recurring campaign (sorted UTC ISO strings).
+// Legacy campaigns (no weekly_schedule) use the single startTime–endTime window
+// exactly as before. With a weekly schedule, `count` is split evenly across the
+// day's ranges that have not ended yet (e.g. 30 over 3 ranges → 10 + 10 + 10).
+// Returns [] before start_date or on a weekday with no ranges.
+function recurringTimesToday(campaign, todayUTC, count) {
+  const tz     = campaign.timezone || 'UTC';
+  const ranges = rangesForDay(campaign, todayUTC)
+    .map((r) => ({ start: localHHMMtoUTC(r.start, tz), end: localHHMMtoUTC(r.end, tz) }));
+  if (ranges.length === 0) return [];
+  if (!parseWeeklySchedule(campaign.weekly_schedule)) return randomTimesInWindow(ranges[0].start, ranges[0].end, count);
+
+  const now     = new Date();
+  const nowMins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const open    = ranges.filter((r) => {
+    const [eh, em] = r.end.split(':').map(Number);
+    return eh * 60 + em > nowMins;
+  });
+  const shares = splitCount(count, open.length);
+  return open.flatMap((r, i) => randomTimesInWindow(r.start, r.end, shares[i])).sort();
+}
+
+// Audience for a recurring campaign. 'resend' targets the non-openers of the
+// snapshotted source dispatch campaigns (see SendLedger.eligibleContacts).
+function recurringTargeting(campaign) {
+  const targetMode = campaign.target_mode || 'all';
+  const groupIds   = targetMode === 'groups'
+    ? db.prepare('SELECT group_id FROM recurring_campaign_groups WHERE recurring_campaign_id=?').all(campaign.id).map((r) => r.group_id)
+    : [];
+  let campaignIds = [];
+  if (targetMode === 'resend') {
+    try { campaignIds = JSON.parse(campaign.resend_campaign_ids || '[]'); } catch { campaignIds = []; }
+  }
+  return { targetMode, groupIds, campaignIds };
+}
+
 function planRecurringCampaigns() {
   const todayUTC = new Date().toISOString().split('T')[0];
 
@@ -395,15 +432,8 @@ function planRecurringCampaigns() {
     if (!campaignBodyOkOrSkip(resolveTemplate(campaign.templateName, templateContent), `Recurring "${campaign.name}"`)) continue;
 
     // Per-campaign targeting + ledger source. Empty group set stays empty (never all).
-    const targetMode = campaign.target_mode || 'all';
-    const groupIds   = targetMode === 'groups'
-      ? db.prepare('SELECT group_id FROM recurring_campaign_groups WHERE recurring_campaign_id=?').all(campaign.id).map((r) => r.group_id)
-      : [];
+    const { targetMode, groupIds, campaignIds } = recurringTargeting(campaign);
     const rcLedger   = { sourceType: 'recurring', sourceId: campaign.id };
-
-    const rcTZ    = campaign.timezone || 'UTC';
-    const rcStart = localHHMMtoUTC(campaign.startTime, rcTZ);
-    const rcEnd   = localHHMMtoUTC(campaign.endTime,   rcTZ);
 
     if (useCanonicalQueue()) {
       const identityId = campaign.sender_identity_id || pickActiveIdentity();
@@ -417,16 +447,16 @@ function planRecurringCampaigns() {
         continue;
       }
 
-      const times = randomTimesInWindow(rcStart, rcEnd, count);
+      const times = recurringTimesToday(campaign, todayUTC, count);
       if (times.length === 0) {
-        // Send window has already ended for today; midnight cron handles tomorrow.
-        console.log(`Recurring "${campaign.name}": send window already passed for today — will run tomorrow`);
+        // Not a sending day (start date / weekday) or the window already ended; midnight cron handles tomorrow.
+        console.log(`Recurring "${campaign.name}": nothing to send today (not started, off day, or window passed)`);
         continue;
       }
 
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
-        targetMode, groupIds, limit: times.length,
+        targetMode, groupIds, campaignIds, limit: times.length,
       });
 
       if (contacts.length === 0) {
@@ -455,16 +485,16 @@ function planRecurringCampaigns() {
       console.log(`Recurring "${campaign.name}" (day ${campaign.currentDay + 1}, canonical): queued ${created} jobs`);
     } else {
       const identityId = campaign.sender_identity_id || null;
-      const times      = randomTimesInWindow(rcStart, rcEnd, requestedCount);
+      const times      = recurringTimesToday(campaign, todayUTC, requestedCount);
       if (times.length === 0) {
-        // Send window has already ended for today; midnight cron handles tomorrow.
-        console.log(`Recurring "${campaign.name}": send window already passed for today — will run tomorrow`);
+        // Not a sending day (start date / weekday) or the window already ended; midnight cron handles tomorrow.
+        console.log(`Recurring "${campaign.name}": nothing to send today (not started, off day, or window passed)`);
         continue;
       }
 
       const contacts = SendLedger.eligibleContacts({
         sourceType: rcLedger.sourceType, sourceId: rcLedger.sourceId,
-        targetMode, groupIds, limit: times.length,
+        targetMode, groupIds, campaignIds, limit: times.length,
       });
 
       if (contacts.length === 0) {

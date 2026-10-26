@@ -49,7 +49,7 @@ backend/
     send.js                 # POST /api/send (queue jobs), GET /api/send/jobs (queue overview)
     schedule.js             # GET/POST /api/schedule (daily batch config)
     scheduled-sends.js      # CRUD /api/scheduled-sends
-    recurring-campaigns.js  # CRUD /api/recurring-campaigns + pause/resume
+    recurring-campaigns.js  # CRUD /api/recurring-campaigns + pause/resume + resend-preview
     log.js                  # GET/DELETE /api/log (send history)
     smtp.js                 # GET/PUT /api/smtp + POST /api/smtp/test
     providers.js            # CRUD /api/providers
@@ -110,6 +110,7 @@ backend/
   send-groups.test.js       # Groups as extra recipient source for manual + one-off sends (both queue modes)
   ledger.test.js            # SendLedger unit tests: claims, eligibility, guarded backfill
   scheduler-targeting.test.js  # End-to-end automated targeting via the ledger (both queue modes)
+  recurring-schedule.test.js   # Start date, per-weekday ranges, resend-to-non-openers (both queue modes)
   groups-targeting.test.js  # target_mode config + group deletion safety (409 / detach) (both queue modes)
   admin-provision.test.js   # POST /api/admin/provision-identity: auth, validation, injection prevention, execFile args
   provisioning-task.test.js # Automated provisioning task flow: poll+claim, result DONE/FAILED, JWT provision trigger, idempotency
@@ -306,8 +307,9 @@ Completed recurring campaigns and one-off/manual sends never block group deletio
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | `/api/recurring-campaigns` | All, ordered by createdAt DESC. Each row includes `target_mode` and `groupIds[]` |
-| POST | `/api/recurring-campaigns` | `{name, templateName? or subject+html+txt, startTime, endTime, initialCount, increasePercent, content_type?, target_mode?, groupIds?[]}`. `target_mode`: `'all'` (default) or `'groups'`; **400** if `groups` with zero groups |
-| PUT | `/api/recurring-campaigns/:id` | Update config fields incl. `content_type?`, `target_mode?`, `groupIds?`. Switching to `all` clears targeted groups; `groups` with zero groups → 400 |
+| GET | `/api/recurring-campaigns/resend-preview?campaignIds=1,2` | `{sent, opened, eligible}` — distinct recipients sent, opened-or-clicked, and current non-opener audience size for those dispatch `campaigns` ids |
+| POST | `/api/recurring-campaigns` | `{name, templateName? or subject+html+txt, startTime, endTime, initialCount, increasePercent, content_type?, target_mode?, groupIds?[], startDate?, weeklySchedule?, resendCampaignIds?[]}`. `target_mode`: `'all'` (default), `'groups'` or `'resend'`; **400** if `groups` with zero groups or `resend` with zero/unknown source campaigns. `startDate` `'YYYY-MM-DD'` (null = immediately). `weeklySchedule` `{"0".."6": [{start,end}]}` (0=Sunday; null = legacy single window every day); **400** on bad/overlapping/empty ranges |
+| PUT | `/api/recurring-campaigns/:id` | Update config fields incl. `content_type?`, `target_mode?`, `groupIds?`, `startDate?`, `weeklySchedule?`, `resendCampaignIds?`. Omitted fields keep stored values; explicit `null` clears `startDate`/`weeklySchedule`. Switching to `all` clears targeted groups; `groups` with zero groups → 400 |
 | POST | `/api/recurring-campaigns/:id/pause` | Sets status=paused |
 | POST | `/api/recurring-campaigns/:id/resume` | Sets status=active |
 | DELETE | `/api/recurring-campaigns/:id` | Also clears its ledger rows (`campaign_send_ledger` source `recurring`) |
@@ -450,7 +452,11 @@ recurring_campaigns (
   startTime TEXT DEFAULT '09:00', endTime TEXT DEFAULT '17:00',
   initialCount INTEGER DEFAULT 10, increasePercent REAL DEFAULT 0,
   status TEXT DEFAULT 'active', currentDay INTEGER DEFAULT 0,
-  lastRunDate TEXT, createdAt TEXT
+  lastRunDate TEXT, createdAt TEXT,
+  -- nullable, no default → existing rows unchanged (start now, one window daily):
+  start_date TEXT,          -- 'YYYY-MM-DD' UTC day; nothing planned before it
+  weekly_schedule TEXT,     -- JSON {"0".."6":[{start,end}]} in campaign tz; days w/o ranges don't send
+  resend_campaign_ids TEXT  -- JSON [campaigns.id]; used when target_mode='resend'
 )
 
 providers (id INTEGER PK, name TEXT UNIQUE, createdAt TEXT)
@@ -899,6 +905,8 @@ Does NOT send email. Creates job queue rows for mail-nodes to pick up.
 - Selects recipients via `SendLedger.eligibleContacts` for source `daily_batch`/`DAILY_BATCH_SOURCE_ID` (honours `target_mode`/groups, excludes ledgered + unsubscribed) — **not** `status='pending'`
 - **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window; creates a `type='daily_batch'` campaign row, then calls `queueCanonicalJobForContact` (with the daily-batch ledger source) for each contact; calls `incrementJobs` after the loop
 - **Legacy**: generates random timestamps, creates `send_jobs` rows (also with the ledger source)
+
+**Start date / weekly schedule / resend (`services/RecurringSchedule.js`)** — `rangesForDay(campaign, dayUTC)` returns `[]` before `start_date` or on a weekday with no ranges, the single `startTime–endTime` window for legacy rows (`weekly_schedule` NULL — identical code path to before), else that weekday's ranges. `recurringTimesToday()` splits the day's count evenly over the ranges that haven't ended (`splitCount(30,3)` → 10/10/10). A non-sending day does **not** advance `currentDay`/`lastRunDate`, so growth counts sending days. `target_mode='resend'` → `SendLedger.eligibleContacts` returns contacts with a `SENT` job (not BOUNCED/SEND_FAILED/COMPLAINED) in the source campaigns and **no** open or click event there (any open, bot included, counts), minus suppressed and already-ledgered. With open tracking off every delivered recipient qualifies.
 
 **`planRecurringCampaigns()`** — called on startup + every midnight UTC:
 - For each `active` recurring campaign where `lastRunDate != today`:
