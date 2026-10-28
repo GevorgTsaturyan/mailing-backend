@@ -256,6 +256,7 @@ export function markUnread(id) {
 // number of message rows deleted.
 export function deleteMessage(id) {
   db.prepare('DELETE FROM inbound_attachments WHERE message_id = ?').run(id);
+  db.prepare('DELETE FROM inbox_replies WHERE inbound_message_id = ?').run(id);
   return db.prepare('DELETE FROM inbound_messages WHERE id = ?').run(id).changes;
 }
 

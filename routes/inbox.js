@@ -13,6 +13,7 @@ import {
   listAttachments,
   getAttachment,
 } from '../services/InboxRepository.js';
+import { sendReply, listReplies, identityForMessage, replySubject } from '../services/InboxReplyService.js';
 
 const router = express.Router();
 
@@ -52,7 +53,23 @@ router.get('/stats', (req, res) => {
 router.get('/:id', (req, res) => {
   const msg = getMessage(req.params.id);
   if (!msg) return res.status(404).json({ error: 'Message not found' });
-  res.json({ ...msg, attachments: listAttachments(msg.id) });
+  const identity = identityForMessage(msg);
+  res.json({
+    ...msg,
+    attachments: listAttachments(msg.id),
+    replies:     listReplies(msg.id),
+    // Who a reply would be sent from (null → this mailbox cannot reply).
+    reply_from:    identity?.fromAddr ?? null,
+    reply_subject: replySubject(msg.subject),
+  });
+});
+
+// POST /api/inbox/:id/reply — { body, includeQuote? } → queues a plain-text reply
+router.post('/:id/reply', (req, res) => {
+  const { body, includeQuote } = req.body || {};
+  const result = sendReply(req.params.id, { body, includeQuote: includeQuote !== false });
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.status(201).json(result.reply);
 });
 
 // GET /api/inbox/:id/attachments/:attachmentId — download one attachment.

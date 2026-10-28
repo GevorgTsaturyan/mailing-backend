@@ -114,6 +114,7 @@ backend/
   groups-targeting.test.js  # target_mode config + group deletion safety (409 / detach) (both queue modes)
   admin-provision.test.js   # POST /api/admin/provision-identity: auth, validation, injection prevention, execFile args
   provisioning-task.test.js # Automated provisioning task flow: poll+claim, result DONE/FAILED, JWT provision trigger, idempotency
+  inbox-reply.test.js       # Inbox reply: threaded plain-text job from the mailbox identity, Reply-To, validation, cascade delete
   inbox.test.js             # 30 tests (INBOX-A..Z5): node POST inbound-messages + JWT inbox CRUD, dedup, filters, pagination, read/unread, HTML sanitization
 ```
 
@@ -231,7 +232,8 @@ Raw jobs (no contact, no unsubscribe URL) are never gated. Dev/test escape hatch
 |--------|------|-------|
 | GET | `/api/inbox` | List messages. Query: `page`, `limit` (max 100), `domain`, `mailbox`, `is_read` (0/1), `search`. Returns `{messages[], total, page, limit}` (no body columns in list) |
 | GET | `/api/inbox/stats` | `{unread}` count. Optional `domain`/`mailbox` filter |
-| GET | `/api/inbox/:id` | Full message including `text_body`, `html_body` (sanitized), headers |
+| GET | `/api/inbox/:id` | Full message including `text_body`, `html_body` (sanitized), headers, `replies[]` (with `job_status`/`delivery_status`), `reply_from` (identity fromAddr owning the mailbox, or null) and `reply_subject` |
+| POST | `/api/inbox/:id/reply` | `{body, includeQuote?=true}` → 201 reply row. `services/InboxReplyService.js`: queues a canonical `jobs` row (priority 100, `content_type='text'`, no contact → no unsubscribe/tracking) FROM the active identity whose `fromAddr` = message `mailbox`/`to_address`, TO `reply_to` or `from_address`, subject `Re: …`, body + optional `> `-quoted original; sets `jobs.in_reply_to` / `jobs.msg_references` for threading; records `inbox_replies`; marks the message read. **400** empty body / no owning identity / identity not READY; **404** unknown message |
 | PATCH | `/api/inbox/:id/read` | Mark read; returns `{ok}` |
 | PATCH | `/api/inbox/:id/unread` | Mark unread; returns `{ok}` |
 | DELETE | `/api/inbox/:id` | Permanently delete the message; 404 if missing; returns `{ok}` |
@@ -619,6 +621,14 @@ schedule_config.target_mode     TEXT NOT NULL DEFAULT 'all'  -- 'all' | 'groups'
 schema_migrations ( name TEXT PK, ran_at TEXT NOT NULL )
 
 -- Inbound messages received by mail-nodes (Dovecot LMTP delivery):
+-- Inbox replies (one per reply sent from the Inbox; send state lives on the job):
+inbox_replies (
+  id INTEGER PK, inbound_message_id INTEGER FK→inbound_messages ON DELETE CASCADE,
+  job_id INTEGER FK→jobs, identity_id INTEGER, from_address TEXT, to_address TEXT,
+  subject TEXT, body TEXT, created_at TEXT
+)
+jobs.in_reply_to TEXT, jobs.msg_references TEXT  -- threading headers; NULL for non-reply jobs
+
 inbound_messages (
   id              INTEGER PK,
   message_id      TEXT,          -- RFC 2822 Message-ID (nullable; not all mail has one)

@@ -756,4 +756,24 @@ try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN start_date TEXT") } ca
 try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN weekly_schedule TEXT") } catch {}
 try { db.exec("ALTER TABLE recurring_campaigns ADD COLUMN resend_campaign_ids TEXT") } catch {}
 
+// ─── Inbox replies ───────────────────────────────────────────────────────────
+// Threading headers for a reply job (NULL for every other job → node unchanged).
+try { db.exec("ALTER TABLE jobs ADD COLUMN in_reply_to TEXT") } catch {}
+try { db.exec("ALTER TABLE jobs ADD COLUMN msg_references TEXT") } catch {}
+// One row per reply sent from the Inbox; the delivery state lives on the job.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS inbox_replies (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    inbound_message_id INTEGER NOT NULL REFERENCES inbound_messages(id) ON DELETE CASCADE,
+    job_id             INTEGER REFERENCES jobs(id),
+    identity_id        INTEGER,
+    from_address       TEXT NOT NULL,
+    to_address         TEXT NOT NULL,
+    subject            TEXT NOT NULL,
+    body               TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_inbox_replies_message ON inbox_replies(inbound_message_id);
+`);
+
 export default db;
