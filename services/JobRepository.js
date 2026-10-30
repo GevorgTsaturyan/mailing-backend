@@ -46,6 +46,12 @@ export function getIdentityDomain(identityId) {
 //   Set<domain>  — contact-bound jobs are only returned when their sending domain
 //                  is in the set; raw jobs (no contact_id) are always returned
 //   empty Set    — only raw jobs are returned (no domain has a verified host yet)
+// Jobs of a PAUSED recurring campaign stay PENDING but are not dispatched, so
+// "Pause" also holds emails that were already queued for today. Resume releases them.
+const NOT_PAUSED_CAMPAIGN = `
+  NOT EXISTS (SELECT 1 FROM campaigns pc JOIN recurring_campaigns prc ON prc.id = pc.recurring_campaign_id
+              WHERE pc.id = j.campaign_id AND prc.status = 'paused')`;
+
 export function findNextPending(serverId, { readyDomains = null } = {}) {
   const now = new Date().toISOString();
   const base = `
@@ -58,6 +64,7 @@ export function findNextPending(serverId, { readyDomains = null } = {}) {
     LEFT   JOIN contacts c ON c.id = j.contact_id
     WHERE  j.status = 'PENDING'
       AND  (j.scheduled_for IS NULL OR j.scheduled_for <= ?)
+      AND  ${NOT_PAUSED_CAMPAIGN}
   `;
 
   if (readyDomains === null) {
@@ -119,6 +126,7 @@ export function claimJob(id, nodeId, serverId) {
     SET    status = 'PROCESSING', node_id = ?, started_at = ?, attempts = attempts + 1
     WHERE  id = ? AND status = 'PENDING'
       AND  identity_id IN (SELECT id FROM sender_identities WHERE serverId = ? AND status = 'active' AND verificationStatus = 'READY')
+      AND  ${NOT_PAUSED_CAMPAIGN.replaceAll('j.campaign_id', 'jobs.campaign_id')}
   `).run(nodeId, now, id, serverId);
   return changes === 1;
 }
