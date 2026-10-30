@@ -216,6 +216,47 @@ test('SPF: FAILED when 2 SPF records exist (RFC violation)', async () => {
   assert.equal(r.ok, false);
 });
 
+test('SPF: recognises a QUOTED existing record — no duplicate created', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queue.push(ok([{ id: 's-1', content: `"v=spf1 ip4:${IP} -all"` }]));
+  queueDkimOk();
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY });
+  assert.equal(r.phases.spf?.status, 'SKIPPED');
+  assert.ok(!calls.some(c => c.method === 'POST'), 'must not create a second SPF record');
+});
+
+test('SPF: quoted + bare duplicates are counted as 2 (FAILED, no write)', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queue.push(ok([
+    { id: 's-1', content: `v=spf1 ip4:${IP} ~all` },
+    { id: 's-2', content: `"v=spf1 ip4:${IP} -all"` },
+  ]));
+  queueDkimOk();
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY });
+  assert.equal(r.phases.spf?.status, 'FAILED');
+  assert.ok(!calls.some(c => c.method === 'POST'));
+});
+
+test('SPF: merging into a quoted record writes unquoted content', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queue.push(ok([{ id: 's-1', content: '"v=spf1 ip4:9.9.9.9 -all"' }]));
+  queue.push(ok({ id: 's-1' }));   // PATCH
+  queueDkimOk();
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY });
+  assert.equal(r.phases.spf?.status, 'OK');
+  const patch = calls.find(c => c.method === 'PATCH');
+  assert.equal(JSON.parse(patch.body).content, `v=spf1 ip4:9.9.9.9 ip4:${IP} -all`);
+});
+
 // ─── DKIM ─────────────────────────────────────────────────────────────────────
 
 function queueSpfOk() {
@@ -296,16 +337,40 @@ test('DKIM: PENDING when dkimPublicKey is not yet available', async () => {
   queueAMail();
   queueMXOk();
   queueSpfOk();
-  // No fetch call needed for DKIM when key is null (returns PENDING before listing)
+  queue.push(ok([]));   // DKIM lookup: nothing published
   queueDmarcOk();
   const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: null });
   assert.equal(r.phases.dkim?.status, 'PENDING');
   assert.equal(r.ok, false); // PENDING counts as not-ok
 });
 
+test('DKIM: SKIPPED when no key in controller but a valid record is already published', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queueSpfOk();
+  queue.push(ok([{ id: 'dk-1', content: `"v=DKIM1; h=sha256; k=rsa; p=${PUBKEY}"` }]));
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: null });
+  assert.equal(r.phases.dkim?.status, 'SKIPPED');
+  assert.ok(!calls.some(c => c.method !== 'GET'), 'must not write anything');
+  assert.equal(r.ok, true);
+});
+
+test('DKIM: still PENDING when no key in controller and published record is truncated', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queueSpfOk();
+  queue.push(ok([{ id: 'dk-1', content: `v=DKIM1; k=rsa; p=${PUBKEY.slice(0, 250)}` }]));
+  queueDmarcOk();
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: null });
+  assert.equal(r.phases.dkim?.status, 'PENDING');
+});
+
 // ─── DMARC ────────────────────────────────────────────────────────────────────
 
-test('DMARC: creates p=none record when absent', async () => {
+test('DMARC: creates p=quarantine record reporting to the identity fromAddr', async () => {
   setup(foundZone);
   queueAMail();
   queueMXOk();
@@ -313,13 +378,26 @@ test('DMARC: creates p=none record when absent', async () => {
   queueDkimOk();
   queue.push(ok([]));              // DMARC absent
   queue.push(ok({ id: 'dm' }));   // POST create
-  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY });
+  const r = await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY, fromAddr: `support@${DOMAIN}` });
   assert.equal(r.phases.dmarc?.status, 'OK');
   // All creates go to the same POST URL — find the POST and check its body content
   const postCalls = calls.filter(c => c.method === 'POST');
   assert.equal(postCalls.length, 1, 'Expected exactly one POST for DMARC creation');
   const createBody = JSON.parse(postCalls[0].body || '{}');
-  assert.ok(createBody.content?.includes('p=none'), 'DMARC should be created with p=none');
+  assert.equal(createBody.content, `v=DMARC1; p=quarantine; rua=mailto:support@${DOMAIN}`);
+});
+
+test('DMARC: falls back to support@<domain> when fromAddr is missing or off-domain', async () => {
+  setup(foundZone);
+  queueAMail();
+  queueMXOk();
+  queueSpfOk();
+  queueDkimOk();
+  queue.push(ok([]));
+  queue.push(ok({ id: 'dm' }));
+  await provisionDns({ domain: DOMAIN, ip: IP, selector: SEL, dkimPublicKey: PUBKEY, fromAddr: 'x@other.com' });
+  const body = JSON.parse(calls.find(c => c.method === 'POST').body);
+  assert.ok(body.content.endsWith(`rua=mailto:support@${DOMAIN}`));
 });
 
 test('DMARC: preserves existing record — never overwrites', async () => {

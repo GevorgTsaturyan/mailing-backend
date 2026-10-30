@@ -246,11 +246,9 @@ function localHHMMtoUTC(hhmm, timezone) {
 function randomTimesInWindow(startTime, endTime, count) {
   const [sh, sm] = startTime.split(':').map(Number);
   const [eh, em] = endTime.split(':').map(Number);
-  const startMins = sh * 60 + sm;
-  const endMins   = eh * 60 + em;
-  const rangeMins = endMins - startMins;
+  const endMins  = eh * 60 + em;
 
-  if (rangeMins <= 0 || count <= 0) return [];
+  if (endMins <= sh * 60 + sm || count <= 0) return [];
 
   const now     = new Date();
   const nowMins = now.getUTCHours() * 60 + now.getUTCMinutes();
@@ -258,6 +256,14 @@ function randomTimesInWindow(startTime, endTime, count) {
   // If the window has already fully ended today, return nothing — the midnight
   // cron will schedule tomorrow's sends when it next runs.
   if (nowMins >= endMins) return [];
+
+  // Distribute over the part of the window that is still ahead. Spreading over
+  // the whole window and then dropping past slots silently lost sends whenever
+  // a campaign was planned mid-window (e.g. count=1 always fell in the first,
+  // already-elapsed bucket).
+  const startMins = Math.max(sh * 60 + sm, nowMins + 1);
+  const rangeMins = endMins - startMins;
+  if (rangeMins <= 0) return [];
 
   const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   const nowMs    = now.getTime();

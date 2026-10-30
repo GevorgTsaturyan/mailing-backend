@@ -63,6 +63,7 @@ export async function runControllerProvisioning(identity, opts = {}) {
         selector:     identity.dkimSelector,
         dkimPublicKey: dkimKey,
         controllerIp,
+        fromAddr:     identity.fromAddr,
       });
       cfStatus = cf.ok ? 'OK' : (cf.skipped ? 'NOT_RUN' : 'PARTIAL');
       mergePhases(identity.id, {

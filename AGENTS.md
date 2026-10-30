@@ -847,14 +847,20 @@ Returns `{ ok, phases, skipped? }`. When `CF_API_TOKEN` is unset, returns `ok:fa
 **Call order and phase keys:**
 1. `a_mail` — `A mail.<domain> → <ip>` (absent→create, correct→skip, wrong→update)
 2. `mx` — `MX <domain> 10 mail.<domain>` (absent→create, correct→skip, wrong host/priority→update)
-3. `spf` — `TXT <domain>` v=spf1 (absent→create, ip missing→merge, 2+ records→FAIL)
+3. `spf` — `TXT <domain>` v=spf1 (absent→create, ip missing→merge, 2+ records→FAIL). TXT content is
+   compared **unquoted** (`unquoteTxt()`): Cloudflare can return `"v=spf1 …"` with quotes, and the old
+   `startsWith('v=spf1')` check missed it and created a duplicate SPF (serawin.net/calerion.org, fixed 2026-10-30).
 4. `dkim` — `TXT <sel>._domainkey.<domain>` (absent→create, same→skip, **truncated-prefix→repair (PATCH)**,
    genuinely different→FAIL — never overwrite). Before publishing, the key is validated with
    `DkimKey.isValidDkimPublicKey()`; an invalid/truncated key returns **PENDING** (never published) so the
    retry/repair loop can re-fetch the full key. "Truncated-prefix" = the already-published key is a strict
    prefix of the full key (the old mail-node multi-segment parsing bug) → provably the same key cut short,
-   so it is safe to PATCH to the full value.
-5. `dmarc` — `TXT _dmarc.<domain>` (absent→create p=none, existing→preserve — never overwrite)
+   so it is safe to PATCH to the full value. When the controller has **no** key (identities set up by hand,
+   e.g. serawin.net), a valid already-published DKIM record → **SKIPPED** (read-only); otherwise PENDING.
+5. `dmarc` — `TXT _dmarc.<domain>` (absent→create `v=DMARC1; p=quarantine; rua=mailto:<fromAddr>`,
+   existing→preserve — never overwrite). `fromAddr` is the identity's own mailbox (passed by
+   `ControllerProvisioningService`); missing/off-domain → `support@<domain>`. `dmarc@<domain>` is never used —
+   it has no mailbox and Gmail's reports bounced.
 6. `a_unsubscribe` — `A unsubscribe.<domain> → <controllerIp>` (only if controllerIp provided)
 7. `a_click` — `A click.<domain> → <controllerIp>` (only if controllerIp provided)
 
@@ -916,7 +922,7 @@ Does NOT send email. Creates job queue rows for mail-nodes to pick up.
 - **Canonical**: picks active identity, caps count by remaining capacity, generates random timestamps in window; creates a `type='daily_batch'` campaign row, then calls `queueCanonicalJobForContact` (with the daily-batch ledger source) for each contact; calls `incrementJobs` after the loop
 - **Legacy**: generates random timestamps, creates `send_jobs` rows (also with the ledger source)
 
-**Start date / weekly schedule / resend (`services/RecurringSchedule.js`)** — `rangesForDay(campaign, dayUTC)` returns `[]` before `start_date` or on a weekday with no ranges, the single `startTime–endTime` window for legacy rows (`weekly_schedule` NULL — identical code path to before), else that weekday's ranges. `recurringTimesToday()` splits the day's count evenly over the ranges that haven't ended (`splitCount(30,3)` → 10/10/10). A non-sending day does **not** advance `currentDay`/`lastRunDate`, so growth counts sending days. `target_mode='resend'` → `SendLedger.eligibleContacts` returns contacts with a `SENT` job (not BOUNCED/SEND_FAILED/COMPLAINED) in the source campaigns and **no** open or click event there (any open, bot included, counts), minus suppressed and already-ledgered. With open tracking off every delivered recipient qualifies.
+**Start date / weekly schedule / resend (`services/RecurringSchedule.js`)** — `rangesForDay(campaign, dayUTC)` returns `[]` before `start_date` or on a weekday with no ranges, the single `startTime–endTime` window for legacy rows (`weekly_schedule` NULL — identical code path to before), else that weekday's ranges. `recurringTimesToday()` splits the day's count evenly over the ranges that haven't ended (`splitCount(30,3)` → 10/10/10). `randomTimesInWindow()` (scheduler.js) spreads slots only over the **remaining** part of a window (start = max(windowStart, now+1min)) — previously it spread over the whole window and dropped past slots, silently losing sends when planned mid-window (fixed 2026-10-30). A non-sending day does **not** advance `currentDay`/`lastRunDate`, so growth counts sending days. `target_mode='resend'` → `SendLedger.eligibleContacts` returns contacts with a `SENT` job (not BOUNCED/SEND_FAILED/COMPLAINED) in the source campaigns and **no** open or click event there (any open, bot included, counts), minus suppressed and already-ledgered. With open tracking off every delivered recipient qualifies.
 
 **`planRecurringCampaigns()`** — called on startup + every midnight UTC:
 - For each `active` recurring campaign where `lastRunDate != today`:
@@ -1066,7 +1072,7 @@ File: `backend/.env` (gitignored). Copy from `.env.example`.
 | MX | @ | mail.serawin.net (priority 10) |
 | TXT | @ | v=spf1 ip4:45.32.235.159 ~all |
 | TXT | mail._domainkey | v=DKIM1; h=sha256; k=rsa; p=... |
-| TXT | _dmarc | v=DMARC1; p=none; rua=mailto:admin@serawin.net |
+| TXT | _dmarc | v=DMARC1; p=quarantine; rua=mailto:support@serawin.net |
 
 **Start:**
 ```bash

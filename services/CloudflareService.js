@@ -11,7 +11,10 @@
 //   SPF:        absent→create, 1 record+ip→skip, 1 record−ip→merge,
 //               2+ records→fail (RFC violation, manual fix required)
 //   DKIM TXT:   absent→create, identical→skip, different→fail (never overwrite)
-//   DMARC:      absent→create p=none, existing→preserve (never overwrite)
+//               (no key in controller: valid published record→skip, else PENDING)
+//   DMARC:      absent→create p=quarantine rua=<identity fromAddr>,
+//               existing→preserve (never overwrite)
+//   TXT content is compared unquoted (Cloudflare may return "v=spf1 …").
 //   unsubscribe/click A: same rules as A record
 
 import { isValidDkimPublicKey } from './DkimKey.js';
@@ -69,6 +72,14 @@ async function patchRecord(zoneId, id, type, name, content, proxied = false) {
 
 // ─── Per-record helpers ───────────────────────────────────────────────────────
 
+// Cloudflare returns TXT content either bare or wrapped in quotes, possibly
+// split into several quoted strings ("a" "b"). Return the joined plain text.
+function unquoteTxt(content) {
+  const s = String(content || '').trim();
+  if (!s.startsWith('"')) return s;
+  return (s.match(/"((?:[^"\\]|\\.)*)"/g) || []).map(p => p.slice(1, -1)).join('');
+}
+
 async function ensureARecord(zoneId, fqdn, targetIp) {
   const records = await listRecords(zoneId, 'A', fqdn);
   if (records.length === 0) {
@@ -112,7 +123,10 @@ async function ensureSPF(zoneId, domain, ip) {
     'GET',
     `/zones/${zoneId}/dns_records?type=TXT&name=${encodeURIComponent(domain)}&per_page=20`
   );
-  const spf = Array.isArray(allTxt) ? allTxt.filter(r => r.content.startsWith('v=spf1')) : [];
+  // Cloudflare may return TXT content with its surrounding quotes ("v=spf1 …"),
+  // so compare unquoted text — otherwise a quoted SPF is missed and a duplicate
+  // record gets created (the serawin.net / calerion.org double-SPF incident).
+  const spf = Array.isArray(allTxt) ? allTxt.filter(r => unquoteTxt(r.content).startsWith('v=spf1')) : [];
 
   if (spf.length >= 2) {
     return { status: 'FAILED', message: `${spf.length} SPF records found — RFC violation, manual fix required` };
@@ -123,21 +137,33 @@ async function ensureSPF(zoneId, domain, ip) {
   }
 
   const existing = spf[0];
-  if (existing.content.includes(`ip4:${ip}`)) {
+  const current  = unquoteTxt(existing.content);
+  if (current.includes(`ip4:${ip}`)) {
     return { status: 'SKIPPED', message: `SPF already contains ip4:${ip}` };
   }
 
   // Merge: insert ip4:<ip> before the final qualifier (~all, -all, ?all, +all)
-  const merged = existing.content.replace(/(\s)(~|-|\?|\+)?all\s*$/, ` ip4:${ip} $1$2all`).trim();
-  const finalContent = merged !== existing.content ? merged
-    : existing.content.replace('~all', `ip4:${ip} ~all`)
-                      .replace('-all', `ip4:${ip} -all`);
+  const merged = current.replace(/(\s)(~|-|\?|\+)?all\s*$/, `$1ip4:${ip} $2all`).trim();
+  const finalContent = merged !== current ? merged
+    : current.replace('~all', `ip4:${ip} ~all`)
+             .replace('-all', `ip4:${ip} -all`);
   await patchRecord(zoneId, existing.id, 'TXT', domain, finalContent);
   return { status: 'OK', message: `SPF merged: ${finalContent}` };
 }
 
 async function ensureDKIM(zoneId, domain, selector, dkimPublicKey) {
   if (!dkimPublicKey) {
+    // Identities set up by hand (before automation) have a working DKIM record
+    // in DNS but no key stored in the controller. Accept a valid published key
+    // instead of staying PENDING forever; nothing is written either way.
+    const name = `${selector}._domainkey.${domain}`;
+    const records = await listRecords(zoneId, 'TXT', name);
+    const publishedP = records.length
+      ? (records[0].content.replace(/["\s]/g, '').match(/p=([A-Za-z0-9+/=]+)/) || [])[1]
+      : null;
+    if (publishedP && isValidDkimPublicKey(publishedP)) {
+      return { status: 'SKIPPED', message: `DKIM TXT ${name} already published (key not stored in controller)` };
+    }
     return { status: 'PENDING', message: 'DKIM public key not yet available from mail-node' };
   }
   // Never publish a key that does not decode to a valid RSA public key — that is
@@ -188,13 +214,18 @@ async function ensureDKIM(zoneId, domain, selector, dkimPublicKey) {
   };
 }
 
-async function ensureDMARC(zoneId, domain) {
+async function ensureDMARC(zoneId, domain, reportAddr) {
   const name = `_dmarc.${domain}`;
   const records = await listRecords(zoneId, 'TXT', name);
-  if (records.length > 0) {
-    return { status: 'SKIPPED', message: `DMARC preserved: ${records[0].content}` };
+  const dmarc = records.filter(r => unquoteTxt(r.content).startsWith('v=DMARC1'));
+  if (dmarc.length > 0) {
+    return { status: 'SKIPPED', message: `DMARC preserved: ${unquoteTxt(dmarc[0].content)}` };
   }
-  const content = `v=DMARC1; p=none; rua=mailto:dmarc@${domain}`;
+  // Reports go to the identity's own mailbox (support@<domain>), which exists
+  // on the mail-node — dmarc@<domain> has no mailbox and Gmail's reports bounced.
+  const rua = reportAddr && reportAddr.toLowerCase().endsWith(`@${domain.toLowerCase()}`)
+    ? reportAddr : `support@${domain}`;
+  const content = `v=DMARC1; p=quarantine; rua=mailto:${rua}`;
   await createRecord(zoneId, 'TXT', name, content);
   return { status: 'OK', message: `DMARC created: ${content}` };
 }
@@ -206,7 +237,7 @@ async function ensureDMARC(zoneId, domain) {
 //   ok=true   → all phases passed (OK or SKIPPED) and none is FAILED
 //   ok=false  → at least one FAILED, or CF not configured
 //   skipped=true → CF_API_TOKEN not configured (caller should show MANUAL steps)
-export async function provisionDns({ domain, ip, selector, dkimPublicKey, controllerIp }) {
+export async function provisionDns({ domain, ip, selector, dkimPublicKey, controllerIp, fromAddr }) {
   if (!isConfigured()) {
     return {
       ok: false,
@@ -243,7 +274,7 @@ export async function provisionDns({ domain, ip, selector, dkimPublicKey, contro
   await run('mx',            () => ensureMX(zoneId, domain));
   await run('spf',           () => ensureSPF(zoneId, domain, ip));
   await run('dkim',          () => ensureDKIM(zoneId, domain, selector, dkimPublicKey));
-  await run('dmarc',         () => ensureDMARC(zoneId, domain));
+  await run('dmarc',         () => ensureDMARC(zoneId, domain, fromAddr));
 
   if (controllerIp) {
     await run('a_unsubscribe', () => ensureARecord(zoneId, `unsubscribe.${domain}`, controllerIp));
