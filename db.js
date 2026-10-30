@@ -775,5 +775,19 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_inbox_replies_message ON inbox_replies(inbound_message_id);
 `);
+// Double opt-in for the public offers site. A row lives here from signup until
+// the subscriber clicks the confirmation link (then a contact is created/updated).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pending_subscriptions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    email       TEXT NOT NULL UNIQUE,
+    firstName   TEXT,
+    source      TEXT,
+    token       TEXT NOT NULL UNIQUE,
+    job_id      INTEGER,
+    created_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL
+  );
+`);
 
 export default db;

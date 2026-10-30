@@ -30,6 +30,7 @@ import nodesRouter              from './routes/nodes.js';
 import jobsRouter               from './routes/jobs.js';
 import unsubscribeRouter        from './routes/unsubscribe.js';
 import trackRouter              from './routes/track.js';
+import publicSubscribeRouter    from './routes/public-subscribe.js';
 import buttonsRouter            from './routes/buttons.js';
 import engagementRouter         from './routes/engagement.js';
 import inboxRouter              from './routes/inbox.js';
@@ -86,6 +87,9 @@ app.use(unsubscribeRouter);
 // click.<sending-domain>: GET /c/:token (302 redirect) + GET /o/:token.gif (pixel).
 // Mounted before requireAuth, exactly like the unsubscribe routes. (see routes/track.js)
 app.use(trackRouter);
+
+// Offers-site double opt-in — server-to-server, X-Site-Key auth (routes/public-subscribe.js).
+app.use('/api/public', publicSubscribeRouter);
 
 // ── Legacy unsubscribe compatibility shim (deprecated) ────────────────────────
 // Emails sent before the token system used `/unsubscribe?email=<addr>`. Those

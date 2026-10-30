@@ -377,6 +377,20 @@ script stdout+stderr on success. Tests: `admin-provision.test.js`.
 |--------|------|-------|
 | GET | `/unsubscribe?email=x` | Sets contact status=unsubscribed. Returns HTML confirmation page. |
 
+### Offers-site double opt-in (`routes/public-subscribe.js`, `services/PublicSubscribeService.js`)
+Server-to-server from `offers-site/backend` only. Header `X-Site-Key` must equal `OFFERS_SITE_KEY`
+(unset → 503, API disabled). Other env: `OFFERS_SITE_URL`, `OFFERS_SITE_NAME`,
+`OFFERS_CONFIRM_IDENTITY_ID` (READY identity that sends the confirmation), `OFFERS_SUBSCRIBERS_GROUP`
+(default `Website subscribers`).
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/api/public/subscribe` | `{email, firstName?, source?}` → `{status: sent\|cooldown\|already_subscribed\|suppressed}`. Stores a `pending_subscriptions` row (48h token) and queues ONE raw confirmation job (10-min resend cooldown). Unsubscribed addresses get no email. No contact is created yet. |
+| POST | `/api/public/confirm` | `{token}` → `{status: confirmed\|invalid\|expired\|suppressed}`. Creates the contact (`status='pending'`) or keeps the existing row, adds it to the subscribers group, deletes the pending row. Never re-adds an address that unsubscribed. |
+
+Table `pending_subscriptions(email UNIQUE, firstName, source, token UNIQUE, job_id, created_at, expires_at)`.
+Tests: `public-subscribe.test.js`.
+
 ---
 
 ## Database
