@@ -22,7 +22,7 @@ const brokenUnsub   = async () => ({ ok: false, hosts: { click: { ok: true  }, u
 // run() always injects safe defaults so a test never hits the real pipeline/probe
 // for identities created by OTHER tests (shared in-memory DB).
 function run(opts = {}) {
-  return runRetries({ provisioner: noopProvision, hostsHealthy: healthyProbe, ...opts });
+  return runRetries({ provisioner: noopProvision, hostsHealthy: healthyProbe, refreshCloudflare: noopProvision, ...opts });
 }
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -325,4 +325,32 @@ test('runRetries: ptr phase stays MANUAL after retry cycle', async () => {
   await run();
   const phases = phasesOf(id);
   assert.equal(phases.ptr?.status, 'MANUAL');
+});
+
+// ── Stale Cloudflare phase on a READY identity (serawin.net "DKIM pending") ────
+
+const phasesCfDkimPending = JSON.stringify({
+  verification: { status: 'READY', reasons: [] },
+  cloudflare:   { status: 'PARTIAL', phases: { spf: { status: 'OK' }, dkim: { status: 'PENDING' } } },
+  dns:          { status: 'OK' },
+  nginx:        { status: 'DONE', phases: {} },
+});
+
+test('READY + stale PENDING Cloudflare phase → Cloudflare step refreshed only (no full pipeline)', async () => {
+  const id = mkManualIdentity('cf-stale.example', 'READY', phasesCfDkimPending);
+  const refreshed = [];
+  const provisioned = [];
+  await withCf(() => run({
+    refreshCloudflare: async (identity) => { refreshed.push(identity.id); },
+    provisioner:       async (identity) => { provisioned.push(identity.id); },
+  }));
+  assert.ok(refreshed.includes(id), 'stale CF phase must be refreshed');
+  assert.ok(!provisioned.includes(id), 'healthy READY identity must not run nginx/TLS pipeline');
+});
+
+test('READY + complete Cloudflare phase → no Cloudflare refresh (no churn)', async () => {
+  const id = mkIdentity('cf-ok.example', 'READY', phasesComplete);
+  const refreshed = [];
+  await withCf(() => run({ refreshCloudflare: async (identity) => { refreshed.push(identity.id); } }));
+  assert.ok(!refreshed.includes(id));
 });

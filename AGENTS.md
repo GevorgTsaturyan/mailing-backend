@@ -865,6 +865,9 @@ Returns `{ ok, phases, skipped? }`. When `CF_API_TOKEN` is unset, returns `ok:fa
 7. `a_click` — `A click.<domain> → <controllerIp>` (only if controllerIp provided)
 
 `ok=false` when any phase is FAILED or PENDING (DKIM key not yet available/invalid).
+`runCloudflareStep(identity)` (ControllerProvisioningService) runs this DNS step alone. `ProvisioningRetryService`
+uses it for **READY** identities whose Cloudflare phase is PENDING/FAILED (stale state, e.g. serawin.net) —
+DNS only, never nginx/TLS or a mail-node reverify.
 `cloudflare.phases.mx` failing blocks the READY badge in `controllerComplete()` (Servers.vue) —
 the identity stays NEEDS_ATTENTION until MX is confirmed, preventing sending with a broken inbound path.
 Tests: `cloudflare.test.js` (mocked fetch, no real CF calls). `DkimKey.js` validator tests: `dkim-key.test.js`.

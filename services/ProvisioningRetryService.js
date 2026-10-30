@@ -34,7 +34,7 @@
 
 import db from '../db.js';
 import { isConfigured as cfConfigured } from './CloudflareService.js';
-import { runControllerProvisioning } from './ControllerProvisioningService.js';
+import { runControllerProvisioning, runCloudflareStep } from './ControllerProvisioningService.js';
 import { checkControllerHostsHealthy } from './ControllerHostHealth.js';
 import { mergePhases } from './ProvisioningPhaseStore.js';
 import { isValidDkimPublicKey } from './DkimKey.js';
@@ -82,7 +82,7 @@ export function controllerNeedsRetry(phases) {
 
 // ─── Per-identity retry ───────────────────────────────────────────────────────
 
-async function retryIdentity(identity, provision, hostsHealthy) {
+async function retryIdentity(identity, provision, hostsHealthy, refreshCloudflare) {
   const phases  = parsePhases(identity);
   const isReady = identity.verificationStatus === 'READY';
 
@@ -128,6 +128,17 @@ async function retryIdentity(identity, provision, hostsHealthy) {
         await provision(identity, { dkimPublicKey: identity.dkimPublicKey || null });
       } catch (err) {
         warn(`controller healing failed for ${identity.domain}: ${err.message}`);
+      }
+    }
+
+    // Stale Cloudflare phase (PENDING/FAILED) on a READY identity — e.g. hand-set-up
+    // serawin.net showing "DKIM pending" forever. Refresh the DNS step only; it is
+    // idempotent and never touches nginx/TLS or the mail-node.
+    else if (cfNeedsRetry(phases)) {
+      try {
+        await refreshCloudflare(identity, { dkimPublicKey: identity.dkimPublicKey || null });
+      } catch (err) {
+        warn(`cloudflare refresh failed for ${identity.domain}: ${err.message}`);
       }
     }
 
@@ -181,6 +192,7 @@ async function runRetries(opts = {}) {
   // Injectable for tests; production uses the real pipeline + strict health probe.
   const provision     = opts.provisioner  || runControllerProvisioning;
   const hostsHealthy  = opts.hostsHealthy  || ((domain) => checkControllerHostsHealthy({ domain }));
+  const refreshCf     = opts.refreshCloudflare || runCloudflareStep;
 
   // Include two sets of identities:
   //  • DONE: went through the full pipeline; both in-flight (Case A) and
@@ -191,7 +203,7 @@ async function runRetries(opts = {}) {
   //    NEEDS_ATTENTION warning. Case B writes controllerHealth without touching
   //    any infrastructure — no nginx/DNS/Postfix changes are made when healthy.
   const candidates = db.prepare(`
-    SELECT id, domain, ip, dkimSelector, serverId, provisioningPhases,
+    SELECT id, domain, ip, fromAddr, dkimSelector, serverId, provisioningPhases,
            dkimPublicKey, nextReverifyAt, verificationStatus
     FROM sender_identities
     WHERE provisioningStatus = 'DONE'
@@ -202,7 +214,7 @@ async function runRetries(opts = {}) {
   log(`checking ${candidates.length} identity(ies)`);
 
   for (const identity of candidates) {
-    try { await retryIdentity(identity, provision, hostsHealthy); }
+    try { await retryIdentity(identity, provision, hostsHealthy, refreshCf); }
     catch (err) { warn(`retry cycle error for ${identity.domain}: ${err.message}`); }
   }
 }

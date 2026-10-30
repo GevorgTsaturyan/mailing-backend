@@ -38,22 +38,18 @@ function ptrMessage(identity) {
   return `Set PTR record: ${identity.ip} → mail.${identity.domain} (in your hosting provider's control panel under Reverse DNS)`;
 }
 
-// Run the full controller-side pipeline for one identity.
-// Returns { cfStatus, dnsReady, ranNginx, nginxError }.
-export async function runControllerProvisioning(identity, opts = {}) {
+// Cloudflare DNS step alone (idempotent). Used by the full pipeline and by the
+// retry service to refresh a stale Cloudflare phase on an already-READY identity
+// without touching nginx/TLS. Returns the cloudflare status string.
+export async function runCloudflareStep(identity, opts = {}) {
   const { dkimPublicKey = null, deps = {} } = opts;
-
-  const provisionDns  = deps.provisionDns  || _provisionDns;
-  const cfConfigured  = deps.cfConfigured  || _cfConfigured;
-  const checkDns      = deps.checkControllerHostsResolve || _checkControllerHostsResolve;
-  const execFileImpl  = deps.execFile      || _execFile;
-  const runNginx      = deps.runNginxScript || ((domain) => defaultRunNginxScript(domain, execFileImpl));
+  const provisionDns = deps.provisionDns || _provisionDns;
+  const cfConfigured = deps.cfConfigured || _cfConfigured;
 
   // Read at call time (not module load) so tests and runtime config both work.
   const controllerIp = process.env.CONTROLLER_PUBLIC_IP || '';
   const dkimKey      = dkimPublicKey || identity.dkimPublicKey || null;
 
-  // ── 1. Cloudflare DNS ─────────────────────────────────────────────────────
   let cfStatus = 'NOT_RUN';
   if (cfConfigured()) {
     try {
@@ -87,6 +83,21 @@ export async function runControllerProvisioning(identity, opts = {}) {
       },
     });
   }
+  return cfStatus;
+}
+
+// Run the full controller-side pipeline for one identity.
+// Returns { cfStatus, dnsReady, ranNginx, nginxError }.
+export async function runControllerProvisioning(identity, opts = {}) {
+  const { deps = {} } = opts;
+
+  const checkDns      = deps.checkControllerHostsResolve || _checkControllerHostsResolve;
+  const execFileImpl  = deps.execFile      || _execFile;
+  const runNginx      = deps.runNginxScript || ((domain) => defaultRunNginxScript(domain, execFileImpl));
+
+  // ── 1. Cloudflare DNS ─────────────────────────────────────────────────────
+  const cfStatus = await runCloudflareStep(identity, opts);
+  const controllerIp = process.env.CONTROLLER_PUBLIC_IP || '';
 
   // ── 2. PTR — always MANUAL, independent, never blocks the pipeline ─────────
   mergePhases(identity.id, { ptr: { status: 'MANUAL', message: ptrMessage(identity) } });
