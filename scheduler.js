@@ -10,6 +10,7 @@ import { purgeOldEvents, retentionDays } from './services/EventRetention.js';
 import * as SendLedger from './services/SendLedger.js';
 import { DAILY_BATCH_SOURCE_ID } from './services/SendLedger.js';
 import { rangesForDay, splitCount, parseWeeklySchedule } from './services/RecurringSchedule.js';
+import { effectiveDailyLimit } from './services/WarmupService.js';
 
 // Pre-validate a template before queueing a campaign's jobs. Returns true when
 // safe to proceed. On a problem it logs an actionable error and returns false so
@@ -213,8 +214,9 @@ function getIdentityRemainingCapacity(identityId) {
     WHERE id = ? AND (lastResetDate IS NULL OR lastResetDate != ?)
   `).run(today, identityId, today);
 
-  const row = db.prepare('SELECT dailyLimit, dailySentCount FROM sender_identities WHERE id=?').get(identityId);
-  return row ? Math.max(0, row.dailyLimit - row.dailySentCount) : 0;
+  const row = db.prepare('SELECT dailyLimit, dailySentCount, warmupStartedAt FROM sender_identities WHERE id=?').get(identityId);
+  // Warm-up schedule (if started) caps the configured dailyLimit.
+  return row ? Math.max(0, effectiveDailyLimit(row) - row.dailySentCount) : 0;
 }
 
 // ─── Timezone-aware local→UTC conversion ─────────────────────────────────────

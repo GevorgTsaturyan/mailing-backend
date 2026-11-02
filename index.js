@@ -43,6 +43,7 @@ import { startOfflineWatcher } from './services/HeartbeatService.js';
 import { startReadinessWatcher } from './services/TrackingHostReadiness.js';
 import { startUnsubscribeReadinessWatcher } from './services/UnsubscribeHostReadiness.js';
 import { startProvisioningRetryService } from './services/ProvisioningRetryService.js';
+import { backfillActivity } from './services/ListHygieneService.js';
 
 const app = express();
 const PORT = 3001;
@@ -117,6 +118,7 @@ app.post('/unsubscribe', express.urlencoded({ extended: false }), (req, res) => 
   const norm = String(email).toLowerCase();
   const contact = db.prepare('SELECT id FROM contacts WHERE email=?').get(norm);
   db.prepare("UPDATE contacts SET status='unsubscribed' WHERE email=? AND status!='unsubscribed'").run(norm);
+  db.prepare("UPDATE contacts SET suppression_reason='unsubscribe' WHERE email=? AND suppression_reason IS NULL").run(norm);
   // Cancel any jobs queued before this unsubscribe.
   if (contact) cancelOutstandingJobsForContact(contact.id, 'unsubscribed');
   res.status(200).send(`
@@ -168,6 +170,9 @@ app.listen(PORT, () => {
     console.error('[startup] Ledger backfill FAILED — halting to avoid unsafe resends:', err.message);
     process.exit(1);
   }
+  // List hygiene: give every contact an activity baseline for the inactivity
+  // sunset (latest real open/click, else now). Idempotent; only fills NULLs.
+  try { backfillActivity(); } catch (err) { console.error('[startup] activity backfill failed:', err.message); }
   initScheduler();
   console.log('[startup] Scheduler initialized');
   startOfflineWatcher();

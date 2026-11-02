@@ -215,18 +215,51 @@ test('Test E — complaint: unsubscribes contact and cancels their other queued 
     'complaint must cancel the contact’s other outstanding jobs');
 });
 
-// ── Test F — hard bounce (documented limitation) ──────────────────────────────
+// ── Test F — bounce classes (list hygiene) ────────────────────────────────────
 
-test('Test F — hard bounce marks contact failed (NOT auto-suppressed in current model)', () => {
-  const c = newContact('pending');
+function sentJob(c, qid) {
   db.prepare(`
     INSERT INTO jobs (status, identity_id, recipient, subject, body, content_type, contact_id, queue_id, delivery_status, created_at)
-    VALUES ('SENT', ?, ?, 'Hi', 'Hi', 'html', ?, 'QIDBOUNCE', 'SMTP_ACCEPTED', ?)
-  `).run(identityId, c.email, c.id, now);
+    VALUES ('SENT', ?, ?, 'Hi', 'Hi', 'html', ?, ?, 'SMTP_ACCEPTED', ?)
+  `).run(identityId, c.email, c.id, qid, now);
+}
+
+test('Test F1 — hard bounce suppresses immediately and cancels queued jobs', () => {
+  const c = newContact('pending');
+  sentJob(c, 'QIDBOUNCE');
+  queueCanonicalJobForContact(c, null, tmpl, null, null, identityId, null);
+  const pending = jobRow(c.id);
   processEvents([{ queueId: 'QIDBOUNCE', eventType: 'bounced', dsnCode: '5.1.1', reasonCategory: 'invalid_recipient', logTime: now }]);
-  // Current schema cannot distinguish hard from soft bounce at the contact level:
-  // it becomes 'failed', which is intentionally NOT suppressed here. Documented
-  // limitation — hard-bounce suppression is deferred to the suppression_list redesign.
-  assert.equal(db.prepare('SELECT status FROM contacts WHERE id=?').get(c.id).status, 'failed');
+  const row = db.prepare('SELECT status, suppression_reason FROM contacts WHERE id=?').get(c.id);
+  assert.equal(row.status, 'failed');
+  assert.equal(row.suppression_reason, 'hard_bounce');
+  assert.equal(isContactSuppressed(c.id), true);
+  assert.equal(db.prepare('SELECT status FROM jobs WHERE id=?').get(pending.id).status, 'CANCELLED');
+});
+
+test('Test F2 — soft bounces suppress only after 3 consecutive; delivery resets', () => {
+  const c = newContact('pending');
+  for (let i = 1; i <= 2; i++) {
+    sentJob(c, `QIDSOFT${i}`);
+    processEvents([{ queueId: `QIDSOFT${i}`, eventType: 'bounced', dsnCode: '4.4.1', reasonCategory: 'deferred', logTime: `${now}-${i}` }]);
+  }
+  assert.equal(isContactSuppressed(c.id), false);
+  sentJob(c, 'QIDSOFTOK');
+  processEvents([{ queueId: 'QIDSOFTOK', eventType: 'sent', dsnCode: '2.0.0', logTime: `${now}-ok` }]);
+  assert.equal(db.prepare('SELECT soft_bounce_count n FROM contacts WHERE id=?').get(c.id).n, 0);
+  for (let i = 3; i <= 5; i++) {
+    sentJob(c, `QIDSOFT${i}`);
+    processEvents([{ queueId: `QIDSOFT${i}`, eventType: 'bounced', dsnCode: '5.2.2', reasonCategory: 'mailbox_full', logTime: `${now}-${i}` }]);
+  }
+  assert.equal(db.prepare('SELECT suppression_reason r FROM contacts WHERE id=?').get(c.id).r, 'soft_bounce_limit');
+});
+
+test('Test F3 — sender-side rejection (spam/blocklist) never penalises the recipient', () => {
+  const c = newContact('pending');
+  sentJob(c, 'QIDSPAMBLK');
+  processEvents([{ queueId: 'QIDSPAMBLK', eventType: 'bounced', dsnCode: '5.7.1', reasonCategory: 'spam_blocked', logTime: now }]);
+  const row = db.prepare('SELECT suppression_reason, soft_bounce_count FROM contacts WHERE id=?').get(c.id);
+  assert.equal(row.suppression_reason, null);
+  assert.equal(row.soft_bounce_count, 0);
   assert.equal(isContactSuppressed(c.id), false);
 });

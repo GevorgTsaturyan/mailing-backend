@@ -18,6 +18,7 @@ import express from 'express';
 import db from '../db.js';
 import { verifyToken, hashIp } from '../services/trackingToken.js';
 import { classifyClick, classifyOpen } from '../services/trackingClassifier.js';
+import { recordActivity } from '../services/ListHygieneService.js';
 import {
   SCANNER_UA_PATTERNS, SCANNER_CIDRS, DATACENTER_CIDRS,
   matchesUa, ipInAnyCidr,
@@ -207,6 +208,7 @@ function storableSignals(signals) {
 }
 
 function recordClick(snapshot, contactId, signals, classification, reason) {
+  if (classification !== 'scanner') recordActivity(contactId);
   db.prepare(`
     INSERT INTO click_events
       (campaign_button_id, campaign_id, contact_id, clicked_at, http_method,
@@ -222,6 +224,7 @@ function recordClick(snapshot, contactId, signals, classification, reason) {
 }
 
 function recordOpen(campaignId, contactId, signals, classification, reason) {
+  if (classification === 'open') recordActivity(contactId);
   db.prepare(`
     INSERT INTO open_events
       (campaign_id, contact_id, opened_at, http_method, user_agent, ip_hash,

@@ -328,8 +328,25 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN scheduled_for TEXT")    } catch {}
 try { db.exec("ALTER TABLE jobs ADD COLUMN contact_id    INTEGER") } catch {}
 try { db.exec("ALTER TABLE jobs ADD COLUMN send_log_id   INTEGER") } catch {}
 
+// ─── List hygiene (deliverability) ────────────────────────────────────────────
+// suppression_reason — non-NULL = never mail again: 'hard_bounce' | 'soft_bounce_limit'
+//                      | 'complaint' | 'unsubscribe'. Independent of `status`
+//                      (status='failed' is also used for transient send errors,
+//                      so it cannot be a suppression signal on its own).
+// soft_bounce_count  — consecutive recipient-side soft bounces; reset on DELIVERED.
+// last_activity_at   — last open/click (or creation); drives inactivity sunset.
+try { db.exec("ALTER TABLE contacts ADD COLUMN suppression_reason TEXT")                         } catch {}
+try { db.exec("ALTER TABLE contacts ADD COLUMN soft_bounce_count  INTEGER NOT NULL DEFAULT 0")   } catch {}
+try { db.exec("ALTER TABLE contacts ADD COLUMN last_activity_at   TEXT")                         } catch {}
+try { db.exec("ALTER TABLE contacts ADD COLUMN created_at         TEXT")                         } catch {}
+// Warm-up: when set, the identity's effective daily limit follows the warm-up
+// schedule (services/WarmupService.js) and never exceeds dailyLimit.
+try { db.exec("ALTER TABLE sender_identities ADD COLUMN warmupStartedAt TEXT")                    } catch {}
+// Backfill: contacts already unsubscribed get an explicit reason.
+db.exec("UPDATE contacts SET suppression_reason='unsubscribe' WHERE status='unsubscribed' AND suppression_reason IS NULL");
+
 // ─── Production hardening: missing indexes (idempotent) ───────────────────────
-db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_status              ON contacts(status)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_contacts_status             ON contacts(status)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_scheduled_sends_status_sched ON scheduled_sends(status, scheduledAt)`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_send_log_scheduledSendId     ON send_log(scheduledSendId)`);
 

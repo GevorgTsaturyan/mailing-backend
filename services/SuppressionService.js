@@ -1,5 +1,6 @@
 import db from '../db.js';
 import { checkAndCompleteCampaign } from './CampaignRepository.js';
+import { inactiveSunsetDays } from './ListHygieneService.js';
 
 // ─── SuppressionService — single source of truth for "may we send to X?" ──────
 //
@@ -27,12 +28,21 @@ import { checkAndCompleteCampaign } from './CampaignRepository.js';
 
 const SUPPRESSED_STATUSES = new Set(['unsubscribed']);
 
+// ── List hygiene (2026-11) ────────────────────────────────────────────────────
+// A contact is ALSO suppressed when contacts.suppression_reason is set
+// (hard_bounce | soft_bounce_limit | complaint | unsubscribe — see
+// ListHygieneService). This closes the gap where hard-bounced contacts
+// (status='failed') were re-selected by automated sends.
+function rowSuppressed(row) {
+  return !!row && (SUPPRESSED_STATUSES.has(row.status) || row.suppression_reason != null);
+}
+
 // ── Point checks ──────────────────────────────────────────────────────────────
 
 export function isContactSuppressed(contactId) {
   if (contactId == null) return false;
-  const row = db.prepare('SELECT status FROM contacts WHERE id = ?').get(contactId);
-  return !!row && SUPPRESSED_STATUSES.has(row.status);
+  const row = db.prepare('SELECT status, suppression_reason FROM contacts WHERE id = ?').get(contactId);
+  return rowSuppressed(row);
 }
 
 // SQL fragment (single source of truth) for excluding suppressed contacts inside
@@ -42,14 +52,25 @@ export function isContactSuppressed(contactId) {
 // re-selected forever. Mirrors SUPPRESSED_STATUSES: only 'unsubscribed' is
 // excluded — never sent/queued/failed (those are the ledger's concern, not
 // suppression). `alias` is the contacts table alias used in the caller's query.
+//
+// Also excludes suppression_reason IS NOT NULL, and — when INACTIVE_SUNSET_DAYS
+// > 0 (default 180) — contacts with no real engagement (open/click) since the
+// cutoff. Sunset applies only to batch SELECTION (automated sends); it is not a
+// permanent suppression, so a later engagement/reset brings the contact back.
 export function suppressionExclusionSql(alias = 'c') {
-  return `${alias}.status <> 'unsubscribed'`;
+  let sql = `${alias}.status <> 'unsubscribed' AND ${alias}.suppression_reason IS NULL`;
+  const days = inactiveSunsetDays();
+  if (days > 0) {
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    sql += ` AND (${alias}.last_activity_at IS NULL OR ${alias}.last_activity_at >= '${cutoff}')`;
+  }
+  return sql;
 }
 
 export function isEmailSuppressed(email) {
   if (!email) return false;
-  const row = db.prepare('SELECT status FROM contacts WHERE email = ?').get(String(email).toLowerCase());
-  return !!row && SUPPRESSED_STATUSES.has(row.status);
+  const row = db.prepare('SELECT status, suppression_reason FROM contacts WHERE email = ?').get(String(email).toLowerCase());
+  return rowSuppressed(row);
 }
 
 // Works for job-shaped rows from either pipeline:
@@ -69,7 +90,7 @@ export function suppressedContactIdSet(contactIds) {
   if (ids.length === 0) return new Set();
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(
-    `SELECT id FROM contacts WHERE id IN (${placeholders}) AND status = 'unsubscribed'`
+    `SELECT id FROM contacts WHERE id IN (${placeholders}) AND (status = 'unsubscribed' OR suppression_reason IS NOT NULL)`
   ).all(...ids);
   return new Set(rows.map((r) => r.id));
 }

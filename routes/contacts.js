@@ -76,6 +76,12 @@ router.put('/:id', (req, res) => {
     ).run(updated.firstName, updated.lastName, updated.email, updated.status, updated.sentAt, id);
     // Keep the failed list in step: a status moved off 'failed' is no longer failed.
     if (updated.status !== 'failed') FailedMails.clear(id);
+    // Manual reset to 'pending' lifts a BOUNCE suppression (e.g. the address was
+    // fixed). Complaints and unsubscribes are never lifted from here.
+    if (updated.status === 'pending') {
+      db.prepare(`UPDATE contacts SET suppression_reason = NULL, soft_bounce_count = 0
+                  WHERE id = ? AND suppression_reason IN ('hard_bounce','soft_bounce_limit')`).run(id);
+    }
     res.json(db.prepare('SELECT * FROM contacts WHERE id = ?').get(id));
   } catch (err) {
     if (err.message.includes('UNIQUE')) return res.status(409).json({ error: 'Email already exists' });

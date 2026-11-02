@@ -1,6 +1,9 @@
 import express from 'express';
 import db from '../db.js';
 import { setPhases } from '../services/ProvisioningPhaseStore.js';
+import { effectiveDailyLimit } from '../services/WarmupService.js';
+
+const withEffective = (r) => (r ? { ...r, effectiveDailyLimit: effectiveDailyLimit(r) } : r);
 
 const router = express.Router();
 
@@ -15,13 +18,13 @@ router.get('/', (req, res) => {
         LEFT JOIN providers p ON p.id = s.providerId
         ORDER BY p.name, s.label, si.domain
       `).all();
-  res.json(rows);
+  res.json(rows.map(withEffective));
 });
 
 router.get('/:id', (req, res) => {
   const row = db.prepare('SELECT * FROM sender_identities WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json(row);
+  res.json(withEffective(row));
 });
 
 router.post('/', (req, res) => {
@@ -39,14 +42,16 @@ router.post('/', (req, res) => {
   if (existing) return res.json(existing);
 
   const info = db.prepare(`
-    INSERT INTO sender_identities (serverId, domain, ip, fromName, fromAddr, dkimSelector, dailyLimit, warmupStage, createdAt)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sender_identities (serverId, domain, ip, fromName, fromAddr, dkimSelector, dailyLimit, warmupStage, createdAt, warmupStartedAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     serverId, domain.trim(), ip.trim(),
     fromName?.trim() || '', fromAddr.trim(),
     dkimSelector?.trim() || 'mail',
     dailyLimit ?? 50, warmupStage ?? 1,
-    new Date().toISOString()
+    new Date().toISOString(),
+    // New identities (new IP/domain) start on the warm-up schedule by default.
+    req.body.warmupStartedAt === null ? null : (req.body.warmupStartedAt || new Date().toISOString())
   );
   res.json(db.prepare('SELECT * FROM sender_identities WHERE id = ?').get(info.lastInsertRowid));
 });
@@ -55,6 +60,9 @@ router.put('/:id', (req, res) => {
   const si = db.prepare('SELECT * FROM sender_identities WHERE id = ?').get(req.params.id);
   if (!si) return res.status(404).json({ error: 'Not found' });
   const { domain, ip, fromName, fromAddr, dkimSelector, dailyLimit, warmupStage, status } = req.body;
+  if (req.body.warmupStartedAt != null && Number.isNaN(new Date(req.body.warmupStartedAt).getTime())) {
+    return res.status(400).json({ error: 'warmupStartedAt must be an ISO date or null' });
+  }
   const newDomain   = domain?.trim() ?? si.domain;
   const newIp       = ip?.trim() ?? si.ip;
   const newSelector = dkimSelector?.trim() ?? si.dkimSelector;
@@ -80,6 +88,13 @@ router.put('/:id', (req, res) => {
     status ?? si.status,
     req.params.id
   );
+
+  // warmupStartedAt: ISO date → (re)start warm-up from that date; null → off.
+  if (Object.prototype.hasOwnProperty.call(req.body, 'warmupStartedAt')) {
+    const v = req.body.warmupStartedAt;
+    db.prepare('UPDATE sender_identities SET warmupStartedAt = ? WHERE id = ?')
+      .run(v === null ? null : new Date(v).toISOString(), req.params.id);
+  }
 
   if (invalidatesVerification) {
     db.prepare(`

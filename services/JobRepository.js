@@ -52,7 +52,13 @@ const NOT_PAUSED_CAMPAIGN = `
   NOT EXISTS (SELECT 1 FROM campaigns pc JOIN recurring_campaigns prc ON prc.id = pc.recurring_campaign_id
               WHERE pc.id = j.campaign_id AND prc.status = 'paused')`;
 
-export function findNextPending(serverId, { readyDomains = null } = {}) {
+export function findNextPending(serverId, opts = {}) {
+  return findPendingCandidates(serverId, { ...opts, limit: 1 })[0] ?? null;
+}
+
+// Ordered PENDING candidates (same eligibility as findNextPending). Used by the
+// poller to skip candidates blocked by the per-provider hourly throttle.
+export function findPendingCandidates(serverId, { readyDomains = null, limit = 1 } = {}) {
   const now = new Date().toISOString();
   const base = `
     SELECT j.*, si.fromAddr, si.fromName, si.domain, si.dkimSelector, si.ip,
@@ -69,22 +75,22 @@ export function findNextPending(serverId, { readyDomains = null } = {}) {
 
   if (readyDomains === null) {
     // Gating disabled — all jobs (raw and campaign) are eligible.
-    return db.prepare(`${base} ORDER BY j.priority DESC, j.created_at ASC LIMIT 1`)
-      .get(serverId, now) ?? null;
+    return db.prepare(`${base} ORDER BY j.priority DESC, j.created_at ASC LIMIT ?`)
+      .all(serverId, now, limit);
   }
 
   if (readyDomains.size === 0) {
     // No domain is ready — only raw jobs (no contact_id) are eligible.
-    return db.prepare(`${base} AND j.contact_id IS NULL ORDER BY j.priority DESC, j.created_at ASC LIMIT 1`)
-      .get(serverId, now) ?? null;
+    return db.prepare(`${base} AND j.contact_id IS NULL ORDER BY j.priority DESC, j.created_at ASC LIMIT ?`)
+      .all(serverId, now, limit);
   }
 
   // Some domains are ready — raw jobs + campaign jobs for ready domains only.
   const domains       = [...readyDomains];
   const placeholders  = domains.map(() => '?').join(',');
   return db.prepare(
-    `${base} AND (j.contact_id IS NULL OR si.domain IN (${placeholders})) ORDER BY j.priority DESC, j.created_at ASC LIMIT 1`
-  ).get(serverId, now, ...domains) ?? null;
+    `${base} AND (j.contact_id IS NULL OR si.domain IN (${placeholders})) ORDER BY j.priority DESC, j.created_at ASC LIMIT ?`
+  ).all(serverId, now, ...domains, limit);
 }
 
 // True iff the identity exists, is active, provisioning-verified (READY), and is

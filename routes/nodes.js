@@ -11,6 +11,7 @@ import { allowDispatch as unsubscribeHostAllowsDispatch } from '../services/Unsu
 import { mergePhases } from '../services/ProvisioningPhaseStore.js';
 import { runControllerProvisioning } from '../services/ControllerProvisioningService.js';
 import { insertMessage } from '../services/InboxRepository.js';
+import { effectiveDailyLimit } from '../services/WarmupService.js';
 
 const router = express.Router();
 
@@ -70,7 +71,7 @@ router.get('/jobs', (req, res) => {
   const cap  = Math.min(Number(limit), 50);
 
   for (const identity of identities) {
-    const remaining = identity.dailyLimit - identity.dailySentCount;
+    const remaining = effectiveDailyLimit(identity) - identity.dailySentCount;
     if (remaining <= 0) continue;
 
     // Unsubscribe-host gate (per-domain, legacy pipeline): all send_jobs rows are

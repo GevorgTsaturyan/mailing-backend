@@ -132,8 +132,8 @@ async function ensureSPF(zoneId, domain, ip) {
     return { status: 'FAILED', message: `${spf.length} SPF records found — RFC violation, manual fix required` };
   }
   if (spf.length === 0) {
-    await createRecord(zoneId, 'TXT', domain, `v=spf1 ip4:${ip} ~all`);
-    return { status: 'OK', message: `SPF created: v=spf1 ip4:${ip} ~all` };
+    await createRecord(zoneId, 'TXT', domain, `v=spf1 ip4:${ip} -all`);
+    return { status: 'OK', message: `SPF created: v=spf1 ip4:${ip} -all` };
   }
 
   const existing = spf[0];

@@ -3,6 +3,7 @@ import { findOrCreate as findOrCreateStats, applyDeliveryEvent } from './Campaig
 import { checkAndCompleteCampaign } from './CampaignRepository.js';
 import { cancelOutstandingJobsForContact } from './SuppressionService.js';
 import * as FailedMails from './FailedMailRepository.js';
+import * as ListHygiene from './ListHygieneService.js';
 
 // ─── DeliveryEventService ─────────────────────────────────────────────────────
 // Processes delivery events reported by mail-nodes from Postfix mail.log.
@@ -115,6 +116,7 @@ function processSingleEvent(event, now) {
   let campaignId          = null;
   let didTransition       = false;  // true when the FSM-gated update path ran
   let complainedContactId = null;   // set when a complaint suppresses a contact
+  let suppressedContactId = null;   // set when a bounce newly suppresses a contact
 
   const result = db.transaction(() => {
     // Resolve job references for both pipelines
@@ -202,9 +204,13 @@ function processSingleEvent(event, now) {
     if (contactId) {
       if (newDeliveryStatus === 'COMPLAINED') {
         markContactUnsubscribed.run(contactId);
+        ListHygiene.applyComplaint(contactId);
         complainedContactId = contactId;  // cancel their queued jobs after commit
       } else if (newDeliveryStatus === 'BOUNCED') {
         markContactFailed.run(contactId);
+        // hard → suppress now; soft → suppress after N; sender-side → no penalty
+        const b = ListHygiene.applyBounce(contactId, event);
+        if (b.suppressed) suppressedContactId = contactId;
         FailedMails.record(contactId, {
           email:  email ?? '',
           reason: event.reasonDetail || event.response || 'Hard bounce',
@@ -213,6 +219,7 @@ function processSingleEvent(event, now) {
       } else if (newDeliveryStatus === 'DELIVERED') {
         // Confirmed delivery clears any prior failure for this contact.
         FailedMails.clear(contactId);
+        ListHygiene.applyDelivered(contactId);
       }
     }
 
@@ -233,6 +240,9 @@ function processSingleEvent(event, now) {
   // its own transaction).
   if (complainedContactId != null) {
     cancelOutstandingJobsForContact(complainedContactId, 'complaint');
+  }
+  if (suppressedContactId != null) {
+    cancelOutstandingJobsForContact(suppressedContactId, 'bounce');
   }
 
   return result;

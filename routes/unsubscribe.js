@@ -43,6 +43,9 @@ function suppressContact(contactId) {
   db.prepare(
     "UPDATE contacts SET status = 'unsubscribed' WHERE id = ? AND status != 'unsubscribed'"
   ).run(contactId);
+  db.prepare(
+    "UPDATE contacts SET suppression_reason = 'unsubscribe' WHERE id = ? AND suppression_reason IS NULL"
+  ).run(contactId);
   // Proactively cancel any jobs queued before this unsubscribe so a job created
   // while subscribed can never be claimed and sent afterward.
   cancelOutstandingJobsForContact(contactId, 'unsubscribed');

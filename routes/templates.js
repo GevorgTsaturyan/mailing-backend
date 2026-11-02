@@ -1,5 +1,6 @@
 import express from 'express';
 import db from '../db.js';
+import { lintTemplate } from '../services/ContentLint.js';
 
 const router = express.Router();
 
@@ -11,7 +12,7 @@ router.get('/', (req, res) => {
 router.get('/:name', (req, res) => {
   const tmpl = db.prepare('SELECT * FROM templates WHERE name = ?').get(req.params.name);
   if (!tmpl) return res.status(404).json({ error: 'Template not found' });
-  res.json(tmpl);
+  res.json({ ...tmpl, warnings: lintTemplate(tmpl) });
 });
 
 router.post('/', (req, res) => {
@@ -23,7 +24,7 @@ router.post('/', (req, res) => {
     db.prepare(
       'INSERT INTO templates (name, subject, html, txt, content_type) VALUES (?, ?, ?, ?, ?)'
     ).run(name.trim(), subject.trim(), html || '', txt || '', content_type || 'html');
-    res.status(201).json({ name: name.trim() });
+    res.status(201).json({ name: name.trim(), warnings: lintTemplate({ subject, html, txt }) });
   } catch (err) {
     if (err.message.includes('UNIQUE')) return res.status(409).json({ error: 'Template name already exists' });
     throw err;
@@ -41,7 +42,8 @@ router.put('/:name', (req, res) => {
     'UPDATE templates SET subject=COALESCE(?, subject), html=COALESCE(?, html), txt=COALESCE(?, txt), content_type=COALESCE(?, content_type) WHERE name=?'
   ).run(subject ?? null, html ?? null, txt ?? null, content_type ?? null, req.params.name);
 
-  res.json(db.prepare('SELECT * FROM templates WHERE name = ?').get(req.params.name));
+  const saved = db.prepare('SELECT * FROM templates WHERE name = ?').get(req.params.name);
+  res.json({ ...saved, warnings: lintTemplate(saved) });
 });
 
 router.delete('/:name', (req, res) => {

@@ -180,9 +180,9 @@ suppresses/fails contacts or destroys campaigns (§16). Tests: `dkim-guard.test.
 ## Suppression enforcement (defense-in-depth)
 
 `SuppressionService` is the single source of truth for recipient eligibility. Suppressed =
-`contacts.status='unsubscribed'` (complaints map to it). `failed` is deliberately NOT treated as
-permanent suppression (it conflates hard bounce with transient failure — that separation is the
-future `suppression_list` task). Enforced at every send path:
+`contacts.status='unsubscribed'` **or** `contacts.suppression_reason IS NOT NULL`
+(`hard_bounce` | `soft_bounce_limit` | `complaint` | `unsubscribe`). `status='failed'` alone is
+still NOT suppression (it is also set by transient send errors). Enforced at every send path:
 - **Creation:** `queueCanonicalJobForContact` / `queueJobForContact` (return false + skip),
   `routes/send.js` (explicit per-contact skip), `JobService.createJob` (throws).
 - **Claim:** `JobService.startJob` (cancels the job → 409) and `GET /api/nodes/jobs` (cancels +
@@ -195,6 +195,44 @@ sent/bounced; `checkAndCompleteCampaign` treats `CANCELLED` as terminal. Residua
 a node claiming a job and its SMTP submission there is an inherent DB↔SMTP window (not exactly-once).
 
 Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memory DB via DB_PATH).
+
+### List hygiene (2026-11, `services/ListHygieneService.js`)
+- **Bounce classes** (`classifyBounce`, pure): `hard` (5.1.x, 5.2.1, `invalid_recipient`,
+  "user unknown"…) → `suppression_reason='hard_bounce'` immediately + queued jobs cancelled.
+  `soft` (mailbox full, 4.x.x expired deferral, other 5.x.x) → `soft_bounce_count++`; at
+  `SOFT_BOUNCE_LIMIT` (default 3) → `soft_bounce_limit`. `DELIVERED` resets the count.
+  `sender` (`spam_blocked`, `blocklist`, `auth_failure`, `reputation`, `rate_limited`,
+  `signing_unavailable`) → **no recipient penalty** (a reputation dip must not wipe the list).
+- **Complaints** → `status='unsubscribed'` + `suppression_reason='complaint'`. Unsubscribe routes
+  set `suppression_reason='unsubscribe'` (startup backfills existing unsubscribed rows).
+- **Manual reset** (`PUT /api/contacts/:id` with `status='pending'`) lifts only bounce
+  suppressions; complaint/unsubscribe are never lifted there.
+- **Inactivity sunset:** `contacts.last_activity_at` = last real open (`classification='open'`)
+  or non-scanner click (`routes/track.js`), baseline = now via `backfillActivity()` at startup
+  (fills NULLs only). `suppressionExclusionSql()` skips contacts inactive > `INACTIVE_SUNSET_DAYS`
+  (default 180, `0` disables) — batch selection only, not a permanent suppression.
+
+### Warm-up + provider throttle (`services/WarmupService.js`)
+- `sender_identities.warmupStartedAt` set ⇒ effective daily limit = min(`dailyLimit`, schedule):
+  week 1 50 · 100 · 200 · 500 · 1000 · 2000 · then ×2 weekly. NULL ⇒ `dailyLimit` unchanged.
+  New identities default to warm-up from creation; `PUT /api/sender-identities/:id` accepts
+  `warmupStartedAt` (ISO → restart, `null` → off). GET responses include `effectiveDailyLimit`.
+  Used by `scheduler.getIdentityRemainingCapacity` and legacy `GET /api/nodes/jobs`.
+- Per-provider hourly cap (Google, Microsoft, Yahoo/AOL, Mail.ru, Yandex): at most
+  `max(5, ceil(effectiveDailyLimit / PROVIDER_SPREAD_HOURS))` jobs **started** per identity per
+  provider per rolling hour (default spread 8h; `0` disables). `PollingService.poll` inspects up
+  to 50 ordered candidates (`JobRepository.findPendingCandidates`) and returns the first allowed.
+  Canonical pipeline only.
+
+### Content lint (`services/ContentLint.js`)
+Advisory warnings (never blocking) on `GET/PUT/POST /api/templates`: > 5 links, > 3 images, URL
+shorteners, bare-IP links, phishing-like subjects, missing plain text. Shown in `Templates.vue`.
+
+### SPF
+`CloudflareService.ensureSPF` now creates new records as `v=spf1 ip4:<ip> -all` (merges keep the
+existing qualifier).
+
+Tests: `suppression.test.js` (F1–F3), `hygiene-warmup.test.js`.
 
 ---
 
@@ -1061,6 +1099,9 @@ Passwords are hashed with bcrypt (rounds=12). `create-admin.js` is the only way 
 | `NODE_ENV` | Yes | Set to `production` to skip seed data. Any other value enables seeding. |
 | `USE_CANONICAL_QUEUE` | No | `true` to route new campaign sends to the `jobs` table (canonical pipeline). Omit or set `false` to use the legacy `send_jobs` pipeline. Flip to `true` only after validating the canonical pipeline in production. |
 | `UNSUBSCRIBE_REQUIRE_READY` | No | Default `true` (fail-closed): contact-bound job dispatch is withheld until the unsubscribe host passes its `/unsubscribe-health` probe. Set `false` ONLY for local dev/tests — never in production. |
+| `SOFT_BOUNCE_LIMIT` | No | Consecutive soft bounces before suppression (default 3). |
+| `INACTIVE_SUNSET_DAYS` | No | Skip contacts with no open/click for this many days (default 180; `0` disables). |
+| `PROVIDER_SPREAD_HOURS` | No | Per-provider hourly cap = effective daily limit ÷ this (default 8; `0` disables throttle). |
 | `UNSUBSCRIBE_READINESS_TTL_MS` / `_REFRESH_MS` / `_TIMEOUT_MS` | No | Unsubscribe-host probe tuning (defaults 600000 / 300000 / 4000), mirroring the `TRACKING_READINESS_*` knobs. |
 
 File: `backend/.env` (gitignored). Copy from `.env.example`.
