@@ -62,7 +62,7 @@ export function ensureOffersButton(identity, brand = null) {
     text: 'See this week’s picks',
     destination_url: url,
     style: brand?.theme?.accent
-      ? { background_color: brand.theme.accent, text_color: brand.theme.accent_text || '#ffffff', border_radius: brand.theme.button_radius ?? 8 }
+      ? { background_color: brand.theme.accent, text_color: brand.theme.accent_text || '#ffffff', border_radius: Math.min(Number(brand.theme.button_radius ?? 8), 40) }
       : {},
     status: 'active',
   });

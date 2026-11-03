@@ -36,3 +36,10 @@ test('provisionBrandSite: offers-site error → FAILED, never throws', async () 
   const r = await S.provisionBrandSite({ domain: 'y.org' }, { fetchImpl: async () => ({ ok: false, status: 500, json: async () => ({ error: 'boom' }) }) });
   assert.equal(r.status, 'FAILED');
 });
+
+test('pill radius (999) from the site theme is clamped for the email button', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ site_name: 'Pill', created: true, theme: { accent: '#2563eb', button_radius: 999 } }) });
+  const r = await S.provisionBrandSite({ domain: 'pill.org', fromName: 'Pill' }, { fetchImpl });
+  assert.equal(r.status, 'OK');
+  assert.equal(Buttons.findById(r.buttonId).style.border_radius, 40);
+});
