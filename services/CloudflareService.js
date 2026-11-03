@@ -279,6 +279,12 @@ export async function provisionDns({ domain, ip, selector, dkimPublicKey, contro
   if (controllerIp) {
     await run('a_unsubscribe', () => ensureARecord(zoneId, `unsubscribe.${domain}`, controllerIp));
     await run('a_click',       () => ensureARecord(zoneId, `click.${domain}`,       controllerIp));
+    // Brand offers site (offers-site brand host) — only when the controller is
+    // configured to host it (OFFERS_SITE_PORT). Email buttons link here so the
+    // link domain matches the From domain.
+    if (process.env.OFFERS_SITE_PORT) {
+      await run('a_offers',    () => ensureARecord(zoneId, `offers.${domain}`,      controllerIp));
+    }
   } else {
     phases.a_unsubscribe = { status: 'SKIPPED', message: 'CONTROLLER_PUBLIC_IP not set — add A record manually' };
     phases.a_click       = { status: 'SKIPPED', message: 'CONTROLLER_PUBLIC_IP not set — add A record manually' };

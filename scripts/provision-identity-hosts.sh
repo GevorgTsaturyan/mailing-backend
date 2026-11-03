@@ -80,6 +80,15 @@ if [[ -f "$BACKEND_DIR/.env" ]]; then
   fi
 fi
 
+# ── Offers brand site (optional): offers.<domain> → offers-site on OFFERS_SITE_PORT ──
+# Enabled only when backend/.env sets OFFERS_SITE_PORT (e.g. 3010). Each brand gets
+# its own generated site there (see offers-site/backend/services/brands.js).
+OFFERS_SITE_PORT=""
+if [[ -f "$BACKEND_DIR/.env" ]]; then
+  _o=$(grep -E '^OFFERS_SITE_PORT=' "$BACKEND_DIR/.env" 2>/dev/null || true)
+  OFFERS_SITE_PORT="${_o#OFFERS_SITE_PORT=}"; OFFERS_SITE_PORT="${OFFERS_SITE_PORT%%#*}"; OFFERS_SITE_PORT="${OFFERS_SITE_PORT//[[:space:]]/}"
+fi
+
 # ── Detect server public IP ───────────────────────────────────────────────────
 SERVER_IP="UNKNOWN"
 for _ip_svc in "https://ifconfig.me" "https://api.ipify.org" "https://checkip.amazonaws.com"; do
@@ -109,16 +118,19 @@ echo "============================================================"
 echo
 
 # ── Subdomains to provision ───────────────────────────────────────────────────
-# Each entry: "subdomain_prefix:health_path"
+# Each entry: "subdomain_prefix:health_path[:upstream_port]" (port defaults to BACKEND_PORT)
 SUBDOMAINS=("unsubscribe:/unsubscribe-health" "click:/tracking-health")
+if [[ -n "$OFFERS_SITE_PORT" ]]; then
+  SUBDOMAINS+=("offers:/robots.txt:${OFFERS_SITE_PORT}")
+fi
 
 DNS_OK=true    # tracks whether all DNS records were verified
 CERT_FAILED=false  # set true if certbot fails (DNS not propagated); script still exits 0
 FINAL_RELOAD=0
 
 for ENTRY in "${SUBDOMAINS[@]}"; do
-  PREFIX="${ENTRY%%:*}"
-  HEALTH_PATH="${ENTRY##*:}"
+  IFS=':' read -r PREFIX HEALTH_PATH UPSTREAM_PORT <<< "$ENTRY"
+  UPSTREAM_PORT="${UPSTREAM_PORT:-$BACKEND_PORT}"
   SUBDOMAIN="${PREFIX}.${DOMAIN}"
   NGINX_CONF="$NGINX_AVAILABLE/${SUBDOMAIN}.conf"
   NGINX_LINK="$NGINX_ENABLED/${SUBDOMAIN}.conf"
@@ -152,7 +164,7 @@ for ENTRY in "${SUBDOMAINS[@]}"; do
     echo "  [nginx] Writing HTTP config: $NGINX_CONF"
     sed \
       -e "s|__SUBDOMAIN__|${SUBDOMAIN}|g" \
-      -e "s|__BACKEND_PORT__|${BACKEND_PORT}|g" \
+      -e "s|__BACKEND_PORT__|${UPSTREAM_PORT}|g" \
       "$TEMPLATE" > "$NGINX_CONF"
     FINAL_RELOAD=1
   fi
@@ -213,8 +225,7 @@ echo
 echo "── Health probes ────────────────────────────────────────────"
 ALL_HEALTHY=true
 for ENTRY in "${SUBDOMAINS[@]}"; do
-  PREFIX="${ENTRY%%:*}"
-  HEALTH_PATH="${ENTRY##*:}"
+  IFS=':' read -r PREFIX HEALTH_PATH _ <<< "$ENTRY"
   SUBDOMAIN="${PREFIX}.${DOMAIN}"
   URL="https://${SUBDOMAIN}${HEALTH_PATH}"
   printf "  %-55s" "$URL"

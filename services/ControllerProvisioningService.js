@@ -23,6 +23,7 @@ import { provisionDns as _provisionDns, isConfigured as _cfConfigured } from './
 import { checkControllerHostsResolve as _checkControllerHostsResolve } from './DnsResolutionService.js';
 import { mergePhases, parseNginxOutput } from './ProvisioningPhaseStore.js';
 import { PROVISION_SCRIPT } from '../routes/admin.js';
+import { provisionBrandSite as _provisionBrandSite } from './OffersBrandService.js';
 
 function defaultRunNginxScript(domain, execFileImpl) {
   return new Promise((resolve) => {
@@ -133,6 +134,14 @@ export async function runControllerProvisioning(identity, opts = {}) {
     console.error(`[controller-provision] nginx/TLS error for ${identity.domain}:`, err.message);
   } else {
     console.log(`[controller-provision] nginx/TLS provisioned for ${identity.domain}`);
+  }
+
+  // ── 5. Brand offers site (best-effort; never affects sending readiness) ────
+  const provisionBrand = deps.provisionBrandSite || _provisionBrandSite;
+  const offersSite = await provisionBrand(identity);
+  mergePhases(identity.id, { offersSite });
+  if (offersSite.status === 'FAILED') {
+    console.error(`[controller-provision] offers brand site for ${identity.domain}:`, offersSite.message);
   }
   return { cfStatus, dnsReady: true, ranNginx: true, nginxError: err || null };
 }

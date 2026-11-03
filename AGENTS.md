@@ -228,6 +228,22 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
 Advisory warnings (never blocking) on `GET/PUT/POST /api/templates`: > 5 links, > 3 images, URL
 shorteners, bare-IP links, phishing-like subjects, missing plain text. Shown in `Templates.vue`.
 
+### Brand offers site per identity (`services/OffersBrandService.js`)
+Enabled when `.env` has `OFFERS_SITE_PORT` (e.g. 3010) **and** `OFFERS_SITE_INTERNAL_KEY`
+(= `INTERNAL_API_KEY` in offers-site `.env`). On identity provisioning:
+- `CloudflareService` adds `a_offers`: A `offers.<domain>` → `CONTROLLER_PUBLIC_IP` (DNS-only).
+- `scripts/provision-identity-hosts.sh` adds `offers.<domain>` (nginx → `127.0.0.1:$OFFERS_SITE_PORT`,
+  own Let's Encrypt cert, health `/robots.txt`). Entries are `prefix:health[:port]`.
+- `ControllerProvisioningService` step 5 → `provisionBrandSite()`: `POST <offers-site>/api/internal/brands`
+  `{domain, site_name, contact_email}` (offers-site generates a design distinct from existing
+  brands and keeps it stable), then creates ONE button "<Brand> Offers" → `https://offers.<domain>/`
+  in the brand's accent colour (idempotent: reuses any button already targeting that URL).
+  Phase `offersSite` (OK/SKIPPED/FAILED) — best-effort, never affects sending readiness.
+- Brand name = identity `fromName` unless generic (Support/Info/…), else capitalised domain label.
+- **Rule:** email buttons for an identity must point to its own `offers.<domain>` — never directly
+  to casino/affiliate URLs. Bare-domain (`<domain>`) takeover is manual (DNS + nginx), only when the
+  root is parked/empty. Tests: `offers-brand.test.js`.
+
 ### SPF
 `CloudflareService.ensureSPF` now creates new records as `v=spf1 ip4:<ip> -all` (merges keep the
 existing qualifier).
@@ -1099,6 +1115,9 @@ Passwords are hashed with bcrypt (rounds=12). `create-admin.js` is the only way 
 | `NODE_ENV` | Yes | Set to `production` to skip seed data. Any other value enables seeding. |
 | `USE_CANONICAL_QUEUE` | No | `true` to route new campaign sends to the `jobs` table (canonical pipeline). Omit or set `false` to use the legacy `send_jobs` pipeline. Flip to `true` only after validating the canonical pipeline in production. |
 | `UNSUBSCRIBE_REQUIRE_READY` | No | Default `true` (fail-closed): contact-bound job dispatch is withheld until the unsubscribe host passes its `/unsubscribe-health` probe. Set `false` ONLY for local dev/tests — never in production. |
+| `OFFERS_SITE_PORT` | No | Enables per-identity brand offers site (`offers.<domain>` → this port on the controller). |
+| `OFFERS_SITE_INTERNAL_KEY` | No | Shared secret for offers-site `/api/internal/brands` (must equal its `INTERNAL_API_KEY`). |
+| `OFFERS_SITE_INTERNAL_URL` | No | Default `http://127.0.0.1:$OFFERS_SITE_PORT`. |
 | `SOFT_BOUNCE_LIMIT` | No | Consecutive soft bounces before suppression (default 3). |
 | `INACTIVE_SUNSET_DAYS` | No | Skip contacts with no open/click for this many days (default 180; `0` disables). |
 | `PROVIDER_SPREAD_HOURS` | No | Per-provider hourly cap = effective daily limit ÷ this (default 8; `0` disables throttle). |
