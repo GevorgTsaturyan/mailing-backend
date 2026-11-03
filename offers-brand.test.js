@@ -20,7 +20,7 @@ test('provisionBrandSite: registers brand and creates ONE accent-coloured button
   process.env.OFFERS_SITE_PORT = '3010'; process.env.OFFERS_SITE_INTERNAL_KEY = 'k';
   const calls = [];
   const fetchImpl = async (url, opts) => { calls.push({ url, body: JSON.parse(opts.body), key: opts.headers['X-Internal-Key'] });
-    return { ok: true, json: async () => ({ site_name: 'Ardovia', created: calls.length === 1, theme: { accent: '#34d399', accent_text: '#06261a', button_radius: 8 } }) }; };
+    return { ok: true, json: async () => ({ site_name: 'Ardovia', created: calls.length === 1, themed: true, theme: { accent: '#34d399', accent_text: '#06261a', button_radius: 8 } }) }; };
   const id = { domain: 'ardovia.co', fromName: 'Ardovia', fromAddr: 'support@ardovia.co' };
   const r1 = await S.provisionBrandSite(id, { fetchImpl });
   const r2 = await S.provisionBrandSite(id, { fetchImpl });
@@ -38,8 +38,14 @@ test('provisionBrandSite: offers-site error → FAILED, never throws', async () 
 });
 
 test('pill radius (999) from the site theme is clamped for the email button', async () => {
-  const fetchImpl = async () => ({ ok: true, json: async () => ({ site_name: 'Pill', created: true, theme: { accent: '#2563eb', button_radius: 999 } }) });
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ site_name: 'Pill', created: true, themed: true, theme: { accent: '#2563eb', button_radius: 999 } }) });
   const r = await S.provisionBrandSite({ domain: 'pill.org', fromName: 'Pill' }, { fetchImpl });
   assert.equal(r.status, 'OK');
   assert.equal(Buttons.findById(r.buttonId).style.border_radius, 40);
+});
+
+test('themes off → default button style (no accent colour)', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ site_name: 'Plain', created: true, themed: false, theme: { accent: '#ff0000' } }) });
+  const r = await S.provisionBrandSite({ domain: 'plain.org', fromName: 'Plain' }, { fetchImpl });
+  assert.equal(Buttons.findById(r.buttonId).style.background_color, undefined);
 });

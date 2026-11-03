@@ -237,7 +237,8 @@ Enabled when `.env` has `OFFERS_SITE_PORT` (e.g. 3010) **and** `OFFERS_SITE_INTE
 - `ControllerProvisioningService` step 5 → `provisionBrandSite()`: `POST <offers-site>/api/internal/brands`
   `{domain, site_name, contact_email}` (offers-site generates a design distinct from existing
   brands and keeps it stable), then creates ONE button "<Brand> Offers" → `https://offers.<domain>/`
-  in the brand's accent colour (idempotent: reuses any button already targeting that URL).
+  (accent-coloured only when the offers site reports `themed: true`, i.e. BRAND_THEMES=on;
+  idempotent: reuses any button already targeting that URL).
   Phase `offersSite` (OK/SKIPPED/FAILED) — best-effort, never affects sending readiness.
 - Brand name = identity `fromName` unless generic (Support/Info/…), else capitalised domain label.
 - **Rule:** email buttons for an identity must point to its own `offers.<domain>` — never directly

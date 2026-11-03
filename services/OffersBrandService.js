@@ -52,7 +52,8 @@ export async function registerBrand(identity, fetchImpl = fetch) {
 }
 
 // Idempotent: reuses any existing button that already targets offers.<domain>.
-// The button takes the brand site's accent colour, so each brand's emails look different too.
+// The button takes the brand site's accent colour only when the site shows its
+// generated theme (offers-site BRAND_THEMES=on → `themed: true`); otherwise default style.
 export function ensureOffersButton(identity, brand = null) {
   const url = offersUrl(identity.domain);
   const existing = Buttons.list().find((b) => String(b.destination_url).replace(/\/+$/, '/') === url);
@@ -61,7 +62,7 @@ export function ensureOffersButton(identity, brand = null) {
     internal_name: `${brandName(identity)} Offers`,
     text: 'See this week’s picks',
     destination_url: url,
-    style: brand?.theme?.accent
+    style: brand?.themed && brand?.theme?.accent
       ? { background_color: brand.theme.accent, text_color: brand.theme.accent_text || '#ffffff', border_radius: Math.min(Number(brand.theme.button_radius ?? 8), 40) }
       : {},
     status: 'active',
