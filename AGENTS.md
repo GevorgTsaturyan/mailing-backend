@@ -220,7 +220,8 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
   Used by `scheduler.getIdentityRemainingCapacity` and legacy `GET /api/nodes/jobs`.
 - Per-provider hourly cap (Google, Microsoft, Yahoo/AOL, Mail.ru, Yandex): at most
   `max(5, ceil(effectiveDailyLimit / PROVIDER_SPREAD_HOURS))` jobs **started** per identity per
-  provider per rolling hour (default spread 8h; `0` disables). `PollingService.poll` inspects up
+  provider per rolling hour (default spread 8h; `0` disables), **evenly paced**: at least
+  `3600/cap` s between consecutive starts (13/h → one every ~4.6 min, no bursts). `PollingService.poll` inspects up
   to 50 ordered candidates (`JobRepository.findPendingCandidates`) and returns the first allowed.
   Canonical pipeline only.
 

@@ -9,7 +9,8 @@ import db from '../db.js';
 //
 // Provider throttle: per identity, per big mailbox provider, at most
 // providerHourlyCap(identity) jobs may be STARTED in a rolling hour. This
-// spreads a day's volume over ≥ PROVIDER_SPREAD_HOURS instead of a burst to
+// spreads a day's volume over ≥ PROVIDER_SPREAD_HOURS (evenly paced, see
+// providerAllows) instead of a burst to
 // Gmail/Microsoft/Yahoo — bursts from a young IP look like spam runs.
 
 // Week 1..N daily limits; after the table: double weekly.
@@ -59,6 +60,11 @@ export function providerHourlyCap(identity, now = new Date()) {
 }
 
 // Returns true when this job may start now under the provider throttle.
+// Two rules (both must pass):
+//   1. at most `cap` starts per rolling hour (per identity, per provider);
+//   2. even pacing — at least 3600/cap seconds since the previous start, so the
+//      hour's quota is spread out (e.g. 13/h → one every ~4.6 min) instead of a
+//      burst of `cap` messages followed by an hour of silence.
 export function providerAllows(job, identity, now = new Date()) {
   const provider = providerOf(job.recipient);
   if (!provider) return true;
@@ -67,9 +73,11 @@ export function providerAllows(job, identity, now = new Date()) {
   const since = new Date(now.getTime() - 3_600_000).toISOString();
   const domains = PROVIDERS[provider];
   const likes = domains.map(() => 'lower(recipient) LIKE ?').join(' OR ');
-  const n = db.prepare(`
-    SELECT COUNT(*) n FROM jobs
+  const r = db.prepare(`
+    SELECT COUNT(*) n, MAX(started_at) last FROM jobs
     WHERE identity_id = ? AND started_at >= ? AND (${likes})
-  `).get(job.identity_id, since, ...domains.map((d) => `%@${d}`)).n;
-  return n < cap;
+  `).get(job.identity_id, since, ...domains.map((d) => `%@${d}`));
+  if (r.n >= cap) return false;
+  if (r.last && now.getTime() - new Date(r.last).getTime() < Math.floor(3_600_000 / cap)) return false;
+  return true;
 }

@@ -54,7 +54,7 @@ test('provider throttle counts jobs started in the last hour per provider', asyn
   const iid = Number(db.prepare(`INSERT INTO sender_identities (serverId, domain, ip, fromAddr, status, verificationStatus, dailyLimit, createdAt)
     VALUES (?, 't.net', '1.1.1.1', 'a@t.net', 'active', 'READY', 40, ?)`).run(sid, ts).lastInsertRowid);
   const identity = { id: iid, dailyLimit: 40, warmupStartedAt: null }; // cap = 5/h
-  const recent = new Date(Date.now() - 600_000).toISOString();
+  const recent = new Date(Date.now() - 50 * 60_000).toISOString(); // within the hour, but older than the pacing gap
   for (let i = 0; i < 5; i++) {
     db.prepare(`INSERT INTO jobs (status, identity_id, recipient, subject, body, created_at, started_at)
                 VALUES ('SENT', ?, ?, 's', 'b', ?, ?)`).run(iid, `u${i}@gmail.com`, recent, recent);
@@ -72,4 +72,21 @@ test('inactivity sunset excludes long-inactive contacts from selection', async (
   const b = db.prepare("INSERT INTO contacts (firstName,lastName,email,last_activity_at) VALUES ('b','b','sunset-new@x.com',?)").run(new Date().toISOString()).lastInsertRowid;
   const ids = db.prepare(`SELECT id FROM contacts c WHERE ${suppressionExclusionSql('c')} AND id IN (?,?)`).all(a, b).map((r) => r.id);
   assert.deepEqual(ids, [Number(b)]);
+});
+
+test('provider throttle paces evenly: no second start within 3600/cap seconds', async () => {
+  const db = (await import('./db.js')).default;
+  const { providerAllows } = await import('./services/WarmupService.js');
+  const ts = new Date().toISOString();
+  const sid = db.prepare("INSERT INTO servers (label, apiKey, status, createdAt) VALUES ('p','KEY-PACE','online',?)").run(ts).lastInsertRowid;
+  const iid = Number(db.prepare(`INSERT INTO sender_identities (serverId, domain, ip, fromAddr, status, verificationStatus, dailyLimit, createdAt)
+    VALUES (?, 'p.net', '1.1.1.2', 'a@p.net', 'active', 'READY', 100, ?)`).run(sid, ts).lastInsertRowid);
+  const identity = { id: iid, dailyLimit: 100, warmupStartedAt: null };   // cap 13/h → gap ~276 s
+  const start = (agoMs) => db.prepare(`INSERT INTO jobs (status, identity_id, recipient, subject, body, created_at, started_at)
+    VALUES ('SENT', ?, 'x@gmail.com', 's', 'b', ?, ?)`).run(iid, ts, new Date(Date.now() - agoMs).toISOString());
+  start(60_000);   // 1 min ago
+  assert.equal(providerAllows({ identity_id: iid, recipient: 'y@gmail.com' }, identity), false, 'too soon after previous Gmail start');
+  assert.equal(providerAllows({ identity_id: iid, recipient: 'y@outlook.com' }, identity), true, 'other provider unaffected');
+  db.prepare('UPDATE jobs SET started_at=? WHERE identity_id=?').run(new Date(Date.now() - 300_000).toISOString(), iid); // 5 min ago
+  assert.equal(providerAllows({ identity_id: iid, recipient: 'y@gmail.com' }, identity), true, 'gap elapsed');
 });
