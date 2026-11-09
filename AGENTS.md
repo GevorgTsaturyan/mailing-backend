@@ -209,8 +209,10 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
   lifts only bounce suppressions. **Unsubscribe is final from the operator side:** for a contact with
   `status='unsubscribed'` or `suppression_reason` unsubscribe/complaint, `PUT /api/contacts/:id` keeps
   `status='unsubscribed'` (other fields editable) and failed-mails reset leaves status alone
-  (`statusLocked: true`). The UI has no re-subscribe action; public double opt-in also refuses
-  suppressed addresses — only the person can ever opt in again. Malformed (even validly signed)
+  (`statusLocked: true`). The ONLY way to lift an unsubscribe is the explicit operator action
+  `POST /api/contacts/:id/resubscribe` (Unsubscribed page "Re-subscribe", e.g. for test addresses):
+  status → `'sent'`, suppression cleared; complaints are refused (409). Public double opt-in refuses
+  suppressed addresses. Malformed (even validly signed)
   unsubscribe tokens → 404, never 500. Tests: `unsubscribe-lock.test.js`.
 - **Inactivity sunset:** `contacts.last_activity_at` = last real open (`classification='open'`)
   or non-scanner click (`routes/track.js`), baseline = now via `backfillActivity()` at startup

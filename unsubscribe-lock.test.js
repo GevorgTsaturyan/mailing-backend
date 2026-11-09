@@ -45,3 +45,14 @@ test('malformed but validly signed unsubscribe token → 404, not 500', async ()
   assert.equal((await fetch(`${base}/u/${bad}`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'List-Unsubscribe=One-Click' })).status, 404);
   assert.equal((await fetch(`${base}/u/${bad}`)).status, 404);
 });
+
+test('explicit re-subscribe: status → sent, no longer suppressed; complaint refused', async () => {
+  const u = mk('rs1@x.com', 'unsubscribed', 'unsubscribe');
+  const r = await fetch(`${base}/api/contacts/${u}/resubscribe`, { method: 'POST' });
+  const c = await r.json();
+  assert.equal(r.status, 200); assert.equal(c.status, 'sent'); assert.equal(c.suppression_reason, null);
+  assert.equal(isContactSuppressed(u), false);
+  const k = mk('rs2@x.com', 'unsubscribed', 'complaint');
+  assert.equal((await fetch(`${base}/api/contacts/${k}/resubscribe`, { method: 'POST' })).status, 409);
+  assert.equal(isContactSuppressed(k), true);
+});

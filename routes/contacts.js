@@ -64,6 +64,22 @@ router.post('/', (req, res) => {
   }
 });
 
+// POST /api/contacts/:id/resubscribe — explicit operator action (e.g. to reset a
+// test address after testing unsubscribe). The ONLY way to lift an unsubscribe:
+// status → 'sent', suppression cleared. Complaints (spam reports) stay locked.
+// Ordinary edits/resets can never change an unsubscribed contact's status.
+router.post('/:id/resubscribe', (req, res) => {
+  const id = Number(req.params.id);
+  const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
+  if (!contact) return res.status(404).json({ error: 'Contact not found' });
+  if (contact.suppression_reason === 'complaint') {
+    return res.status(409).json({ error: 'This contact reported our email as spam — they cannot be re-subscribed.' });
+  }
+  db.prepare("UPDATE contacts SET status = 'sent', suppression_reason = NULL, soft_bounce_count = 0 WHERE id = ?").run(id);
+  console.log(`[contacts] contact #${id} re-subscribed by operator`);
+  res.json(db.prepare('SELECT * FROM contacts WHERE id = ?').get(id));
+});
+
 router.put('/:id', (req, res) => {
   const id = Number(req.params.id);
   const { firstName, lastName, email, status, sentAt } = req.body;
