@@ -160,7 +160,7 @@ export function listCampaigns(limit = 100) {
   // sends) still reports a non-zero unique count instead of 0. The report view
   // breaks these down into raw vs human vs prefetch/bot — see campaignSummary().
   return db.prepare(`
-    SELECT c.id, c.type, c.label, c.status, c.date, c.created_at,
+    SELECT c.id, c.type, c.label, c.status, c.date, c.created_at, c.ab_test_id, c.ab_variant, c.ab_template,
            s.total_sent, s.total_delivered,
            si.fromAddr AS identity_from, si.domain AS identity_domain,
            (SELECT COUNT(DISTINCT CASE WHEN oe.contact_id IS NOT NULL THEN 'c'||oe.contact_id

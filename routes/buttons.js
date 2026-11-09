@@ -1,5 +1,6 @@
 import express from 'express';
 import * as ButtonRepository from '../services/ButtonRepository.js';
+import * as ButtonGroups from '../services/ButtonGroupRepository.js';
 import { renderButtonHtml } from '../services/BodyCompiler.js';
 
 const router = express.Router();
@@ -49,6 +50,7 @@ router.put('/:id', (req, res) => {
 router.delete('/:id', (req, res) => {
   const ok = ButtonRepository.remove(Number(req.params.id));
   if (!ok) return res.status(404).json({ error: 'Button not found' });
+  ButtonGroups.removeButtonFromAllGroups(Number(req.params.id));
   res.json({ ok: true });
 });
 

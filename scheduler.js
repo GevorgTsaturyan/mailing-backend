@@ -565,6 +565,10 @@ function checkScheduledSends() {
           scheduled_send_id: task.id,
           label: task.label ?? null,
         });
+        if (task.ab_variant) {
+          db.prepare('UPDATE campaigns SET ab_test_id=?, ab_variant=?, ab_template=? WHERE id=?')
+            .run(task.ab_test_id, task.ab_variant, task.templateName, dispatch.id);
+        }
         findOrCreateStats(dispatch.id);
         let jobsQueued = 0;
 

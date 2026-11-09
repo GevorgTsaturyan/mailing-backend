@@ -328,6 +328,15 @@ try { db.exec("ALTER TABLE jobs ADD COLUMN scheduled_for TEXT")    } catch {}
 try { db.exec("ALTER TABLE jobs ADD COLUMN contact_id    INTEGER") } catch {}
 try { db.exec("ALTER TABLE jobs ADD COLUMN send_log_id   INTEGER") } catch {}
 
+// ─── A/B tests ────────────────────────────────────────────────────────────────
+// A scheduled send created with a second template is split into two
+// scheduled_sends rows (random halves) sharing ab_test_id; each produces its own
+// campaign carrying the same ab_test_id + variant + template, so the report can
+// compare click rates. Labels are shared, so both runs group together in the UI.
+try { db.exec("ALTER TABLE scheduled_sends ADD COLUMN ab_test_id TEXT") } catch {}
+try { db.exec("ALTER TABLE scheduled_sends ADD COLUMN ab_variant TEXT") } catch {}
+// (campaigns.ab_* columns are added right after the campaigns table is created)
+
 // ─── List hygiene (deliverability) ────────────────────────────────────────────
 // suppression_reason — non-NULL = never mail again: 'hard_bounce' | 'soft_bounce_limit'
 //                      | 'complaint' | 'unsubscribe'. Independent of `status`
@@ -387,6 +396,10 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_campaigns_scheduled_send_id    ON campaigns(scheduled_send_id);
   CREATE INDEX IF NOT EXISTS idx_campaigns_recurring_id         ON campaigns(recurring_campaign_id);
 `);
+// A/B test tagging (see 'A/B tests' above).
+try { db.exec("ALTER TABLE campaigns ADD COLUMN ab_test_id  TEXT") } catch {}
+try { db.exec("ALTER TABLE campaigns ADD COLUMN ab_variant  TEXT") } catch {}
+try { db.exec("ALTER TABLE campaigns ADD COLUMN ab_template TEXT") } catch {}
 
 // campaign_stats — one row per campaigns row, updated transactionally on each
 //   delivery event.  Counters are the permanent historical record: they survive
@@ -723,6 +736,26 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_failed_mails_failed_at ON failed_mails(failed_at DESC);
+`);
+
+// ─── Button groups ────────────────────────────────────────────────────────────
+// Organise reusable CTA buttons into named groups (e.g. one per sending brand),
+// mirroring template groups. Membership keyed by button id; deleting a button
+// cascades its memberships. Purely organisational.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS button_groups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT,
+    createdAt   TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS button_group_members (
+    group_id  INTEGER NOT NULL REFERENCES button_groups(id) ON DELETE CASCADE,
+    button_id INTEGER NOT NULL REFERENCES buttons(id)       ON DELETE CASCADE,
+    addedAt   TEXT    NOT NULL,
+    PRIMARY KEY (group_id, button_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_button_group_members_button ON button_group_members(button_id);
 `);
 
 // ─── Template groups ──────────────────────────────────────────────────────────

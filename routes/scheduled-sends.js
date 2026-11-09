@@ -1,8 +1,18 @@
 import express from 'express';
+import { randomUUID, randomInt } from 'node:crypto';
 import db from '../db.js';
 import * as Groups from '../services/GroupRepository.js';
 
 const router = express.Router();
+
+// Random, unbiased split (Fisher–Yates with crypto randomness): A gets the extra
+// recipient when the count is odd. Exported for tests.
+export function splitAB(ids) {
+  const arr = [...ids];
+  for (let i = arr.length - 1; i > 0; i--) { const j = randomInt(i + 1); [arr[i], arr[j]] = [arr[j], arr[i]]; }
+  const half = Math.ceil(arr.length / 2);
+  return { a: arr.slice(0, half), b: arr.slice(half) };
+}
 
 function parse(row) {
   return { ...row, contactIds: JSON.parse(row.contactIds) };
@@ -55,9 +65,37 @@ router.post('/', (req, res) => {
   if (content_type != null && content_type !== 'html' && content_type !== 'text')
     return res.status(400).json({ error: "content_type must be 'html' or 'text'" });
 
+  // ── A/B test: a second template splits the recipients into two random halves ──
+  const abTemplateName = req.body.abTemplateName || null;
+  if (abTemplateName) {
+    if (!templateName) return res.status(400).json({ error: 'A/B test needs template A (templateName) and template B (abTemplateName)' });
+    if (abTemplateName === templateName) return res.status(400).json({ error: 'A/B test needs two different templates' });
+    if (snapshot.length < 2) return res.status(400).json({ error: 'A/B test needs at least 2 recipients' });
+    if (!db.prepare('SELECT 1 FROM templates WHERE name=?').get(abTemplateName)) return res.status(400).json({ error: 'Template B not found' });
+  }
+
   const identityId = senderIdentityId
     ? (db.prepare('SELECT id FROM sender_identities WHERE id=? AND status=?').get(senderIdentityId, 'active')?.id ?? null)
     : null;
+
+  if (abTemplateName) {
+    const { a, b } = splitAB(snapshot);
+    const abTestId = randomUUID();
+    const ctOf = (name) => db.prepare('SELECT content_type FROM templates WHERE name=?').get(name)?.content_type || 'html';
+    const ins = db.prepare(`
+      INSERT INTO scheduled_sends
+        (label, contactIds, templateName, content_type, scheduledAt, status, sender_identity_id, createdAt, ab_test_id, ab_variant)
+      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+    `);
+    const now = new Date().toISOString();
+    const lbl = label || `A/B: ${templateName} vs ${abTemplateName}`;
+    const ids = db.transaction(() => [
+      ins.run(lbl, JSON.stringify(a), templateName,   ctOf(templateName),   scheduledAt, identityId, now, abTestId, 'A').lastInsertRowid,
+      ins.run(lbl, JSON.stringify(b), abTemplateName, ctOf(abTemplateName), scheduledAt, identityId, now, abTestId, 'B').lastInsertRowid,
+    ])();
+    const rows = ids.map((id) => parse(db.prepare('SELECT * FROM scheduled_sends WHERE id = ?').get(id)));
+    return res.status(201).json({ ...rows[0], abTest: { id: abTestId, variants: rows } });
+  }
 
   const result = db.prepare(`
     INSERT INTO scheduled_sends

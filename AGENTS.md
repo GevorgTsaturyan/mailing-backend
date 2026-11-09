@@ -229,6 +229,22 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
 Advisory warnings (never blocking) on `GET/PUT/POST /api/templates`: > 5 links, > 3 images, URL
 shorteners, bare-IP links, phishing-like subjects, missing plain text. Shown in `Templates.vue`.
 
+### A/B tests (scheduled sends)
+`POST /api/scheduled-sends` with `abTemplateName` (template B) next to `templateName` (A) splits the
+recipient snapshot into two **random** halves (`splitAB`, crypto Fisher–Yates; A gets the odd one) and
+creates two `scheduled_sends` rows sharing `ab_test_id`, `ab_variant` A/B, the same label, and each
+template's own `content_type`. Response: row A + `abTest: { id, variants: [A, B] }`. No contact gets both
+versions. On dispatch the scheduler tags the campaign (`campaigns.ab_test_id/ab_variant/ab_template`);
+the campaigns list returns them and the UI shows an A/B badge + click rate per variant. Validation:
+both templates required and different, ≥2 recipients, B must exist. Suppression/unsubscribe is
+enforced exactly as for any scheduled send (creation, queue time, claim time). Tests: `ab-test.test.js`.
+
+### Button groups
+`button_groups` + `button_group_members(group_id, button_id)` (`services/ButtonGroupRepository.js`,
+`routes/button-groups.js` → `/api/button-groups`: list/get/create/update/delete,
+`POST|DELETE /:id/members { buttonIds }`). Purely organisational, mirrors template groups; deleting a
+button removes it from all groups. Tests: `button-groups.test.js`.
+
 ### Cross-brand send warning (`services/CrossBrandService.js`)
 `POST /api/contacts/cross-brand-check { senderIdentityId?, contactIds?, groupIds? }` →
 `{ identity, total, conflicts: [{ contactId, email, brands: [domain] }] }`: recipients already
