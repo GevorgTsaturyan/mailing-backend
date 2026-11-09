@@ -4,6 +4,7 @@ import { parse } from 'csv-parse/sync';
 import db from '../db.js';
 import * as Groups from '../services/GroupRepository.js';
 import * as FailedMails from '../services/FailedMailRepository.js';
+import * as CrossBrand from '../services/CrossBrandService.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -36,6 +37,14 @@ router.get('/', (req, res) => {
     `).all(groupId)));
   }
   res.json(withGroupIds(db.prepare(`SELECT c.*, ${GROUP_IDS_SUBSELECT} FROM contacts c ORDER BY c.id`).all()));
+});
+
+// POST /api/contacts/cross-brand-check { senderIdentityId?, contactIds?, groupIds? }
+// → { identity, total, conflicts: [{ contactId, email, brands: [domain] }] }
+// Advisory: recipients already emailed by a DIFFERENT identity (UI confirms first).
+router.post('/cross-brand-check', (req, res) => {
+  const { senderIdentityId, contactIds, groupIds } = req.body || {};
+  res.json(CrossBrand.check({ identityId: senderIdentityId || null, contactIds, groupIds }));
 });
 
 router.post('/', (req, res) => {

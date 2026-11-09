@@ -229,6 +229,16 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
 Advisory warnings (never blocking) on `GET/PUT/POST /api/templates`: > 5 links, > 3 images, URL
 shorteners, bare-IP links, phishing-like subjects, missing plain text. Shown in `Templates.vue`.
 
+### Cross-brand send warning (`services/CrossBrandService.js`)
+`POST /api/contacts/cross-brand-check { senderIdentityId?, contactIds?, groupIds? }` →
+`{ identity, total, conflicts: [{ contactId, email, brands: [domain] }] }`: recipients already
+emailed (canonical job `SENT` or legacy `send_log` sent/delivered) by a **different** identity than
+the one that will send (explicit, else first active+READY — same as `/api/send`). **Advisory only** —
+never blocks; the UI (`CrossBrandConfirm.vue`) asks "send anyway?" in the Contacts send/schedule
+modal and Dashboard send-now. Contacts may legitimately be mailed by several brands; the warning
+prevents doing it by accident (several brands → same person is a snowshoe signal). Tests:
+`cross-brand.test.js`.
+
 ### Brand offers site per identity (`services/OffersBrandService.js`)
 Enabled when `.env` has `OFFERS_SITE_PORT` (e.g. 3010) **and** `OFFERS_SITE_INTERNAL_KEY`
 (= `INTERNAL_API_KEY` in offers-site `.env`). On identity provisioning:
