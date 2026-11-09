@@ -71,11 +71,16 @@ router.put('/:id', (req, res) => {
   const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
   if (!contact) return res.status(404).json({ error: 'Contact not found' });
 
+  // A person who unsubscribed (or complained) stays unsubscribed: only they can
+  // opt in again (public double opt-in also refuses suppressed addresses). An
+  // operator edit/reset never changes their status; other fields stay editable.
+  const statusLocked = contact.status === 'unsubscribed' || ['unsubscribe', 'complaint'].includes(contact.suppression_reason);
+
   const updated = {
     firstName: firstName ?? contact.firstName,
     lastName:  lastName  ?? contact.lastName,
     email:     email     ?? contact.email,
-    status:    status    ?? contact.status,
+    status:    statusLocked ? 'unsubscribed' : (status ?? contact.status),
     sentAt:    sentAt    !== undefined ? sentAt : contact.sentAt,
   };
 

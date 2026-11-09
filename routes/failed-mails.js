@@ -18,11 +18,18 @@ router.post('/:id/reset', (req, res) => {
   const id = Number(req.params.id);
   const contact = db.prepare('SELECT * FROM contacts WHERE id = ?').get(id);
   if (!contact) return res.status(404).json({ error: 'Contact not found' });
+  // Never re-enables someone who unsubscribed or complained (only they can opt in
+  // again). Otherwise: back to pending, and a BOUNCE suppression is lifted (the
+  // operator judged the address OK) — same rule as PUT /api/contacts/:id.
+  const locked = contact.status === 'unsubscribed' || ['unsubscribe', 'complaint'].includes(contact.suppression_reason);
   db.transaction(() => {
-    db.prepare("UPDATE contacts SET status = 'pending', sentAt = NULL WHERE id = ?").run(id);
+    if (!locked) {
+      db.prepare("UPDATE contacts SET status = 'pending', sentAt = NULL WHERE id = ?").run(id);
+      db.prepare("UPDATE contacts SET suppression_reason = NULL, soft_bounce_count = 0 WHERE id = ? AND suppression_reason IN ('hard_bounce','soft_bounce_limit')").run(id);
+    }
     FailedMails.clear(id);
   })();
-  res.json({ ok: true });
+  res.json({ ok: true, statusLocked: locked });
 });
 
 // DELETE /api/failed-mails/:id — dismiss a contact from the failed list only

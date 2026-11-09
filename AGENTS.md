@@ -205,8 +205,13 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
   `signing_unavailable`) → **no recipient penalty** (a reputation dip must not wipe the list).
 - **Complaints** → `status='unsubscribed'` + `suppression_reason='complaint'`. Unsubscribe routes
   set `suppression_reason='unsubscribe'` (startup backfills existing unsubscribed rows).
-- **Manual reset** (`PUT /api/contacts/:id` with `status='pending'`) lifts only bounce
-  suppressions; complaint/unsubscribe are never lifted there.
+- **Manual reset** (`PUT /api/contacts/:id` with `status='pending'`, or `POST /api/failed-mails/:id/reset`)
+  lifts only bounce suppressions. **Unsubscribe is final from the operator side:** for a contact with
+  `status='unsubscribed'` or `suppression_reason` unsubscribe/complaint, `PUT /api/contacts/:id` keeps
+  `status='unsubscribed'` (other fields editable) and failed-mails reset leaves status alone
+  (`statusLocked: true`). The UI has no re-subscribe action; public double opt-in also refuses
+  suppressed addresses — only the person can ever opt in again. Malformed (even validly signed)
+  unsubscribe tokens → 404, never 500. Tests: `unsubscribe-lock.test.js`.
 - **Inactivity sunset:** `contacts.last_activity_at` = last real open (`classification='open'`)
   or non-scanner click (`routes/track.js`), baseline = now via `backfillActivity()` at startup
   (fills NULLs only). `suppressionExclusionSql()` skips contacts inactive > `INACTIVE_SUNSET_DAYS`

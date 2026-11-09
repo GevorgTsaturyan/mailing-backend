@@ -33,7 +33,9 @@ router.use(express.urlencoded({ extended: false }));
 // or the contact no longer exists.
 function resolveContact(token) {
   const payload = verifyToken(token);
-  if (!payload || payload.c == null) return null;
+  // A malformed (even if validly signed) payload is treated as an invalid link (404),
+  // never a server error.
+  if (!payload || !Number.isInteger(payload.c)) return null;
   return db.prepare('SELECT id, email, status FROM contacts WHERE id = ?').get(payload.c) || null;
 }
 
