@@ -1,4 +1,5 @@
 import db from '../db.js';
+import { windowConfig, lengthHours } from './SendWindow.js';
 
 // ─── WarmupService — IP/domain warm-up + per-provider throttle ────────────────
 //
@@ -48,15 +49,29 @@ export function providerOf(email) {
   return DOMAIN_TO_PROVIDER.get(d) || null;
 }
 
+// Hours over which an identity's daily limit is spread. With a send window
+// (SendWindow) the window length is used, so the whole daily limit fits inside it;
+// otherwise PROVIDER_SPREAD_HOURS (default 8; 0 disables the throttle).
 function spreadHours() {
+  if (process.env.PROVIDER_SPREAD_HOURS === '0') return 0;
+  const w = lengthHours(windowConfig());
+  if (w) return w;
   const n = parseInt(process.env.PROVIDER_SPREAD_HOURS ?? '8', 10);
-  return Number.isFinite(n) && n > 0 ? n : 0; // 0 disables the throttle
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// Daily limit enforced at SEND time (not only when jobs are queued): jobs left over
+// from yesterday's window can never push an identity past today's limit.
+export function dailyAllows(identity, now = new Date()) {
+  const today = now.toISOString().slice(0, 10);
+  const sent = identity?.lastResetDate === today ? Number(identity.dailySentCount || 0) : 0;
+  return sent < effectiveDailyLimit(identity, now);
 }
 
 export function providerHourlyCap(identity, now = new Date()) {
   const h = spreadHours();
   if (!h) return Infinity;
-  return Math.max(5, Math.ceil(effectiveDailyLimit(identity, now) / h));
+  return Math.max(3, Math.ceil(effectiveDailyLimit(identity, now) / h));
 }
 
 // Returns true when this job may start now under the provider throttle.

@@ -34,8 +34,12 @@ export function onJobCompleted(jobId, queueId) {
       FailedMails.clear(job.contact_id);
     }
     if (job.identity_id) {
-      db.prepare('UPDATE sender_identities SET dailySentCount = dailySentCount + 1 WHERE id=?')
-        .run(job.identity_id);
+      // Day-aware counter: the first send of a new UTC day starts the count at 1.
+      const today = new Date().toISOString().slice(0, 10);
+      db.prepare(`UPDATE sender_identities
+        SET dailySentCount = CASE WHEN lastResetDate = ? THEN dailySentCount + 1 ELSE 1 END,
+            lastResetDate  = ?
+        WHERE id=?`).run(today, today, job.identity_id);
     }
     db.prepare("UPDATE jobs SET delivery_status = 'SMTP_ACCEPTED' WHERE id=?").run(jobId);
     if (job.campaign_id) incrementSent(job.campaign_id);

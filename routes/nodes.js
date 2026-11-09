@@ -184,8 +184,11 @@ router.post('/results', (req, res) => {
     }
 
     if (r.status === 'sent') {
-      db.prepare('UPDATE sender_identities SET dailySentCount = dailySentCount + 1 WHERE id=?')
-        .run(job.senderIdentityId);
+      const today = new Date().toISOString().slice(0, 10);
+      db.prepare(`UPDATE sender_identities
+        SET dailySentCount = CASE WHEN lastResetDate = ? THEN dailySentCount + 1 ELSE 1 END,
+            lastResetDate  = ?
+        WHERE id=?`).run(today, today, job.senderIdentityId);
     }
   }
 

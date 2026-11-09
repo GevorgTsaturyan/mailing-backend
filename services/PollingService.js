@@ -2,7 +2,8 @@ import * as JobRepository from './JobRepository.js';
 import { isSignerHealthy } from './NodeRepository.js';
 import { getReadyDomains } from './UnsubscribeHostReadiness.js';
 import db from '../db.js';
-import { providerAllows } from './WarmupService.js';
+import { providerAllows, dailyAllows } from './WarmupService.js';
+import { isOpen as sendWindowOpen } from './SendWindow.js';
 
 // How many ordered candidates to inspect when the head of the queue is blocked
 // by the per-provider hourly throttle (e.g. Gmail cap reached → send Outlook next).
@@ -25,12 +26,17 @@ export function poll(serverId) {
   // Raw jobs (no contact_id) carry no List-Unsubscribe URL and are never gated.
   const readyDomains = getReadyDomains();
   const candidates = JobRepository.findPendingCandidates(serverId, { readyDomains, limit: THROTTLE_LOOKAHEAD });
-  const identityStmt = db.prepare('SELECT id, dailyLimit, warmupStartedAt FROM sender_identities WHERE id = ?');
+  const identityStmt = db.prepare('SELECT id, dailyLimit, dailySentCount, lastResetDate, warmupStartedAt FROM sender_identities WHERE id = ?');
   const cache = new Map();
   const now = new Date();
+  // Campaign mail (contact-bound) waits for the daily send window and respects the
+  // identity's daily limit at send time; raw jobs (Inbox replies) always go.
+  const windowOpen = sendWindowOpen(now);
   for (const job of candidates) {
     if (!cache.has(job.identity_id)) cache.set(job.identity_id, identityStmt.get(job.identity_id));
-    if (providerAllows(job, cache.get(job.identity_id), now)) return job;
+    const identity = cache.get(job.identity_id);
+    if (job.contact_id != null && (!windowOpen || !dailyAllows(identity, now))) continue;
+    if (providerAllows(job, identity, now)) return job;
   }
   return null;
 }

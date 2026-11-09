@@ -34,7 +34,7 @@ test('provider mapping + hourly cap', () => {
   assert.equal(providerOf('a@hotmail.com'), 'microsoft');
   assert.equal(providerOf('a@example.org'), null);
   assert.equal(providerHourlyCap({ dailyLimit: 50, warmupStartedAt: null }), 7); // ceil(50/8)
-  assert.equal(providerHourlyCap({ dailyLimit: 10, warmupStartedAt: null }), 5); // floor of 5
+  assert.equal(providerHourlyCap({ dailyLimit: 10, warmupStartedAt: null }), 3); // floor of 3
 });
 
 test('content lint', () => {

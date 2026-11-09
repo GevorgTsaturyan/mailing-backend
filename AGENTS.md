@@ -232,6 +232,16 @@ Run tests: `npm test` (uses `node --test`; unsubscribe suite runs on an in-memor
   to 50 ordered candidates (`JobRepository.findPendingCandidates`) and returns the first allowed.
   Canonical pipeline only.
 
+### Send window + send-time daily limit (`services/SendWindow.js`)
+`SEND_WINDOW_START`/`SEND_WINDOW_END` ("HH:MM") + `SEND_WINDOW_TZ` (IANA, default UTC; live:
+18:00–21:00 Europe/Brussels). `PollingService.poll` skips **contact-bound** jobs outside the window
+(queue pauses, resumes next window; nothing cancelled) and when `dailyAllows(identity)` is false
+(today's `dailySentCount` ≥ effective daily limit). Raw jobs (Inbox replies) are never windowed.
+While a window is set, provider pacing spreads the daily limit over the window length
+(`providerHourlyCap = max(3, ceil(limit / windowHours))`, e.g. 40/day in 3 h → 14/h, one every
+~4.3 min). `dailySentCount` increments are day-aware (first send of a new UTC day resets to 1).
+Tests: `send-window.test.js`.
+
 ### Content lint (`services/ContentLint.js`)
 Advisory warnings (never blocking) on `GET/PUT/POST /api/templates`: > 5 links, > 3 images, URL
 shorteners, bare-IP links, phishing-like subjects, missing plain text. Shown in `Templates.vue`.
@@ -1150,6 +1160,8 @@ Passwords are hashed with bcrypt (rounds=12). `create-admin.js` is the only way 
 | `NODE_ENV` | Yes | Set to `production` to skip seed data. Any other value enables seeding. |
 | `USE_CANONICAL_QUEUE` | No | `true` to route new campaign sends to the `jobs` table (canonical pipeline). Omit or set `false` to use the legacy `send_jobs` pipeline. Flip to `true` only after validating the canonical pipeline in production. |
 | `UNSUBSCRIBE_REQUIRE_READY` | No | Default `true` (fail-closed): contact-bound job dispatch is withheld until the unsubscribe host passes its `/unsubscribe-health` probe. Set `false` ONLY for local dev/tests — never in production. |
+| `SEND_WINDOW_START` / `SEND_WINDOW_END` | No | Daily sending hours for campaign mail, "HH:MM" (e.g. 18:00 / 21:00). Unset = any time. |
+| `SEND_WINDOW_TZ` | No | IANA timezone of the window (e.g. `Europe/Brussels`; default UTC). |
 | `OFFERS_SITE_PORT` | No | Enables per-identity brand offers site (`offers.<domain>` → this port on the controller). |
 | `OFFERS_SITE_INTERNAL_KEY` | No | Shared secret for offers-site `/api/internal/brands` (must equal its `INTERNAL_API_KEY`). |
 | `OFFERS_SITE_INTERNAL_URL` | No | Default `http://127.0.0.1:$OFFERS_SITE_PORT`. |
