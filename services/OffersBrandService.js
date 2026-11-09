@@ -51,12 +51,16 @@ export async function registerBrand(identity, fetchImpl = fetch) {
   return data;
 }
 
-// Idempotent: reuses any existing button that already targets offers.<domain>.
+// Idempotent: reuses any existing button that already targets the brand site —
+// either offers.<domain> or the bare domain (buttons may be repointed to the bare
+// domain once it serves the brand site), so re-provisioning never duplicates.
 // The button takes the brand site's accent colour only when the site shows its
 // generated theme (offers-site BRAND_THEMES=on → `themed: true`); otherwise default style.
 export function ensureOffersButton(identity, brand = null) {
   const url = offersUrl(identity.domain);
-  const existing = Buttons.list().find((b) => String(b.destination_url).replace(/\/+$/, '/') === url);
+  const norm = (u) => String(u).toLowerCase().replace(/\/+$/, '') + '/';
+  const targets = new Set([url, `https://${identity.domain}/`, `https://www.${identity.domain}/`].map(norm));
+  const existing = Buttons.list().find((b) => targets.has(norm(b.destination_url)));
   if (existing) return { id: existing.id, created: false };
   const b = Buttons.create({
     internal_name: `${brandName(identity)} Offers`,

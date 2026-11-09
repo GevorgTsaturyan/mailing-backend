@@ -49,3 +49,12 @@ test('themes off → default button style (no accent colour)', async () => {
   const r = await S.provisionBrandSite({ domain: 'plain.org', fromName: 'Plain' }, { fetchImpl });
   assert.equal(Buttons.findById(r.buttonId).style.background_color, undefined);
 });
+
+test('re-provisioning reuses a button repointed to the bare domain (no duplicate)', async () => {
+  const fetchImpl = async () => ({ ok: true, json: async () => ({ site_name: 'Bare', created: false, themed: false }) });
+  const id = { domain: 'bare.org', fromName: 'Bare' };
+  const r1 = await S.provisionBrandSite(id, { fetchImpl });
+  Buttons.update(r1.buttonId, { destination_url: 'https://bare.org/' });
+  const r2 = await S.provisionBrandSite(id, { fetchImpl });
+  assert.equal(r2.buttonId, r1.buttonId);
+});
